@@ -323,6 +323,26 @@ inline uint8_t* emit_jmp_fwd(Emitter& e) {
 }
 
 // ---------------------------------------------------------------------------
+// EFLAGS save/restore — wraps memory dispatch sequences so that the inline
+// CMP R14, R15 (and SUB/ADD for ESP management) does not clobber guest flags.
+//
+// PUSHFQ shifts RSP by 8, breaking 16-byte alignment.  We fix that with
+// LEA RSP, [RSP ± 8] which does NOT affect EFLAGS.
+// ---------------------------------------------------------------------------
+
+inline void emit_save_flags(Emitter& e) {
+    e.emit8(0x9C);                                             // PUSHFQ
+    // LEA RSP, [RSP - 8]  (re-align to 16 bytes; LEA is flag-neutral)
+    e.emit8(0x48); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0xF8);
+}
+
+inline void emit_restore_flags(Emitter& e) {
+    // LEA RSP, [RSP + 8]  (undo alignment padding)
+    e.emit8(0x48); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0x08);
+    e.emit8(0x9D);                                             // POPFQ
+}
+
+// ---------------------------------------------------------------------------
 // Fastmem access: OP reg, [R12+R14]  or  OP [R12+R14], reg
 //
 // R12 (base, REX.B=1) + R14 (index, REX.X=1): REX = 0x43
