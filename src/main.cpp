@@ -160,6 +160,77 @@ static bool test_eflags_preservation() {
 }
 
 // ===========================================================================
+// Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm
+// ===========================================================================
+// Guest program (load PA = 0x3000):
+//
+//   mov  eax, 10
+//   mov  ecx, 20
+//   lea  edx, [eax + ecx*2 + 5]  ; EDX = 10 + 40 + 5 = 55 (no mem access!)
+//   push 0x12345678               ; PUSH imm32
+//   push edx                      ; PUSH r32 (55)
+//   pop  ebx                      ; POP → EBX = 55
+//   pop  esi                      ; POP → ESI = 0x12345678
+//   mov  dword ptr [0x4000], 0x42 ; MOV [mem], imm32
+//   mov  edi, [0x4000]            ; EDI = 0x42
+//   ret
+//
+// Expected: EDX=55, EBX=55, ESI=0x12345678, EDI=0x42, ESP=STACK_TOP
+
+static const uint8_t test3_code[] = {
+    // mov eax, 10
+    0xB8, 0x0A, 0x00, 0x00, 0x00,             //  0
+    // mov ecx, 20
+    0xB9, 0x14, 0x00, 0x00, 0x00,             //  5
+    // lea edx, [eax + ecx*2 + 5]
+    0x8D, 0x54, 0x48, 0x05,                    // 10
+    // push 0x12345678
+    0x68, 0x78, 0x56, 0x34, 0x12,             // 14
+    // push edx
+    0x52,                                       // 19
+    // pop ebx
+    0x5B,                                       // 20
+    // pop esi
+    0x5E,                                       // 21
+    // mov dword ptr [0x4000], 0x42
+    0xC7, 0x05, 0x00, 0x40, 0x00, 0x00,
+          0x42, 0x00, 0x00, 0x00,              // 22
+    // mov edi, [0x4000]
+    0x8B, 0x3D, 0x00, 0x40, 0x00, 0x00,       // 32
+    // ret
+    0xC3,                                       // 38
+};
+static_assert(sizeof(test3_code) == 39);
+
+static bool test_lea_push_pop() {
+    printf("=== Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm ===\n");
+
+    MmioMap mmio = make_mmio();
+    auto exec = std::make_unique<XboxExecutor>();
+    if (!setup_exec(*exec, mmio, 0x3000, test3_code, sizeof(test3_code)))
+        return false;
+
+    exec->run(0x3000, 100'000);
+
+    printf("  EDX  = %u  \t(expected 55  = LEA result)\n",     exec->ctx.gp[GP_EDX]);
+    printf("  EBX  = %u  \t(expected 55  = POP after PUSH EDX)\n", exec->ctx.gp[GP_EBX]);
+    printf("  ESI  = 0x%08X\t(expected 0x12345678 = POP after PUSH imm)\n", exec->ctx.gp[GP_ESI]);
+    printf("  EDI  = 0x%08X\t(expected 0x00000042 = MOV EDI,[0x4000])\n",   exec->ctx.gp[GP_EDI]);
+    printf("  ESP  = 0x%08X\t(expected 0x%08X = STACK_TOP+4 after RET)\n",
+           exec->ctx.gp[GP_ESP], STACK_TOP + 4);
+
+    bool ok = exec->ctx.gp[GP_EDX] == 55u
+           && exec->ctx.gp[GP_EBX] == 55u
+           && exec->ctx.gp[GP_ESI] == 0x12345678u
+           && exec->ctx.gp[GP_EDI] == 0x42u
+           && exec->ctx.gp[GP_ESP] == STACK_TOP + 4;
+
+    printf("  %s\n", ok ? "PASS" : "FAIL");
+    exec->destroy();
+    return ok;
+}
+
+// ===========================================================================
 
 int main() {
     bool all_pass = true;
@@ -167,6 +238,8 @@ int main() {
     all_pass &= test_sum_loop();
     printf("\n");
     all_pass &= test_eflags_preservation();
+    printf("\n");
+    all_pass &= test_lea_push_pop();
 
     printf("\n%s\n", all_pass ? "ALL PASS" : "SOME FAILED");
     return all_pass ? 0 : 1;

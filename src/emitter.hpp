@@ -371,6 +371,38 @@ inline void emit_fastmem_movzx(Emitter& e, uint8_t guest_enc, unsigned src_bits)
     e.emit8(0x34);
 }
 
+// MOVSX r32, [R12+R14]  for 8/16-bit loads with sign-extension
+inline void emit_fastmem_movsx(Emitter& e, uint8_t guest_enc, unsigned src_bits) {
+    e.emit8(0x43); e.emit8(0x0F);
+    e.emit8(src_bits == 8 ? 0xBEu : 0xBFu);
+    e.emit8(uint8_t((guest_enc << 3) | 4u));
+    e.emit8(0x34);
+}
+
+// MOV DWORD PTR [R12+R14], imm32
+// REX=0x43, opcode=0xC7, ModRM=mod=00 reg=0 rm=4(SIB), SIB=0x34, imm32
+inline void emit_fastmem_store_imm32(Emitter& e, uint32_t imm) {
+    e.emit8(0x43); e.emit8(0xC7);
+    e.emit8(0x04); e.emit8(0x34);
+    e.emit32(imm);
+}
+
+// MOV WORD PTR [R12+R14], imm16
+inline void emit_fastmem_store_imm16(Emitter& e, uint16_t imm) {
+    e.emit8(0x66);  // operand-size prefix
+    e.emit8(0x43); e.emit8(0xC7);
+    e.emit8(0x04); e.emit8(0x34);
+    e.emit8(uint8_t(imm & 0xFF));
+    e.emit8(uint8_t(imm >> 8));
+}
+
+// MOV BYTE PTR [R12+R14], imm8
+inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
+    e.emit8(0x43); e.emit8(0xC6);
+    e.emit8(0x04); e.emit8(0x34);
+    e.emit8(imm);
+}
+
 // ---------------------------------------------------------------------------
 // Absolute call via R14 (clobbers R14 — safe: EA already committed or saved)
 //   MOVABS R14, imm64 + CALL R14

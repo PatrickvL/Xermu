@@ -105,14 +105,50 @@ and will be tested by a later instruction (Jcc, CMOVcc, SETcc, etc.) before
 being overwritten. Dispatches where no arithmetic flags are live skip the
 PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 
-### 2.4 Clean Instruction Handling
+### 2.4 Instruction Dispatch Table (`insn_dispatch.hpp`)
+
+All instruction classification is driven by a **two-level O(1) dispatch table**:
+
+- **Level 1**: `uint8_t MNEMONIC_CLASS[ZYDIS_MNEMONIC_MAX_VALUE+1]` — maps every
+  Zydis mnemonic enum to a compact `InsnClassId` (0–13). Initialized once by
+  `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
+
+- **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
+  `{EmitHandler, InsnClassFlags}` pair. `InsnClassFlags` encode properties:
+  - `ICF_HAS_DISPATCH` — the handler emits CMP R14,R15 (may clobber EFLAGS)
+  - `ICF_CLEAN_COPY` — verbatim copy or re-encode, no memory access
+  - `ICF_TERMINATOR` — trace exit (branch/call/ret)
+  - `ICF_PRIVILEGED` — privileged instruction (trap/UD2)
+
+Class IDs and their handlers:
+
+| InsnClassId   | Mnemonics                                | Handler                |
+|---------------|------------------------------------------|------------------------|
+| IC_CLEAN      | (no mem operand fallback via ALU)        | `emit_handler_clean`   |
+| IC_LEA        | LEA                                      | `emit_handler_lea`     |
+| IC_MOV_MEM    | MOV                                      | `emit_handler_mov_mem` |
+| IC_ALU_MEM    | ADD/SUB/AND/OR/XOR/CMP/ADC/SBB/INC/DEC/NEG/NOT/SHL/SHR/SAR/ROL/ROR/RCL/RCR | `emit_handler_alu_mem` |
+| IC_TEST_MEM   | TEST                                     | `emit_handler_test_mem`|
+| IC_PUSH       | PUSH (reg + imm)                         | `emit_handler_push`    |
+| IC_POP        | POP                                      | `emit_handler_pop`     |
+| IC_LEAVE      | LEAVE                                    | `emit_handler_leave`   |
+| IC_MOVZX_MEM  | MOVZX                                    | `emit_handler_movzx_mem` |
+| IC_MOVSX_MEM  | MOVSX                                    | `emit_handler_movsx_mem` |
+| IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/IRETD             | (inline in build loop) |
+| IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (inline UD2 trap)      |
+
+The `build()` loop in Phase 1 uses `lookup_flags()` for dispatch detection and
+termination. Phase 3 uses `lookup_insn_class()` to fetch the handler callback —
+no switch/if chains on mnemonics remain in the hot path.
+
+### 2.5 Clean Instruction Handling
 
 Instructions without memory operands or privilege requirements are copied verbatim
 into the code cache (`memcpy`). Exception: short-form INC/DEC r32 (opcodes
 `0x40`–`0x4F`) which collide with REX prefixes on x86-64 — these are re-encoded
 to the two-byte `FF /0` / `FF /1` forms.
 
-### 2.5 Self-Modifying Code Detection
+### 2.6 Self-Modifying Code Detection
 
 Page-granular version tags (`PageVersions`). Each guest page has a `uint32_t`
 version counter. Before executing a cached trace, the run loop compares the
@@ -136,11 +172,12 @@ and rebuild.
 | `trace.hpp`           | `Trace` struct, `TraceCache` hash table        | ✅ Working    |
 | `emitter.hpp`         | Byte emitter, EA synthesis, fastmem helpers    | ✅ Working    |
 | `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `PageVersions`   | ✅ Working    |
-| `trace_builder.cpp`   | Decode → classify → emit loop                  | ✅ Working    |
+| `insn_dispatch.hpp`   | Two-level O(1) mnemonic dispatch table          | ✅ Working    |
+| `trace_builder.cpp`   | Decode → classify → emit loop (table-driven)   | ✅ Working    |
 | `executor.hpp`        | `XboxExecutor` struct, `dispatch_trace` decl   | ✅ Working    |
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
-| `main.cpp`            | Self-tests: sum loop + EFLAGS preservation     | ✅ ALL PASS   |
+| `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV     | ✅ ALL PASS   |
 
 ---
 
@@ -149,9 +186,14 @@ and rebuild.
 - [x] Zydis-based instruction decode (LEGACY_32 mode, full operand detail)
 - [x] Trace building: linear scan to first branch/call/ret, page-boundary stop
 - [x] Verbatim copy of clean instructions (with INC/DEC re-encoding)
-- [x] Inline fastmem dispatch for MOV r32←mem, MOV mem←r32 (8/16/32-bit)
+- [x] Two-level O(1) dispatch table for mnemonic → handler classification
+- [x] Inline fastmem dispatch for MOV r32←mem, MOV mem←r32, MOV [mem]←imm (8/16/32-bit)
 - [x] MMIO slow-path call-out (platform-aware ABI: SysV and Windows x64)
-- [x] PUSH/POP r32 with inline ESP management
+- [x] PUSH r32 / PUSH imm8/imm32 / POP r32 with inline ESP management
+- [x] LEA — address computation without memory access (no fastmem dispatch)
+- [x] ALU reg/mem forms (ADD/SUB/AND/OR/XOR/CMP/ADC/SBB/INC/DEC/NEG/NOT/shifts/rotates)
+- [x] MOVZX/MOVSX from memory (byte/word → dword zero/sign extension)
+- [x] LEAVE (MOV ESP,EBP + POP EBP)
 - [x] CALL near (direct + register-indirect) trace exit
 - [x] RET trace exit (stack read → `next_eip`, preserves live EAX)
 - [x] JMP direct/indirect/memory trace exit
@@ -161,7 +203,7 @@ and rebuild.
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
-- [x] Self-tests pass: sum loop + fastmem round-trip, EFLAGS preservation
+- [x] Self-tests pass: sum loop + fastmem round-trip, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm
 
 ---
 
@@ -210,31 +252,31 @@ Region). Currently, `emit_ea_to_r14` rejects FS/GS segment overrides. Fix: add
 a FS/GS base field to `GuestContext`, and emit an ADD of the segment base into
 R14 during EA synthesis when a non-default segment is present.
 
-#### 5.5 8-bit and 16-bit Register Operands in Memory Dispatch
-**Priority: MEDIUM** — `emit_mem_dispatch` currently only handles 32-bit register
-operands (`reg32_enc`). Instructions like `MOV AL, [mem]` or `MOV [mem], CX`
-need 8-bit and 16-bit register encoding support. Also need MOVZX/MOVSX memory
-forms.
+#### 5.5 ~~8-bit and 16-bit Register Operands in Memory Dispatch~~ Partially Done
+**Resolved for MOVZX/MOVSX.** MOVZX/MOVSX r32,[mem8/mem16] now have dedicated
+handlers using `emit_fastmem_movzx` / `emit_fastmem_movsx`. Still needed: direct
+8-bit and 16-bit register operand forms (e.g., `MOV AL, [mem]`, `MOV [mem], CX`).
 
-#### 5.6 Immediate-to-Memory Instructions
-**Priority: MEDIUM** — `MOV DWORD PTR [mem], imm32` has no register operand;
-`emit_mem_dispatch` fails because `reg_op_idx` has no register to extract.
-Need a separate path that synthesizes the EA, does the fastmem check, then
-writes the immediate directly.
+#### 5.6 ~~Immediate-to-Memory Instructions~~ ✅ DONE
+**Resolved.** `emit_handler_mov_mem` detects `ops[other_idx].type == IMMEDIATE`
+and routes to `emit_fastmem_dispatch_store_imm` which writes the immediate
+directly to `[R12+R14]` (fastmem) or calls `mmio_dispatch_write_imm` (slow path).
+Verified by Test 3 (`MOV DWORD PTR [0x4000], 0x42`).
 
-#### 5.7 Multi-Memory-Operand Instructions
-**Priority: MEDIUM** — Instructions like `XCHG [mem], reg` or `CMPXCHG [mem], reg`
-have both a read and a write to the same memory location. LEA r, [mem] has a
-memory-syntax operand that doesn't actually access memory. The classifier needs
-refinement.
+#### 5.7 ~~LEA / Multi-Memory-Operand Classification~~ ✅ DONE
+**Resolved.** LEA is classified as `IC_LEA` with `ICF_CLEAN_COPY` — it computes
+EA into R14 and moves the result to the destination register, with no memory
+access. `XCHG [mem], reg` / `CMPXCHG [mem], reg` still need read-modify-write
+support.
 
 #### 5.8 CALL/JMP Indirect Through Memory
 **Priority: MEDIUM** — `JMP [mem]` is partially handled; `CALL [mem]` (vtable
 dispatch) is not. C++ games hit this constantly.
 
-#### 5.9 PUSH/POP Immediate and Memory Forms
-**Priority: MEDIUM** — Only PUSH/POP r32 are implemented. Also need:
-- `PUSH imm8/imm32`
+#### 5.9 ~~PUSH/POP Immediate~~ ✅ DONE + Memory Forms Still Needed
+**PUSH imm8/imm32 resolved.** The `emit_handler_push` detects immediate operands
+and emits SUB ESP,4 + fastmem store of the immediate. Verified by Test 3
+(`PUSH 0x12345678`). Still needed:
 - `PUSH [mem]` / `POP [mem]`
 - `PUSHA` / `POPA` (used by some Xbox code)
 
@@ -436,6 +478,14 @@ Expected output:
 === Test 2: EFLAGS preservation across memory dispatch ===
   EBX  = 1       (expected 1 = JE taken)
   EDX  = 42      (expected 42 = loaded from RAM)
+  PASS
+
+=== Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm ===
+  EDX  = 55      (expected 55  = LEA result)
+  EBX  = 55      (expected 55  = POP after PUSH EDX)
+  ESI  = 0x12345678      (expected 0x12345678 = POP after PUSH imm)
+  EDI  = 0x00000042      (expected 0x00000042 = MOV EDI,[0x4000])
+  ESP  = 0x00080004      (expected 0x00080004 = STACK_TOP+4 after RET)
   PASS
 
 ALL PASS
