@@ -86,6 +86,10 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand* ops, const uint8_t* raw,
                            GuestContext* ctx, bool save_flags);
 
+bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
+                          const ZydisDecodedOperand* ops, const uint8_t* raw,
+                          GuestContext* ctx, bool save_flags);
+
 // ---------------------------------------------------------------------------
 // Dispatch table — Level 1 maps mnemonic → compact index, Level 2 has class
 // ---------------------------------------------------------------------------
@@ -104,6 +108,7 @@ enum InsnClassId : uint8_t {
     IC_LEAVE,       // LEAVE
     IC_MOVZX_MEM,   // MOVZX r32, [m]
     IC_MOVSX_MEM,   // MOVSX r32, [m]
+    IC_FPU_MEM,     // x87 instructions with memory operand forms
     IC_TERMINATOR,  // JMP/CALL/RET/Jcc/LOOP — trace exit
     IC_PRIVILEGED,  // HLT/LGDT/CLI/... — trap
     IC_MAX
@@ -123,6 +128,7 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_LEAVE      */ { emit_handler_leave,     ICF_HAS_DISPATCH },
     /* IC_MOVZX_MEM  */ { emit_handler_movzx_mem, ICF_HAS_DISPATCH },
     /* IC_MOVSX_MEM  */ { emit_handler_movsx_mem, ICF_HAS_DISPATCH },
+    /* IC_FPU_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH },
     /* IC_TERMINATOR */ { nullptr,                ICF_TERMINATOR },
     /* IC_PRIVILEGED */ { nullptr,                ICF_PRIVILEGED },
 };
@@ -188,6 +194,24 @@ inline void init_mnemonic_table() {
     // ---- Zero/sign extending loads ----
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_MOVZX]  = IC_MOVZX_MEM;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_MOVSX]  = IC_MOVSX_MEM;
+
+    // ---- x87 FPU (mnemonics that CAN have memory operand forms) ----
+    // Register-only forms are handled by the fallback in the handler
+    // (clean copy). Memory forms use the generic rewriter.
+    for (auto m : {
+        ZYDIS_MNEMONIC_FLD,    ZYDIS_MNEMONIC_FST,    ZYDIS_MNEMONIC_FSTP,
+        ZYDIS_MNEMONIC_FILD,   ZYDIS_MNEMONIC_FIST,   ZYDIS_MNEMONIC_FISTP,
+        ZYDIS_MNEMONIC_FBLD,   ZYDIS_MNEMONIC_FBSTP,
+        ZYDIS_MNEMONIC_FADD,   ZYDIS_MNEMONIC_FSUB,   ZYDIS_MNEMONIC_FSUBR,
+        ZYDIS_MNEMONIC_FMUL,   ZYDIS_MNEMONIC_FDIV,   ZYDIS_MNEMONIC_FDIVR,
+        ZYDIS_MNEMONIC_FCOM,   ZYDIS_MNEMONIC_FCOMP,
+        ZYDIS_MNEMONIC_FIADD,  ZYDIS_MNEMONIC_FISUB,  ZYDIS_MNEMONIC_FISUBR,
+        ZYDIS_MNEMONIC_FIMUL,  ZYDIS_MNEMONIC_FIDIV,  ZYDIS_MNEMONIC_FIDIVR,
+        ZYDIS_MNEMONIC_FICOM,  ZYDIS_MNEMONIC_FICOMP,
+        ZYDIS_MNEMONIC_FLDCW,  ZYDIS_MNEMONIC_FNSTCW,
+        ZYDIS_MNEMONIC_FLDENV, ZYDIS_MNEMONIC_FNSTENV,
+        ZYDIS_MNEMONIC_FNSTSW,
+    }) MNEMONIC_CLASS[m] = IC_FPU_MEM;
 }
 
 // O(1) lookup: returns the InsnClassFlags for a mnemonic.

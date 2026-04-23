@@ -231,6 +231,121 @@ static bool test_lea_push_pop() {
 }
 
 // ===========================================================================
+// Test 4: x87 register-only operations (FXSAVE/FXRSTOR validation)
+// ===========================================================================
+// Guest program (load PA = 0x4100):
+//   Compute 1.0 + 1.0 = 2.0 twice using x87, verify equality via FCOMPP.
+//   All instructions are register-only — no memory operands.
+//
+//   FLD1                   ; ST(0) = 1.0
+//   FLD1                   ; ST(0) = 1.0, ST(1) = 1.0
+//   FADDP ST(1), ST        ; ST(0) = 2.0
+//   FLD1                   ; ST(0) = 1.0, ST(1) = 2.0
+//   FLD1                   ; ST(0) = 1.0, ST(1) = 1.0, ST(2) = 2.0
+//   FADDP ST(1), ST        ; ST(0) = 2.0, ST(1) = 2.0
+//   FCOMPP                 ; compare & pop both — if equal, C3=1
+//   FNSTSW AX              ; FPU status word → AX
+//   TEST AH, 0x40          ; check C3 (bit 14 of status → bit 6 of AH)
+//   JNZ .equal
+//   MOV EBX, 0             ; not equal (FAIL)
+//   RET
+// .equal:
+//   MOV EBX, 1             ; equal (PASS)
+//   RET
+//
+// Expected: EBX = 1
+
+static const uint8_t test4_code[] = {
+    0xD9, 0xE8,                         //  0: FLD1
+    0xD9, 0xE8,                         //  2: FLD1
+    0xDE, 0xC1,                         //  4: FADDP ST(1),ST
+    0xD9, 0xE8,                         //  6: FLD1
+    0xD9, 0xE8,                         //  8: FLD1
+    0xDE, 0xC1,                         // 10: FADDP ST(1),ST
+    0xDE, 0xD9,                         // 12: FCOMPP
+    0xDF, 0xE0,                         // 14: FNSTSW AX
+    0xF6, 0xC4, 0x40,                  // 16: TEST AH, 0x40
+    0x75, 0x06,                         // 19: JNZ +6 → offset 27
+    0xBB, 0x00, 0x00, 0x00, 0x00,      // 21: MOV EBX, 0
+    0xC3,                               // 26: RET
+    0xBB, 0x01, 0x00, 0x00, 0x00,      // 27: MOV EBX, 1
+    0xC3,                               // 32: RET
+};
+static_assert(sizeof(test4_code) == 33);
+
+static bool test_fpu_register_ops() {
+    printf("=== Test 4: x87 register-only operations ===\n");
+
+    MmioMap mmio = make_mmio();
+    auto exec = std::make_unique<XboxExecutor>();
+    if (!setup_exec(*exec, mmio, 0x4100, test4_code, sizeof(test4_code)))
+        return false;
+
+    exec->run(0x4100, 100'000);
+
+    printf("  EBX  = %u  \t(expected 1 = FCOMPP equal)\n", exec->ctx.gp[GP_EBX]);
+
+    bool ok = exec->ctx.gp[GP_EBX] == 1u;
+
+    printf("  %s\n", ok ? "PASS" : "FAIL");
+    exec->destroy();
+    return ok;
+}
+
+// ===========================================================================
+// Test 5: x87 memory store (FISTP to RAM via generic rewriter)
+// ===========================================================================
+// Guest program (load PA = 0x5000):
+//   Build the value 5.0 in x87, store to RAM via FISTP, read back via MOV.
+//
+//   FLD1                         ; ST(0) = 1.0
+//   FADD ST(0), ST(0)            ; ST(0) = 2.0
+//   FADD ST(0), ST(0)            ; ST(0) = 4.0
+//   FLD1                         ; ST(0) = 1.0, ST(1) = 4.0
+//   FADDP ST(1), ST              ; ST(0) = 5.0
+//   FISTP DWORD PTR [0x4000]     ; store 5 to RAM, pop
+//   MOV EAX, [0x4000]            ; EAX = 5
+//   RET
+//
+// Expected: EAX = 5, [0x4000] = 5
+
+static const uint8_t test5_code[] = {
+    0xD9, 0xE8,                                 //  0: FLD1
+    0xD8, 0xC0,                                 //  2: FADD ST(0),ST(0) → 2.0
+    0xD8, 0xC0,                                 //  4: FADD ST(0),ST(0) → 4.0
+    0xD9, 0xE8,                                 //  6: FLD1
+    0xDE, 0xC1,                                 //  8: FADDP → 5.0
+    0xDB, 0x1D, 0x00, 0x40, 0x00, 0x00,        // 10: FISTP DWORD PTR [0x4000]
+    0x8B, 0x05, 0x00, 0x40, 0x00, 0x00,        // 16: MOV EAX, [0x4000]
+    0xC3,                                        // 22: RET
+};
+static_assert(sizeof(test5_code) == 23);
+
+static bool test_fpu_memory_store() {
+    printf("=== Test 5: x87 memory store (FISTP to RAM) ===\n");
+
+    MmioMap mmio = make_mmio();
+    auto exec = std::make_unique<XboxExecutor>();
+    if (!setup_exec(*exec, mmio, 0x5000, test5_code, sizeof(test5_code)))
+        return false;
+
+    exec->run(0x5000, 100'000);
+
+    uint32_t ram4000 = 0;
+    memcpy(&ram4000, exec->ram + 0x4000, 4);
+
+    printf("  EAX  = %u  \t(expected 5)\n",       exec->ctx.gp[GP_EAX]);
+    printf("  [0x4000] = %u  \t(expected 5)\n",   ram4000);
+
+    bool ok = exec->ctx.gp[GP_EAX] == 5u
+           && ram4000              == 5u;
+
+    printf("  %s\n", ok ? "PASS" : "FAIL");
+    exec->destroy();
+    return ok;
+}
+
+// ===========================================================================
 
 int main() {
     bool all_pass = true;
@@ -240,6 +355,10 @@ int main() {
     all_pass &= test_eflags_preservation();
     printf("\n");
     all_pass &= test_lea_push_pop();
+    printf("\n");
+    all_pass &= test_fpu_register_ops();
+    printf("\n");
+    all_pass &= test_fpu_memory_store();
 
     printf("\n%s\n", all_pass ? "ALL PASS" : "SOME FAILED");
     return all_pass ? 0 : 1;

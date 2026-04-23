@@ -52,6 +52,12 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         // Stash host_code (RSI) in R14 before we clobber RSI with guest ESI.
         "mov %%rsi, %%r14\n\t"
 
+        // ---- Save host FPU/SSE state, load guest FPU/SSE state ----------
+        "lea 624(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "fxsave (%%rax)\n\t"
+        "lea 112(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "fxrstor (%%rax)\n\t"
+
         // ---- Load guest GP registers into host registers -----------------
         // (ESP intentionally skipped — stays in ctx->gp[4])
         "movl  0(%%r13), %%eax\n\t"
@@ -74,6 +80,12 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         "movl %%ebp, 20(%%r13)\n\t"
         "movl %%esi, 24(%%r13)\n\t"
         "movl %%edi, 28(%%r13)\n\t"
+
+        // ---- Save guest FPU/SSE state, restore host FPU/SSE state -------
+        "lea 112(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "fxsave (%%rax)\n\t"
+        "lea 624(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "fxrstor (%%rax)\n\t"
 
         // ---- Epilog: restore host registers ------------------------------
 #ifdef _WIN32
@@ -110,6 +122,14 @@ bool XboxExecutor::init(MmioMap* mmio) {
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
+
+    // Initialize guest FPU state to clean defaults.
+    // FCW = 0x037F: all x87 exceptions masked, double precision, round-nearest
+    uint16_t fcw = 0x037F;
+    memcpy(ctx.guest_fpu + 0, &fcw, 2);
+    // MXCSR = 0x1F80: all SSE exceptions masked, round-nearest
+    uint32_t mxcsr = 0x1F80;
+    memcpy(ctx.guest_fpu + 24, &mxcsr, 4);
 
     return true;
 }
