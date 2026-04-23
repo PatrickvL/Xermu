@@ -304,6 +304,69 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
 }
 
 // ---------------------------------------------------------------------------
+// Generic memory-operand rewriter: rewrites any instruction to use [R12+R14]
+// instead of its original memory addressing. Handles x87, SSE, and integer
+// instructions uniformly.
+//
+// Precondition: EA has been computed into R14 by emit_ea_to_r14().
+//
+// Strategy:
+//   1. Copy legacy prefixes (skip address-size override and segment overrides)
+//   2. Emit REX = 0x43 (REX.X=1 for R14 index, REX.B=1 for R12 base)
+//   3. Copy opcode escape bytes (0F, 0F38, 0F3A) + opcode byte
+//   4. Emit new ModRM: mod=00, reg=original, rm=100 (SIB follows)
+//   5. Emit SIB = 0x34 (base=R12, index=R14, scale=1)
+//   6. Copy any immediate bytes
+// ---------------------------------------------------------------------------
+
+inline bool emit_rewrite_mem_to_fastmem(Emitter& e,
+                                         const ZydisDecodedInstruction& insn,
+                                         const uint8_t* raw) {
+    // 1. Copy legacy prefixes (skip address-size, segment overrides, REX)
+    for (uint8_t i = 0; i < insn.raw.prefix_count; ++i) {
+        uint8_t val = insn.raw.prefixes[i].value;
+        // Skip address-size override (not needed in 64-bit rewritten form)
+        if (val == 0x67) continue;
+        // Skip segment overrides (EA already resolved by emit_ea_to_r14)
+        if (val == 0x26 || val == 0x2E || val == 0x36 || val == 0x3E ||
+            val == 0x64 || val == 0x65) continue;
+        // Skip REX (guest is 32-bit, shouldn't have one; we emit our own)
+        if (val >= 0x40 && val <= 0x4F) continue;
+        e.emit8(val);
+    }
+
+    // 2. Emit REX = 0x43 (REX.X=1 for R14, REX.B=1 for R12)
+    e.emit8(0x43);
+
+    // 3. Emit opcode escape bytes + opcode
+    switch (insn.opcode_map) {
+    case ZYDIS_OPCODE_MAP_DEFAULT: break;
+    case ZYDIS_OPCODE_MAP_0F:     e.emit8(0x0F); break;
+    case ZYDIS_OPCODE_MAP_0F38:   e.emit8(0x0F); e.emit8(0x38); break;
+    case ZYDIS_OPCODE_MAP_0F3A:   e.emit8(0x0F); e.emit8(0x3A); break;
+    default: return false; // VEX/EVEX/XOP not supported
+    }
+    e.emit8(insn.opcode);
+
+    // 4. New ModRM: mod=00, reg=original reg field, rm=100 (SIB follows)
+    e.emit8(uint8_t((insn.raw.modrm.reg << 3) | 0x04));
+
+    // 5. SIB: scale=0, index=R14(110), base=R12(100) = 0x34
+    e.emit8(0x34);
+
+    // 6. Displacement is absorbed into R14 — skip it.
+
+    // 7. Copy immediate bytes (if any, e.g. SHUFPS xmm, [mem], imm8)
+    for (int j = 0; j < 2; ++j) {
+        if (insn.raw.imm[j].size > 0) {
+            e.copy(raw + insn.raw.imm[j].offset, insn.raw.imm[j].size / 8);
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Fastmem check: CMP R14, R15  (compare EA against ram_size)
 //   REX=0x45 (REX.R=1 R14, REX.B=1 R15), 0x3B, ModRM=mod=11 reg=6 rm=7 = 0xF7
 // ---------------------------------------------------------------------------

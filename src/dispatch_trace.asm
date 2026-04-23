@@ -11,6 +11,11 @@
 ;
 ; Guest GP registers live in host EAX–EDI while a trace runs.
 ; ESP is NOT mapped to host RSP; it stays in ctx->gp[GP_ESP].
+;
+; FPU/SSE state is saved/restored via FXSAVE/FXRSTOR on entry/exit.
+
+CTX_GUEST_FPU EQU 112
+CTX_HOST_FPU  EQU 624
 
 .code
 
@@ -35,6 +40,12 @@ dispatch_trace PROC
     mov     r15d, DWORD PTR [r13+56]       ; R15D = ctx->ram_size
     mov     r14, rsi                        ; Stash host_code in R14
 
+    ; Save host FPU/SSE state, load guest FPU/SSE state
+    lea     rax, [r13 + CTX_HOST_FPU]
+    fxsave  [rax]
+    lea     rax, [r13 + CTX_GUEST_FPU]
+    fxrstor [rax]
+
     ; Load guest GP registers into host registers
     ; (ESP intentionally skipped — stays in ctx->gp[4])
     mov     eax, DWORD PTR [r13+0]
@@ -56,6 +67,12 @@ dispatch_trace PROC
     mov     DWORD PTR [r13+20], ebp
     mov     DWORD PTR [r13+24], esi
     mov     DWORD PTR [r13+28], edi
+
+    ; Save guest FPU/SSE state, restore host FPU/SSE state
+    lea     rax, [r13 + CTX_GUEST_FPU]
+    fxsave  [rax]
+    lea     rax, [r13 + CTX_HOST_FPU]
+    fxrstor [rax]
 
     ; Restore callee-saved registers
     pop     rsi

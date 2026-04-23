@@ -58,7 +58,7 @@ Since guest ISA ≈ host ISA:
 | ESP           | NOT in host RSP — lives in `ctx->gp[GP_ESP]`     |
 | EIP           | Implicit (host instruction pointer within trace)  |
 | EFLAGS        | Host EFLAGS (direct, with caveats for INC/DEC)    |
-| FPU / SSE     | **Not yet implemented** — would be host FPU/SSE   |
+| FPU / SSE     | Host FPU/SSE via FXSAVE/FXRSTOR in trampoline     |
 | CR0/CR3/CR4   | Emulated fields in `GuestContext`                 |
 | GDT/IDT       | Emulated fields in `GuestContext`                 |
 | IF            | Virtual (`ctx->virtual_if` bool)                  |
@@ -134,6 +134,7 @@ Class IDs and their handlers:
 | IC_LEAVE      | LEAVE                                    | `emit_handler_leave`   |
 | IC_MOVZX_MEM  | MOVZX                                    | `emit_handler_movzx_mem` |
 | IC_MOVSX_MEM  | MOVSX                                    | `emit_handler_movsx_mem` |
+| IC_FPU_MEM    | FLD/FST/FISTP/FADD/FSUB/FMUL/FDIV/FCOM/FLDCW/... (27 x87 mnemonics) | `emit_handler_fpu_mem` |
 | IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/IRETD             | (inline in build loop) |
 | IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (inline UD2 trap)      |
 
@@ -170,14 +171,14 @@ and rebuild.
 | `mmio.hpp`            | MMIO region dispatch table                     | ✅ Working    |
 | `code_cache.hpp`      | 32 MB executable slab allocator                | ✅ Working    |
 | `trace.hpp`           | `Trace` struct, `TraceCache` hash table        | ✅ Working    |
-| `emitter.hpp`         | Byte emitter, EA synthesis, fastmem helpers    | ✅ Working    |
+| `emitter.hpp`         | Byte emitter, EA synthesis, fastmem helpers, generic mem rewriter | ✅ Working    |
 | `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `PageVersions`   | ✅ Working    |
 | `insn_dispatch.hpp`   | Two-level O(1) mnemonic dispatch table          | ✅ Working    |
 | `trace_builder.cpp`   | Decode → classify → emit loop (table-driven)   | ✅ Working    |
 | `executor.hpp`        | `XboxExecutor` struct, `dispatch_trace` decl   | ✅ Working    |
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
-| `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV     | ✅ ALL PASS   |
+| `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
 
 ---
 
@@ -194,6 +195,10 @@ and rebuild.
 - [x] ALU reg/mem forms (ADD/SUB/AND/OR/XOR/CMP/ADC/SBB/INC/DEC/NEG/NOT/shifts/rotates)
 - [x] MOVZX/MOVSX from memory (byte/word → dword zero/sign extension)
 - [x] LEAVE (MOV ESP,EBP + POP EBP)
+- [x] FPU/SSE state save/restore via FXSAVE/FXRSTOR in dispatch trampoline
+- [x] x87 register-only instructions run natively (FLD/FADD/FMUL/FCOM/FNSTSW/etc.)
+- [x] x87 memory-operand forms via generic `emit_rewrite_mem_to_fastmem()` rewriter
+- [x] Generic memory operand rewriter (rewrites any insn to use `[R12+R14]` fastmem)
 - [x] CALL near (direct + register-indirect) trace exit
 - [x] RET trace exit (stack read → `next_eip`, preserves live EAX)
 - [x] JMP direct/indirect/memory trace exit
@@ -203,7 +208,7 @@ and rebuild.
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
-- [x] Self-tests pass: sum loop + fastmem round-trip, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm
+- [x] Self-tests pass: sum loop, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm, x87 reg ops, x87 mem store
 
 ---
 
@@ -223,22 +228,25 @@ that would be clobbered. Only those sites emit the save/restore pair. Applied to
 `emit_mem_dispatch`, `emit_push`, and `emit_pop`. Verified by Test 2 (CMP+MOV+JE
 sequence where ZF must survive a memory load).
 
-#### 5.2 FPU / x87 / MMX / SSE State
-**Priority: HIGH** — The Xbox uses x87 for all floating-point math and SSE1 for
-SIMD. Every 3D game uses these extensively. The current executor doesn't touch
-FPU/SSE state at all.
+#### 5.2 ~~FPU / x87 / MMX / SSE State~~ ✅ DONE (x87 core)
+**Resolved for x87.** Guest FPU/SSE state is saved/restored via FXSAVE/FXRSTOR
+in the dispatch trampoline (both MASM and GCC/Clang inline asm). `GuestContext`
+now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 112) and `host_fpu`
+(offset 624), both 16-byte aligned.
 
-- x87 stack: 8×80-bit registers, TOP pointer, status/control words, tag word
-- MMX: aliases to x87 (ST0–ST7 as MM0–MM7)
-- SSE1: XMM0–XMM7 (128-bit), MXCSR
+- **Register-only x87 instructions** (FLD1, FADD ST(i), FCOMPP, FNSTSW AX, etc.)
+  run natively — verbatim-copied by the trace builder.
+- **Memory-operand x87 instructions** (FLD [mem], FSTP [mem], FISTP [mem], FLDCW
+  [mem], etc.) use the generic `emit_rewrite_mem_to_fastmem()` rewriter which
+  reconstructs any instruction to use `[R12+R14]` addressing. 27 x87 mnemonics
+  registered in the dispatch table under `IC_FPU_MEM`.
+- **Guest FPU defaults**: FCW = 0x037F (all exceptions masked, double precision),
+  MXCSR = 0x1F80 (all SSE exceptions masked).
+- Verified by Test 4 (FLD1+FADDP+FCOMPP+FNSTSW AX) and Test 5 (FISTP [mem]).
 
-Since host FPU/SSE state is directly usable for the guest (same ISA), the
-approach is:
-1. Save/restore host FPU/SSE state on executor entry/exit (FXSAVE/FXRSTOR or
-   XSAVE/XRSTOR)
-2. Let x87/MMX/SSE instructions run natively (verbatim copy in trace builder)
-3. Memory-operand forms (e.g., `MOVAPS [mem], XMM0`) still need the inline
-   fastmem dispatch pattern — extended to handle XMM register encodings
+**Still needed**: SSE memory-operand forms (MOVAPS, MOVUPS, etc.) — the generic
+rewriter supports them structurally, but they are not yet registered in the
+dispatch table. MMX memory forms also not yet registered.
 
 #### 5.3 String Instructions (REP MOVS/STOS/CMPS/SCAS/LODS)
 **Priority: HIGH** — Used by memcpy/memset/strlen and compiler intrinsics.
@@ -486,6 +494,15 @@ Expected output:
   ESI  = 0x12345678      (expected 0x12345678 = POP after PUSH imm)
   EDI  = 0x00000042      (expected 0x00000042 = MOV EDI,[0x4000])
   ESP  = 0x00080004      (expected 0x00080004 = STACK_TOP+4 after RET)
+  PASS
+
+=== Test 4: x87 register-only operations ===
+  EBX  = 1       (expected 1 = FCOMPP equal)
+  PASS
+
+=== Test 5: x87 memory store (FISTP to RAM) ===
+  EAX  = 5       (expected 5)
+  [0x4000] = 5           (expected 5)
   PASS
 
 ALL PASS

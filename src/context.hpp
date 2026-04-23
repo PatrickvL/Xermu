@@ -15,7 +15,7 @@
 
 // IMPORTANT: field offsets are referenced from asm trampolines.
 // Do not reorder without updating executor.cpp and emitter.hpp.
-struct GuestContext {
+struct alignas(16) GuestContext {
     // GP registers [offsets 0..28], in x86 ModRM encoding order.
     uint32_t  gp[8];         // [0]  EAX ECX EDX EBX ESP EBP ESI EDI
 
@@ -35,6 +35,11 @@ struct GuestContext {
     uint32_t  gdtr_base; uint16_t gdtr_limit; uint16_t _p1;
     uint32_t  idtr_base; uint16_t idtr_limit; uint16_t _p2;
     bool      virtual_if;
+
+    // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
+    // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
+    alignas(16) uint8_t guest_fpu[512];  // [112] guest x87/MMX/SSE state
+    alignas(16) uint8_t host_fpu[512];   // [624] saved host state
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);
@@ -43,6 +48,12 @@ static_assert(offsetof(GuestContext, next_eip)     == 40);
 static_assert(offsetof(GuestContext, fastmem_base) == 48);
 static_assert(offsetof(GuestContext, ram_size)     == 56);
 static_assert(offsetof(GuestContext, mmio)         == 64);
+static_assert(offsetof(GuestContext, guest_fpu)    == 112);
+static_assert(offsetof(GuestContext, host_fpu)     == 624);
+
+// Offsets used by asm trampolines (MASM + inline asm)
+inline constexpr int CTX_GUEST_FPU = 112;
+inline constexpr int CTX_HOST_FPU  = 624;
 
 // GP register indices (match x86 ModRM/SIB encoding order)
 enum : int {

@@ -509,6 +509,43 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
+// emit_handler_fpu_mem — x87 instructions with memory operand forms.
+// Register-only forms (FADD ST(i),ST(0) etc.) are verbatim-copied.
+// Memory forms use the generic rewriter to access [R12+R14].
+// ---------------------------------------------------------------------------
+bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
+                          const ZydisDecodedOperand* ops, const uint8_t* raw,
+                          GuestContext* /*ctx*/, bool save_flags) {
+    // Check if this instance actually has a memory operand.
+    int mem_idx = -1;
+    if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
+        // Register-only form: verbatim copy (works natively in 64-bit mode)
+        e.copy(raw, insn.length);
+        return true;
+    }
+
+    // Memory form: compute EA, bounds check, rewrite for fastmem
+    if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    if (save_flags) emit_save_flags(e);
+    emit_cmp_r14_r15(e);
+    uint8_t* slow_site = emit_jae_fwd(e);
+
+    // Fast path: rewrite the instruction to use [R12+R14]
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) {
+        return false;
+    }
+    uint8_t* done_site = emit_jmp_fwd(e);
+
+    // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
+    Emitter::patch_rel32(slow_site, e.cur());
+    e.emit8(0x0F); e.emit8(0x0B); // UD2
+
+    Emitter::patch_rel32(done_site, e.cur());
+    if (save_flags) emit_restore_flags(e);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Conditional branch exit
 // ---------------------------------------------------------------------------
 
