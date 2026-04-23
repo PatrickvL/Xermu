@@ -26,48 +26,23 @@ struct TraceBuilder {
     TraceBuilder();
 
     // Build and emit a trace starting at guest_eip.
-    // Returns the Trace on success, nullptr on error or unsupported instruction.
-    // `ram` must point to the start of guest physical RAM (same as fastmem_base).
     Trace* build(uint32_t           guest_eip,
                  const uint8_t*     ram,
                  uint32_t           ram_size,
                  CodeCache&         cc,
                  TraceArena&        arena,
                  const PageVersions& pv,
-                 GuestContext*      ctx);   // ctx needed for MMIO handler ptrs
+                 GuestContext*      ctx);
+
+    // has_mem_operand is used by emit handlers — needs to be accessible
+    static bool has_mem_operand(const ZydisDecodedOperand* ops, uint8_t count,
+                                 int& mem_op_idx);
 
 private:
     ZydisDecoder        decoder_;
 
     // Maps Zydis conditional-jump mnemonic to the 1-byte short-Jcc opcode.
     static uint8_t jcc_short_opcode(ZydisMnemonic m);
-
-    // Returns true if the instruction is a trace terminator (branch/call/ret).
-    static bool is_terminator(ZydisMnemonic m);
-
-    // Returns true if the instruction touches memory (has a MEM operand).
-    static bool has_mem_operand(const ZydisDecodedOperand* ops, uint8_t count,
-                                 int& mem_op_idx);
-
-    // Returns true for privileged instructions we must trap.
-    static bool is_privileged(ZydisMnemonic m);
-
-    // Emit a full inline memory-access dispatch for one instruction.
-    // Handles both load and store, all common sizes.
-    bool emit_mem_dispatch(Emitter&                    e,
-                           const ZydisDecodedInstruction& insn,
-                           const ZydisDecodedOperand*  ops,
-                           int                          mem_idx,
-                           GuestContext*                ctx,
-                           bool                         save_flags);
-
-    // Emit PUSH/POP sequences (they modify ESP inline).
-    bool emit_push(Emitter& e, const ZydisDecodedInstruction& insn,
-                   const ZydisDecodedOperand* ops, GuestContext* ctx,
-                   bool save_flags);
-    bool emit_pop(Emitter& e, const ZydisDecodedInstruction& insn,
-                  const ZydisDecodedOperand* ops, GuestContext* ctx,
-                  bool save_flags);
 
     // Emit a conditional-branch trace exit.
     void emit_cond_exit(Emitter& e, const ZydisDecodedInstruction& insn,
