@@ -84,6 +84,8 @@ SIGSEGV, no exception handling in the hot path:
 
 ```
 Synthesize EA → R14D
+PUSHFQ                 (save guest EFLAGS)
+LEA RSP, [RSP-8]       (re-align stack to 16 bytes)
 CMP R14, R15           (PA < ram_size?)
 JAE slow_path          (predicted not-taken)
 OP reg, [R12 + R14]    ← fastmem: direct host dereference, ~3 cycle overhead
@@ -93,7 +95,13 @@ slow_path:
   call mmio_dispatch_{read,write}(ctx, PA, gp_idx, size)
   load GP regs ← ctx
 done:
+LEA RSP, [RSP+8]       (undo alignment padding)
+POPFQ                  (restore guest EFLAGS)
 ```
+
+The PUSHFQ/POPFQ wrapping ensures that the CMP R14, R15 bounds check does not
+clobber guest EFLAGS. The LEA RSP adjustments maintain 16-byte stack alignment
+required by the host ABI (PUSHFQ pushes 8 bytes, LEA pads to 16).
 
 ### 2.4 Clean Instruction Handling
 
@@ -130,7 +138,7 @@ and rebuild.
 | `executor.hpp`        | `XboxExecutor` struct, `dispatch_trace` decl   | ✅ Working    |
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
-| `main.cpp`            | Self-test: sum 1..10, fastmem round-trip       | ✅ PASS       |
+| `main.cpp`            | Self-tests: sum loop + EFLAGS preservation     | ✅ ALL PASS   |
 
 ---
 
@@ -150,7 +158,8 @@ and rebuild.
 - [x] SMC page-version validation on trace re-entry
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
-- [x] Self-test passes: EAX=55, EBX=0xDEADBEEF, ECX=0, RAM round-trip
+- [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ wrapping)
+- [x] Self-tests pass: sum loop + fastmem round-trip, EFLAGS preservation
 
 ---
 
@@ -160,12 +169,12 @@ and rebuild.
 
 These are needed to execute non-trivial x86-32 programs beyond the self-test.
 
-#### 5.1 EFLAGS Preservation Across Slow Paths
-**Priority: HIGH** — Currently, MMIO slow paths (save GP → call C → load GP)
-clobber EFLAGS. Any instruction sequence where a flag-setting instruction is
-followed by a conditional branch, with a memory access in between, will
-malfunction if the memory access takes the slow path. Fix: save/restore EFLAGS
-around the slow-path call (PUSHFQ/POPFQ or LAHF/SAHF for the subset).
+#### 5.1 ~~EFLAGS Preservation Across Slow Paths~~ ✅ DONE
+**Resolved.** The CMP R14, R15 bounds check in every memory dispatch was
+clobbering guest EFLAGS. Fixed by wrapping the entire memory dispatch sequence
+(fastmem + slow path) in PUSHFQ/POPFQ with LEA-based stack alignment. Applied to
+`emit_mem_dispatch`, `emit_push`, and `emit_pop`. Verified by Test 2 (CMP+MOV+JE
+sequence where ZF must survive a memory load).
 
 #### 5.2 FPU / x87 / MMX / SSE State
 **Priority: HIGH** — The Xbox uses x87 for all floating-point math and SSE1 for
@@ -377,6 +386,7 @@ eliminating the CMP+JAE pair from every memory access.
 | 5 | Stack overflow on `XboxExecutor` construction | ~6.5 MB of embedded arrays (TraceCache, PageVersions) | Heap-allocate via `std::make_unique` |
 | 6 | MSVC: `#error` on `dispatch_trace` | GCC `__attribute__((naked))` not available on MSVC x64 | MASM `.asm` trampoline for MSVC |
 | 7 | MMIO slow-path calls corrupt args on Windows | JIT emitted SysV ABI (RDI/RSI/RDX/RCX) on Windows | Platform-aware `emit_ccall_arg*` helpers + shadow space |
+| 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | PUSHFQ/POPFQ wrapping with LEA stack alignment around all dispatch sequences |
 
 ---
 
@@ -410,14 +420,20 @@ cmake --build build --config Release
 
 Expected output:
 ```
-Running guest from PA 00001000 ...
-ctx.gp[EAX]  = 55        (expected 55)
-ctx.gp[EBX]  = 0xDEADBEEF (expected 0xDEADBEEF)
-ctx.gp[ECX]  = 0          (expected 0)
-RAM[0x4000]  = 55         (expected 55)
-RAM[0x4004]  = 55         (expected 55)
+=== Test 1: Sum loop + fastmem round-trip ===
+  EAX  = 55      (expected 55)
+  EBX  = 0xDEADBEEF      (expected 0xDEADBEEF)
+  ECX  = 0       (expected 0)
+  [0x4000] = 55          (expected 55)
+  [0x4004] = 55          (expected 55)
+  PASS
 
-PASS
+=== Test 2: EFLAGS preservation across memory dispatch ===
+  EBX  = 1       (expected 1 = JE taken)
+  EDX  = 42      (expected 42 = loaded from RAM)
+  PASS
+
+ALL PASS
 ```
 
 ---

@@ -138,6 +138,7 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
 
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
 
+    emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
     emit_fastmem_op(e, guest_enc, size_bits, is_load);
@@ -155,6 +156,7 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
     emit_load_all_gp(e);
 
     Emitter::patch_rel32(done_site, e.cur());
+    emit_restore_flags(e);
     return true;
 }
 
@@ -170,6 +172,7 @@ bool TraceBuilder::emit_push(Emitter& e,
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     if (!reg32_enc(ops[0].reg.value, reg_enc))       return false;
 
+    emit_save_flags(e);
     emit_sub_ctx_esp(e, 4);
     emit_load_esp_to_r14(e);
 
@@ -188,6 +191,7 @@ bool TraceBuilder::emit_push(Emitter& e,
     emit_load_all_gp(e);
 
     Emitter::patch_rel32(done_site, e.cur());
+    emit_restore_flags(e);
     return true;
 }
 
@@ -203,6 +207,7 @@ bool TraceBuilder::emit_pop(Emitter& e,
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     if (!reg32_enc(ops[0].reg.value, reg_enc))       return false;
 
+    emit_save_flags(e);
     emit_load_esp_to_r14(e);
 
     emit_cmp_r14_r15(e);
@@ -221,6 +226,7 @@ bool TraceBuilder::emit_pop(Emitter& e,
 
     Emitter::patch_rel32(done_site, e.cur());
     emit_add_ctx_esp(e, 4);
+    emit_restore_flags(e);
     return true;
 }
 
