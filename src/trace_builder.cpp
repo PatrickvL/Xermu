@@ -126,7 +126,8 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
                                       const ZydisDecodedInstruction& insn,
                                       const ZydisDecodedOperand* ops,
                                       int mem_idx,
-                                      GuestContext* /*ctx*/) {
+                                      GuestContext* /*ctx*/,
+                                      bool save_flags) {
     int  reg_op_idx = (mem_idx == 0) ? 1 : 0;
     bool is_load    = (mem_idx != 0);
 
@@ -138,7 +139,7 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
 
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
 
-    emit_save_flags(e);
+    if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
     emit_fastmem_op(e, guest_enc, size_bits, is_load);
@@ -156,7 +157,7 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
     emit_load_all_gp(e);
 
     Emitter::patch_rel32(done_site, e.cur());
-    emit_restore_flags(e);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -167,12 +168,13 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
 bool TraceBuilder::emit_push(Emitter& e,
                               const ZydisDecodedInstruction& /*insn*/,
                               const ZydisDecodedOperand* ops,
-                              GuestContext* /*ctx*/) {
+                              GuestContext* /*ctx*/,
+                              bool save_flags) {
     uint8_t reg_enc = 0;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     if (!reg32_enc(ops[0].reg.value, reg_enc))       return false;
 
-    emit_save_flags(e);
+    if (save_flags) emit_save_flags(e);
     emit_sub_ctx_esp(e, 4);
     emit_load_esp_to_r14(e);
 
@@ -191,7 +193,7 @@ bool TraceBuilder::emit_push(Emitter& e,
     emit_load_all_gp(e);
 
     Emitter::patch_rel32(done_site, e.cur());
-    emit_restore_flags(e);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -202,12 +204,13 @@ bool TraceBuilder::emit_push(Emitter& e,
 bool TraceBuilder::emit_pop(Emitter& e,
                              const ZydisDecodedInstruction& /*insn*/,
                              const ZydisDecodedOperand* ops,
-                             GuestContext* /*ctx*/) {
+                             GuestContext* /*ctx*/,
+                             bool save_flags) {
     uint8_t reg_enc = 0;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     if (!reg32_enc(ops[0].reg.value, reg_enc))       return false;
 
-    emit_save_flags(e);
+    if (save_flags) emit_save_flags(e);
     emit_load_esp_to_r14(e);
 
     emit_cmp_r14_r15(e);
@@ -226,7 +229,7 @@ bool TraceBuilder::emit_pop(Emitter& e,
 
     Emitter::patch_rel32(done_site, e.cur());
     emit_add_ctx_esp(e, 4);
-    emit_restore_flags(e);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -381,6 +384,12 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
 static constexpr size_t MAX_TRACE_BYTES = 8192;
 static constexpr size_t MAX_INSN_COUNT  = 512;
 
+// Arithmetic flags clobbered by the inline CMP R14,R15 bounds check and
+// SUB/ADD ctx->gp[ESP] in memory dispatch sequences.
+static constexpr uint32_t ARITH_FLAGS =
+    ZYDIS_CPUFLAG_CF | ZYDIS_CPUFLAG_PF | ZYDIS_CPUFLAG_AF |
+    ZYDIS_CPUFLAG_ZF | ZYDIS_CPUFLAG_SF | ZYDIS_CPUFLAG_OF;
+
 Trace* TraceBuilder::build(uint32_t            guest_eip,
                             const uint8_t*      ram,
                             uint32_t            ram_size,
@@ -393,6 +402,89 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
         return nullptr;
     }
 
+    // =================================================================
+    // Phase 1: Pre-scan — decode instructions, extract flag metadata.
+    // =================================================================
+    struct InsnMeta {
+        uint8_t  length;
+        uint32_t flags_tested;
+        uint32_t flags_written;
+        bool     has_dispatch;  // mem_dispatch / PUSH / POP
+        bool     need_save;     // set by Phase 2
+    };
+
+    InsnMeta meta[MAX_INSN_COUNT];
+    size_t   n_insns = 0;
+
+    {
+        const uint8_t* scan_pc       = ram + guest_eip;
+        uint32_t       scan_guest_pc = guest_eip;
+        const uint32_t scan_page     = guest_eip & ~0xFFFu;
+
+        for (size_t i = 0; i < MAX_INSN_COUNT; ++i) {
+            if (scan_guest_pc >= ram_size) break;
+
+            ZydisDecodedInstruction insn;
+            ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+            ZyanUSize avail = ram_size - scan_guest_pc;
+            if (avail > 15) avail = 15;
+
+            ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, scan_pc, avail,
+                                                   &insn, ops);
+            if (!ZYAN_SUCCESS(st)) break;
+
+            uint32_t tested = 0, written = 0;
+            if (insn.cpu_flags) {
+                tested  = insn.cpu_flags->tested;
+                written = insn.cpu_flags->modified | insn.cpu_flags->set_0 |
+                          insn.cpu_flags->set_1    | insn.cpu_flags->undefined;
+            }
+
+            bool dispatch = false;
+            if (!is_terminator(insn.mnemonic) && !is_privileged(insn.mnemonic)) {
+                if (insn.mnemonic == ZYDIS_MNEMONIC_PUSH ||
+                    insn.mnemonic == ZYDIS_MNEMONIC_POP) {
+                    dispatch = true;
+                } else {
+                    int mi = -1;
+                    if (has_mem_operand(ops, insn.operand_count, mi))
+                        dispatch = true;
+                }
+            }
+
+            meta[n_insns++] = { insn.length, tested, written, dispatch, false };
+
+            if (is_terminator(insn.mnemonic) || is_privileged(insn.mnemonic))
+                break;
+
+            scan_pc       += insn.length;
+            scan_guest_pc += insn.length;
+            if ((scan_guest_pc & ~0xFFFu) != scan_page) break;
+        }
+    }
+
+    // =================================================================
+    // Phase 2: Backward flag-liveness analysis.
+    //
+    // `live` tracks flags that are alive AFTER the current instruction.
+    // At the trace exit no flags survive (next trace starts fresh).
+    // For each instruction: live_before = (live_after & ~written) | tested.
+    // A dispatch needs save/restore only if live_before has arithmetic flags.
+    // =================================================================
+    {
+        uint32_t live = 0;
+        for (int i = (int)n_insns - 1; i >= 0; --i) {
+            uint32_t live_before =
+                (live & ~meta[i].flags_written) | meta[i].flags_tested;
+            meta[i].need_save =
+                meta[i].has_dispatch && (live_before & ARITH_FLAGS) != 0;
+            live = live_before;
+        }
+    }
+
+    // =================================================================
+    // Phase 3: Emit — re-decode and generate host code.
+    // =================================================================
     uint8_t* emit_buf = cc.alloc(MAX_TRACE_BYTES);
     if (!emit_buf) { fprintf(stderr, "[trace] code cache full\n"); return nullptr; }
 
@@ -401,6 +493,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     uint32_t       guest_pc  = guest_eip;
     const uint32_t page_base = guest_eip & ~0xFFFu;
     bool           done_flag = false;
+    size_t         insn_idx  = 0;
 
     for (size_t n = 0; n < MAX_INSN_COUNT && !done_flag; ++n) {
         if (guest_pc >= ram_size) {
@@ -453,7 +546,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         // ---- PUSH / POP ----
         if (insn.mnemonic == ZYDIS_MNEMONIC_PUSH) {
-            if (!emit_push(e, insn, ops, ctx)) {
+            bool save = (insn_idx < n_insns) && meta[insn_idx].need_save;
+            if (!emit_push(e, insn, ops, ctx, save)) {
                 fprintf(stderr, "[trace] unsupported PUSH at %08X\n", guest_pc);
                 emit_epilog_static(e, guest_pc);
                 done_flag = true;
@@ -461,7 +555,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             goto advance;
         }
         if (insn.mnemonic == ZYDIS_MNEMONIC_POP) {
-            if (!emit_pop(e, insn, ops, ctx)) {
+            bool save = (insn_idx < n_insns) && meta[insn_idx].need_save;
+            if (!emit_pop(e, insn, ops, ctx, save)) {
                 fprintf(stderr, "[trace] unsupported POP at %08X\n", guest_pc);
                 emit_epilog_static(e, guest_pc);
                 done_flag = true;
@@ -482,7 +577,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             // ---- Memory operand ----
             int mem_idx = -1;
             if (has_mem_operand(ops, insn.operand_count, mem_idx)) {
-                if (!emit_mem_dispatch(e, insn, ops, mem_idx, ctx)) {
+                bool save = (insn_idx < n_insns) && meta[insn_idx].need_save;
+                if (!emit_mem_dispatch(e, insn, ops, mem_idx, ctx, save)) {
                     fprintf(stderr, "[trace] unsupported mem insn %d at %08X\n",
                             insn.mnemonic, guest_pc);
                     emit_epilog_static(e, guest_pc);
@@ -498,6 +594,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     advance:
         pc       += insn.length;
         guest_pc  = pc_after;
+        ++insn_idx;
 
         if (!done_flag && (guest_pc & ~0xFFFu) != page_base) {
             emit_epilog_static(e, guest_pc);

@@ -58,13 +58,16 @@ private:
                            const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand*  ops,
                            int                          mem_idx,
-                           GuestContext*                ctx);
+                           GuestContext*                ctx,
+                           bool                         save_flags);
 
     // Emit PUSH/POP sequences (they modify ESP inline).
     bool emit_push(Emitter& e, const ZydisDecodedInstruction& insn,
-                   const ZydisDecodedOperand* ops, GuestContext* ctx);
+                   const ZydisDecodedOperand* ops, GuestContext* ctx,
+                   bool save_flags);
     bool emit_pop(Emitter& e, const ZydisDecodedInstruction& insn,
-                  const ZydisDecodedOperand* ops, GuestContext* ctx);
+                  const ZydisDecodedOperand* ops, GuestContext* ctx,
+                  bool save_flags);
 
     // Emit a conditional-branch trace exit.
     void emit_cond_exit(Emitter& e, const ZydisDecodedInstruction& insn,
