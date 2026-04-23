@@ -40,16 +40,11 @@ struct XboxExecutor {
 // ---------------------------------------------------------------------------
 // Assembly trampoline: load guest registers, call trace, save back.
 //
-// Calling convention (System V AMD64):
-//   arg0 (RDI) = GuestContext*
-//   arg1 (RSI) = void*  (host_code pointer into code cache)
+// GCC/Clang: naked function with inline asm in executor.cpp.
+// MSVC:      MASM implementation in dispatch_trace.asm.
 //
-// Windows x64 differs (args in RCX, RDX; RDI/RSI are callee-saved).
-// A MASM implementation with the same logic is needed for MSVC builds.
+// System V AMD64: args in RDI, RSI.
+// Windows x64:    args in RCX, RDX; RDI/RSI are callee-saved.
 // ---------------------------------------------------------------------------
 
-#if defined(__GNUC__) || defined(__clang__)
 extern "C" void dispatch_trace(GuestContext* ctx, void* host_code);
-#else
-#  error "dispatch_trace() requires GCC or Clang. Provide a MASM .asm for MSVC."
-#endif

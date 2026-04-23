@@ -19,17 +19,21 @@ set(ZYDIS_FEATURE_ENCODER   OFF CACHE BOOL "" FORCE)
 set(ZYDIS_MINIMAL_MODE      OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zydis)
 
-add_executable(xbox_executor
-    src/trace_builder.cpp
-    src/executor.cpp
-    src/main.cpp
+set(SOURCES
+    trace_builder.cpp
+    executor.cpp
+    main.cpp
 )
-target_include_directories(xbox_executor PRIVATE src)
+
+if(MSVC)
+    enable_language(ASM_MASM)
+    list(APPEND SOURCES dispatch_trace.asm)
+endif()
+
+add_executable(xbox_executor ${SOURCES})
 target_link_libraries(xbox_executor PRIVATE Zydis)
 
 if(MSVC)
-    message(WARNING "MSVC: dispatch_trace() trampoline is GCC/Clang-only. "
-                    "Provide a MASM .asm with the same logic for MSVC builds.")
     target_compile_options(xbox_executor PRIVATE /W3)
 else()
     target_compile_options(xbox_executor PRIVATE -Wall -Wextra -O2)

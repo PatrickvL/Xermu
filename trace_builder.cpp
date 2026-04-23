@@ -145,10 +145,10 @@ bool TraceBuilder::emit_mem_dispatch(Emitter& e,
 
     Emitter::patch_rel32(slow_site, e.cur());
     emit_save_all_gp(e);
-    emit_mov_rdi_r13(e);
-    emit_mov_esi_r14d(e);
-    emit_mov_edx_imm(e, guest_enc);
-    emit_mov_ecx_imm(e, size_bits / 8);
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_pa(e);
+    emit_ccall_arg2_imm(e, guest_enc);
+    emit_ccall_arg3_imm(e, size_bits / 8);
     emit_call_abs(e, is_load
         ? reinterpret_cast<void*>(mmio_dispatch_read)
         : reinterpret_cast<void*>(mmio_dispatch_write));
@@ -180,10 +180,10 @@ bool TraceBuilder::emit_push(Emitter& e,
 
     Emitter::patch_rel32(slow_site, e.cur());
     emit_save_all_gp(e);
-    emit_mov_rdi_r13(e);
-    emit_mov_esi_r14d(e);
-    emit_mov_edx_imm(e, reg_enc);
-    emit_mov_ecx_imm(e, 4);
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_pa(e);
+    emit_ccall_arg2_imm(e, reg_enc);
+    emit_ccall_arg3_imm(e, 4);
     emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
     emit_load_all_gp(e);
 
@@ -212,10 +212,10 @@ bool TraceBuilder::emit_pop(Emitter& e,
 
     Emitter::patch_rel32(slow_site, e.cur());
     emit_save_all_gp(e);
-    emit_mov_rdi_r13(e);
-    emit_mov_esi_r14d(e);
-    emit_mov_edx_imm(e, reg_enc);
-    emit_mov_ecx_imm(e, 4);
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_pa(e);
+    emit_ccall_arg2_imm(e, reg_enc);
+    emit_ccall_arg3_imm(e, 4);
     emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
     emit_load_all_gp(e);
 
@@ -345,10 +345,10 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     // Step 4b (slow / MMIO): call mmio_dispatch_read; result lands in ctx->gp[EAX].
     // Then reload EAX from ctx so both paths converge: EAX = return address.
     Emitter::patch_rel32(slow, e.cur());
-    emit_mov_rdi_r13(e);
-    emit_mov_esi_r14d(e);
-    emit_mov_edx_imm(e, GP_EAX);
-    emit_mov_ecx_imm(e, 4);
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_pa(e);
+    emit_ccall_arg2_imm(e, GP_EAX);
+    emit_ccall_arg3_imm(e, 4);
     emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
     emit_load_gp(e, GP_EAX, gp_offset(GP_EAX));   // EAX = ctx->gp[EAX] (retaddr)
 
