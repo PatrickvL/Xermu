@@ -20,17 +20,18 @@ set(ZYDIS_MINIMAL_MODE      OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zydis)
 
 set(SOURCES
-    trace_builder.cpp
-    executor.cpp
-    main.cpp
+    src/trace_builder.cpp
+    src/executor.cpp
+    src/main.cpp
 )
 
 if(MSVC)
     enable_language(ASM_MASM)
-    list(APPEND SOURCES dispatch_trace.asm)
+    list(APPEND SOURCES src/dispatch_trace.asm)
 endif()
 
 add_executable(xbox_executor ${SOURCES})
+target_include_directories(xbox_executor PRIVATE src)
 target_link_libraries(xbox_executor PRIVATE Zydis)
 
 if(MSVC)
