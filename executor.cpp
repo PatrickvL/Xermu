@@ -25,6 +25,7 @@
 //   (they are callee-saved on Windows but not on SysV).
 // ---------------------------------------------------------------------------
 
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((naked))
 void dispatch_trace([[maybe_unused]] GuestContext* ctx,
                     [[maybe_unused]] void*         host_code) {
@@ -89,6 +90,7 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         ::: // no C-level inputs/outputs; all state is through memory (ctx)
     );
 }
+#endif // GCC/Clang — MSVC uses dispatch_trace.asm
 
 // ---------------------------------------------------------------------------
 // XboxExecutor

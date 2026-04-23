@@ -356,11 +356,20 @@ inline void emit_fastmem_movzx(Emitter& e, uint8_t guest_enc, unsigned src_bits)
 //   MOVABS R14, imm64 + CALL R14
 //   REX.W=1, REX.B=1 (R14): 0x49 0xBE imm64
 //   CALL R14: REX.B=1 → 0x41 0xFF 0xD6
+// On Windows, allocates/frees the required 32-byte shadow space.
 // ---------------------------------------------------------------------------
 
 inline void emit_call_abs(Emitter& e, const void* target) {
+#ifdef _WIN32
+    // SUB RSP, 0x20
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x20);
+#endif
     e.emit8(0x49); e.emit8(0xBE); e.emit64((uint64_t)(uintptr_t)target);
     e.emit8(0x41); e.emit8(0xFF); e.emit8(0xD6);
+#ifdef _WIN32
+    // ADD RSP, 0x20
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x20);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -395,38 +404,57 @@ inline void emit_load_esp_to_r14(Emitter& e) {
 
 // ---------------------------------------------------------------------------
 // MMIO slow-path call helpers.
-// Called after emit_save_all_gp so host RDI/RSI/RDX/RCX are free.
+// Called after emit_save_all_gp so all guest-mapped host registers are free.
+// Each helper emits the correct register for the current platform's ABI.
 //
 // System V AMD64 ABI:  args in RDI, RSI, RDX, RCX
 // Windows x64 ABI:     args in RCX, RDX, R8,  R9
 //
-// We emit the SysV layout here.  A Windows port would swap the order.
-// Both ABIs: R13 = ctx (not a volatile register in either ABI once in JIT).
+// Both ABIs: R13 = ctx (callee-saved, not clobbered by the call).
 // ---------------------------------------------------------------------------
 
-// Set RDI = R13 (ctx):  49 8B FD  (MOV RDI, R13 via r/m64 form)
-inline void emit_mov_rdi_r13(Emitter& e) {
+// arg0 = GuestContext* (from R13)
+inline void emit_ccall_arg0_ctx(Emitter& e) {
+#ifdef _WIN32
+    // MOV RCX, R13
+    e.emit8(0x4C); e.emit8(0x89); e.emit8(0xE9);
+#else
+    // MOV RDI, R13
     e.emit8(0x49); e.emit8(0x8B); e.emit8(0xFD);
+#endif
 }
 
-// Set RSI = R14D (PA, zero-extended):  45 89 F6 (wrong encoding below, see manual)
-// Actually: MOV ESI, R14D — zero-extends to RSI.
-// R14=src(REX.B=1, rm=6), ESI=dst(reg=6). Using 0x89 form:
-//   REX=0x44 (REX.R for R14 as reg... hmm let's use 0x8B form instead)
-// MOV ESI, R14D using 0x8B (mov r32, r/m32): dest=ESI(6) src=R14(rm=6,REX.B=1)
-//   REX=0x41, 0x8B, mod=11 reg=6(ESI) rm=6(R14) = 0xF6
-inline void emit_mov_esi_r14d(Emitter& e) {
+// arg1 = PA (from R14D)
+inline void emit_ccall_arg1_pa(Emitter& e) {
+#ifdef _WIN32
+    // MOV EDX, R14D
+    e.emit8(0x44); e.emit8(0x89); e.emit8(0xF2);
+#else
+    // MOV ESI, R14D (zero-extends to RSI)
     e.emit8(0x41); e.emit8(0x8B); e.emit8(0xF6);
+#endif
 }
 
-// MOV EDX, imm32
-inline void emit_mov_edx_imm(Emitter& e, uint32_t v) {
+// arg2 = imm32
+inline void emit_ccall_arg2_imm(Emitter& e, uint32_t v) {
+#ifdef _WIN32
+    // MOV R8D, imm32
+    e.emit8(0x41); e.emit8(0xB8); e.emit32(v);
+#else
+    // MOV EDX, imm32
     e.emit8(0xBA); e.emit32(v);
+#endif
 }
 
-// MOV ECX, imm32
-inline void emit_mov_ecx_imm(Emitter& e, uint32_t v) {
+// arg3 = imm32
+inline void emit_ccall_arg3_imm(Emitter& e, uint32_t v) {
+#ifdef _WIN32
+    // MOV R9D, imm32
+    e.emit8(0x41); e.emit8(0xB9); e.emit32(v);
+#else
+    // MOV ECX, imm32
     e.emit8(0xB9); e.emit32(v);
+#endif
 }
 
 // ---------------------------------------------------------------------------

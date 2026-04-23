@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <memory>
 
 // ---------------------------------------------------------------------------
 // Guest program (hand-assembled, 32-bit protected mode, load PA = 0x1000):
@@ -86,43 +87,43 @@ int main() {
     mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
              stub_mmio_read, stub_mmio_write);
 
-    XboxExecutor exec;
-    if (!exec.init(&mmio)) { fprintf(stderr, "init failed\n"); return 1; }
+    auto exec = std::make_unique<XboxExecutor>();
+    if (!exec->init(&mmio)) { fprintf(stderr, "init failed\n"); return 1; }
 
     static constexpr uint32_t LOAD_PA = 0x1000;
-    exec.load_guest(LOAD_PA, guest_code, sizeof(guest_code));
+    exec->load_guest(LOAD_PA, guest_code, sizeof(guest_code));
 
     // Stack well inside RAM; initial frame is just the sentinel return address.
     static constexpr uint32_t STACK_TOP = 0x0008'0000;
-    exec.ctx.gp[GP_ESP] = STACK_TOP;
+    exec->ctx.gp[GP_ESP] = STACK_TOP;
     // Place a real sentinel return address on the stack so RET can succeed
     // with a predictable EIP that the run loop will cleanly halt on.
     static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
-    memcpy(exec.ram + STACK_TOP, &SENTINEL_EIP, 4);
+    memcpy(exec->ram + STACK_TOP, &SENTINEL_EIP, 4);
 
-    exec.ctx.eflags = 0x0000'0202;
+    exec->ctx.eflags = 0x0000'0202;
 
     printf("Running guest from PA %08X ...\n", LOAD_PA);
-    exec.run(LOAD_PA, /*max_steps=*/100'000);
+    exec->run(LOAD_PA, /*max_steps=*/100'000);
 
     // Post-conditions
     uint32_t ram4000 = 0, ram4004 = 0;
-    memcpy(&ram4000, exec.ram + 0x4000, 4);
-    memcpy(&ram4004, exec.ram + 0x4004, 4);
+    memcpy(&ram4000, exec->ram + 0x4000, 4);
+    memcpy(&ram4004, exec->ram + 0x4004, 4);
 
-    printf("ctx.gp[EAX]  = %u  \t(expected 55)\n",   exec.ctx.gp[GP_EAX]);
-    printf("ctx.gp[EBX]  = 0x%08X\t(expected 0xDEADBEEF)\n", exec.ctx.gp[GP_EBX]);
-    printf("ctx.gp[ECX]  = %u  \t(expected 0)\n",    exec.ctx.gp[GP_ECX]);
+    printf("ctx.gp[EAX]  = %u  \t(expected 55)\n",   exec->ctx.gp[GP_EAX]);
+    printf("ctx.gp[EBX]  = 0x%08X\t(expected 0xDEADBEEF)\n", exec->ctx.gp[GP_EBX]);
+    printf("ctx.gp[ECX]  = %u  \t(expected 0)\n",    exec->ctx.gp[GP_ECX]);
     printf("RAM[0x4000]  = %u  \t(expected 55)\n",   ram4000);
     printf("RAM[0x4004]  = %u  \t(expected 55)\n",   ram4004);
 
-    bool ok = exec.ctx.gp[GP_EAX] == 55u
-           && exec.ctx.gp[GP_EBX] == 0xDEADBEEFu
-           && exec.ctx.gp[GP_ECX] == 0u
+    bool ok = exec->ctx.gp[GP_EAX] == 55u
+           && exec->ctx.gp[GP_EBX] == 0xDEADBEEFu
+           && exec->ctx.gp[GP_ECX] == 0u
            && ram4000              == 55u
            && ram4004              == 55u;
 
     printf("\n%s\n", ok ? "PASS" : "FAIL");
-    exec.destroy();
+    exec->destroy();
     return ok ? 0 : 1;
 }
