@@ -84,8 +84,7 @@ SIGSEGV, no exception handling in the hot path:
 
 ```
 Synthesize EA → R14D
-PUSHFQ                 (save guest EFLAGS)
-LEA RSP, [RSP-8]       (re-align stack to 16 bytes)
+[PUSHFQ + LEA RSP,-8]  (only if backward liveness says arithmetic flags are live)
 CMP R14, R15           (PA < ram_size?)
 JAE slow_path          (predicted not-taken)
 OP reg, [R12 + R14]    ← fastmem: direct host dereference, ~3 cycle overhead
@@ -95,13 +94,16 @@ slow_path:
   call mmio_dispatch_{read,write}(ctx, PA, gp_idx, size)
   load GP regs ← ctx
 done:
-LEA RSP, [RSP+8]       (undo alignment padding)
-POPFQ                  (restore guest EFLAGS)
+[LEA RSP,+8 + POPFQ]  (only if saved above)
 ```
 
 The PUSHFQ/POPFQ wrapping ensures that the CMP R14, R15 bounds check does not
-clobber guest EFLAGS. The LEA RSP adjustments maintain 16-byte stack alignment
-required by the host ABI (PUSHFQ pushes 8 bytes, LEA pads to 16).
+clobber guest EFLAGS when they are live. The wrapping is conditional: a backward
+flag-liveness analysis during trace building determines which dispatch sites
+actually need it. A flag is "live" if it was set by a prior guest instruction
+and will be tested by a later instruction (Jcc, CMOVcc, SETcc, etc.) before
+being overwritten. Dispatches where no arithmetic flags are live skip the
+PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 
 ### 2.4 Clean Instruction Handling
 
@@ -158,7 +160,7 @@ and rebuild.
 - [x] SMC page-version validation on trace re-entry
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
-- [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ wrapping)
+- [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
 - [x] Self-tests pass: sum loop + fastmem round-trip, EFLAGS preservation
 
 ---
@@ -171,8 +173,11 @@ These are needed to execute non-trivial x86-32 programs beyond the self-test.
 
 #### 5.1 ~~EFLAGS Preservation Across Slow Paths~~ ✅ DONE
 **Resolved.** The CMP R14, R15 bounds check in every memory dispatch was
-clobbering guest EFLAGS. Fixed by wrapping the entire memory dispatch sequence
-(fastmem + slow path) in PUSHFQ/POPFQ with LEA-based stack alignment. Applied to
+clobbering guest EFLAGS. Fixed with conditional PUSHFQ/POPFQ wrapping gated by
+a backward flag-liveness analysis: the trace builder pre-scans all instructions
+to extract per-instruction flags-tested/flags-written (from Zydis `cpu_flags`),
+then sweeps backward to determine which dispatch sites have live arithmetic flags
+that would be clobbered. Only those sites emit the save/restore pair. Applied to
 `emit_mem_dispatch`, `emit_push`, and `emit_pop`. Verified by Test 2 (CMP+MOV+JE
 sequence where ZF must survive a memory load).
 
@@ -386,7 +391,7 @@ eliminating the CMP+JAE pair from every memory access.
 | 5 | Stack overflow on `XboxExecutor` construction | ~6.5 MB of embedded arrays (TraceCache, PageVersions) | Heap-allocate via `std::make_unique` |
 | 6 | MSVC: `#error` on `dispatch_trace` | GCC `__attribute__((naked))` not available on MSVC x64 | MASM `.asm` trampoline for MSVC |
 | 7 | MMIO slow-path calls corrupt args on Windows | JIT emitted SysV ABI (RDI/RSI/RDX/RCX) on Windows | Platform-aware `emit_ccall_arg*` helpers + shadow space |
-| 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | PUSHFQ/POPFQ wrapping with LEA stack alignment around all dispatch sequences |
+| 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | Conditional PUSHFQ/POPFQ wrapping gated by backward flag-liveness analysis |
 
 ---
 
