@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// xbox.hpp — Xbox physical address map + device stubs (umbrella header).
+// xbox.hpp ï¿½ Xbox physical address map + device stubs (umbrella header).
 //
 // Individual device headers live in src/xbox/.  This file includes them all
 // so that existing consumers (test_runner.cpp, xbe_loader.hpp, main.cpp) can
@@ -9,6 +9,7 @@
 
 #include "xbox/address_map.hpp"
 #include "xbox/nv2a.hpp"
+#include "xbox/pgraph.hpp"
 #include "xbox/apu.hpp"
 #include "xbox/ide.hpp"
 #include "xbox/usb.hpp"

@@ -58,6 +58,10 @@ struct Nv2aState {
     uint32_t fifo_dwords_consumed    = 0;
     uint32_t fifo_jumps              = 0;
 
+    // Pointer to PGRAPH state shadow (set by xbox_setup, used for diag reads).
+    struct PgraphState;  // forward decl — full definition in pgraph.hpp
+    void* pgraph_ptr = nullptr;  // points to PgraphState
+
     // PCRTC vblank
     uint32_t vblank_counter = 0;
     static constexpr uint32_t VBLANK_PERIOD = 16667;

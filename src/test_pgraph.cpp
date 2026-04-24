@@ -1,0 +1,140 @@
+// ---------------------------------------------------------------------------
+// test_pgraph.cpp — Unit test for PgraphState method handling.
+//
+// Constructs NV2A push buffer commands, feeds them through Nv2aState's
+// tick_fifo → PgraphState::handle_method chain, and verifies that the
+// PGRAPH state shadow captures the correct values.
+// ---------------------------------------------------------------------------
+
+#include "xbox/nv2a.hpp"
+#include "xbox/pgraph.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static int g_pass = 0;
+static int g_fail = 0;
+
+#define CHECK(cond, msg) do { \
+    if (cond) { g_pass++; } \
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", msg); } \
+} while(0)
+
+// Build an INCREASING method header.
+static uint32_t pb_inc(uint32_t method, uint32_t subchan, uint32_t count) {
+    return (count << 18) | (subchan << 13) | method;
+}
+
+int main() {
+    using namespace xbox;
+    using namespace xbox::nv097;
+
+    // Set up NV2A state + PGRAPH state shadow.
+    Nv2aState nv2a;
+    PgraphState pgraph;
+    nv2a.method_handler = pgraph_method_handler;
+    nv2a.method_user    = &pgraph;
+
+    // Allocate a small RAM buffer for the push buffer.
+    constexpr uint32_t RAM_SIZE = 1024 * 1024; // 1 MB
+    auto* ram = static_cast<uint8_t*>(calloc(1, RAM_SIZE));
+    if (!ram) { fprintf(stderr, "Cannot allocate RAM\n"); return 1; }
+
+    uint32_t pb_offset = 0x10000; // push buffer at 64K
+    uint32_t pos = pb_offset;
+
+    // === Command 1: SET_BLEND_ENABLE = 1 ===
+    uint32_t hdr1 = pb_inc(SET_BLEND_ENABLE, 0, 1);
+    memcpy(ram + pos, &hdr1, 4); pos += 4;
+    uint32_t val1 = 1;
+    memcpy(ram + pos, &val1, 4); pos += 4;
+
+    // === Command 2: SET_DEPTH_TEST_ENABLE = 1, SET_DEPTH_FUNC = 0x0203 (LEQUAL) ===
+    // INCREASING: method=SET_DEPTH_TEST_ENABLE, count=2 (covers DEPTH_TEST + DEPTH_FUNC)
+    uint32_t hdr2 = pb_inc(SET_DEPTH_TEST_ENABLE, 0, 2);
+    memcpy(ram + pos, &hdr2, 4); pos += 4;
+    uint32_t depth_en = 1;
+    memcpy(ram + pos, &depth_en, 4); pos += 4;
+    uint32_t depth_func = 0x0203;
+    memcpy(ram + pos, &depth_func, 4); pos += 4;
+
+    // === Command 3: SET_SURFACE_COLOR_OFFSET = 0x00100000 ===
+    uint32_t hdr3 = pb_inc(SET_SURFACE_COLOR_OFFSET, 0, 1);
+    memcpy(ram + pos, &hdr3, 4); pos += 4;
+    uint32_t color_off = 0x00100000;
+    memcpy(ram + pos, &color_off, 4); pos += 4;
+
+    // === Command 4: SET_TEXTURE_OFFSET stage 0 = 0x00200000 ===
+    uint32_t hdr4 = pb_inc(SET_TEXTURE_OFFSET + 0*64, 0, 1);
+    memcpy(ram + pos, &hdr4, 4); pos += 4;
+    uint32_t tex_off = 0x00200000;
+    memcpy(ram + pos, &tex_off, 4); pos += 4;
+
+    // === Command 5: SET_TEXTURE_OFFSET stage 2 = 0x00300000 ===
+    uint32_t hdr5 = pb_inc(SET_TEXTURE_OFFSET + 2*64, 0, 1);
+    memcpy(ram + pos, &hdr5, 4); pos += 4;
+    uint32_t tex2_off = 0x00300000;
+    memcpy(ram + pos, &tex2_off, 4); pos += 4;
+
+    // === Command 6: SET_BEGIN_END = 4 (TRIANGLES), then SET_BEGIN_END = 0 (END) ===
+    uint32_t hdr6a = pb_inc(SET_BEGIN_END, 0, 1);
+    memcpy(ram + pos, &hdr6a, 4); pos += 4;
+    uint32_t begin_val = 4; // TRIANGLES
+    memcpy(ram + pos, &begin_val, 4); pos += 4;
+
+    uint32_t hdr6b = pb_inc(SET_BEGIN_END, 0, 1);
+    memcpy(ram + pos, &hdr6b, 4); pos += 4;
+    uint32_t end_val = 0;
+    memcpy(ram + pos, &end_val, 4); pos += 4;
+
+    // === Command 7: CLEAR_SURFACE ===
+    uint32_t hdr7 = pb_inc(CLEAR_SURFACE, 0, 1);
+    memcpy(ram + pos, &hdr7, 4); pos += 4;
+    uint32_t clear_val = 0xF0;
+    memcpy(ram + pos, &clear_val, 4); pos += 4;
+
+    // === Command 8: SET_CULL_FACE_ENABLE = 1, SET_CULL_FACE = 0x0404 (FRONT) ===
+    uint32_t hdr8 = pb_inc(SET_CULL_FACE_ENABLE, 0, 1);
+    memcpy(ram + pos, &hdr8, 4); pos += 4;
+    uint32_t cull_en = 1;
+    memcpy(ram + pos, &cull_en, 4); pos += 4;
+
+    uint32_t hdr8b = pb_inc(SET_CULL_FACE, 0, 1);
+    memcpy(ram + pos, &hdr8b, 4); pos += 4;
+    uint32_t cull_face = 0x0404;
+    memcpy(ram + pos, &cull_face, 4); pos += 4;
+
+    // --- Run the DMA pusher ---
+    nv2a.pfifo_cache1_dma_push = 1;
+    nv2a.pfifo_cache1_push0 = 1;
+    nv2a.pfifo_cache1_dma_get = pb_offset;
+    nv2a.pfifo_cache1_dma_put = pos;
+
+    // Tick multiple times to drain the push buffer.
+    for (int i = 0; i < 10; i++)
+        nv2a.tick_fifo(ram, RAM_SIZE);
+
+    // === Verify PGRAPH state ===
+    CHECK(pgraph.blend_enable == 1, "blend_enable == 1");
+    CHECK(pgraph.depth_test_enable == 1, "depth_test_enable == 1");
+    CHECK(pgraph.depth_func == 0x0203, "depth_func == LEQUAL (0x0203)");
+    CHECK(pgraph.surface_color_offset == 0x00100000, "surface_color_offset == 0x100000");
+    CHECK(pgraph.textures[0].offset == 0x00200000, "texture[0].offset == 0x200000");
+    CHECK(pgraph.textures[2].offset == 0x00300000, "texture[2].offset == 0x300000");
+    CHECK(pgraph.begin_end_mode == 0, "begin_end_mode == 0 (END)");
+    CHECK(pgraph.draw_count == 1, "draw_count == 1");
+    CHECK(pgraph.clear_count == 1, "clear_count == 1");
+    CHECK(pgraph.clear_surface == 0xF0, "clear_surface == 0xF0");
+    CHECK(pgraph.cull_face_enable == 1, "cull_face_enable == 1");
+    CHECK(pgraph.cull_face == 0x0404, "cull_face == FRONT (0x0404)");
+
+    // FIFO stats
+    CHECK(nv2a.fifo_methods_dispatched == pgraph.total_methods,
+          "fifo_methods == pgraph.total_methods");
+    CHECK(nv2a.pfifo_cache1_dma_get == pos, "DMA_GET == PUT (drained)");
+
+    free(ram);
+
+    printf("PGRAPH state test: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail > 0 ? 1 : 0;
+}

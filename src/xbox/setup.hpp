@@ -2,6 +2,7 @@
 // Xbox hardware setup — XboxHardware struct, tick callback, xbox_setup().
 #include "address_map.hpp"
 #include "nv2a.hpp"
+#include "pgraph.hpp"
 #include "apu.hpp"
 #include "ide.hpp"
 #include "usb.hpp"
@@ -20,7 +21,8 @@ namespace xbox {
 
 struct XboxHardware {
     MmioMap     mmio;
-    Nv2aState   nv2a;
+    Nv2aState    nv2a;
+    PgraphState  pgraph;
     ApuState    apu;
     IdeState    ide;
     OhciState   usb0;
@@ -61,6 +63,12 @@ inline XboxHardware* xbox_setup(Executor& exec) {
                  flash_read, flash_write, &hw->flash);
     hw->mmio.add(NV2A_BASE, NV2A_SIZE,
                  nv2a_read, nv2a_write, &hw->nv2a);
+
+    // Wire PFIFO → PGRAPH: push buffer methods dispatch to pgraph state shadow.
+    hw->nv2a.method_handler = pgraph_method_handler;
+    hw->nv2a.method_user    = &hw->pgraph;
+    hw->nv2a.pgraph_ptr     = &hw->pgraph;
+
     hw->mmio.add(APU_BASE, APU_SIZE,
                  apu_read, apu_write, &hw->apu);
     hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,

@@ -76,6 +76,17 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# PGRAPH state shadow unit test (standalone — no JIT, no Zydis)
+# ---------------------------------------------------------------------------
+add_executable(test_pgraph src/test_pgraph.cpp)
+target_include_directories(test_pgraph PRIVATE src)
+if(MSVC)
+    target_compile_options(test_pgraph PRIVATE /W3)
+else()
+    target_compile_options(test_pgraph PRIVATE -Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
 # NASM test binary assembly (optional — only if NASM is installed)
 # ---------------------------------------------------------------------------
 find_program(NASM_EXECUTABLE nasm)
@@ -142,6 +153,7 @@ if(NASM_EXECUTABLE)
 
     # C++ unit tests (no NASM dependency)
     add_test(NAME pe_loader COMMAND test_pe_loader)
+    add_test(NAME pgraph    COMMAND test_pgraph)
 
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
