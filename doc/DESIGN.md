@@ -856,27 +856,195 @@ the CPU never computes vertex counts or issues individual draw calls.
 **Register combiner interpreter (fragment shader):**
 
 The NV2A's 8-stage register combiner is translated to a GLSL fragment shader
-with a `NUM_STAGES` specialisation constant (`layout(constant_id=0) const int`),
-evaluated at `vkCreateGraphicsPipelines` time.  Key design:
+ubershader that interprets raw PGRAPH register state at runtime.  This avoids
+per-draw shader compilation — one precompiled shader handles all combiner
+configurations.  Key design from the reference HLSL implementation:
 
-- `vec4 Regs[16]` register file replaces switch chains — GLSL supports indirect
-  indexing in fragment stages.
-- Merged RGB and alpha combiner pass per stage.
-- `NUM_STAGES` is set from `PSCombinerCount` in the push buffer.  The pipeline
-  cache handles deduplication.
+- **Register file:** `vec4 Regs[16]` — all 16 PS register indices (ZERO, C0, C1,
+  FOG, V0, V1, T0–T3, R0–R1, V1R0_SUM, EF_PROD) mapped to a flat array.
+  Direct indexing replaces all switch-based register dispatch.  Writes to
+  slot 0 (ZERO/DISCARD) are silently dropped.
+- **Per-stage combiner:** Each stage decodes 4 packed uint32 registers from
+  PGRAPH (COMBINECOLORI, COMBINEALPHAO, COMBINECOLORO, COMBINEALPHAO) into
+  8 input bytes (A/B/C/D for RGB and alpha).  Each input byte encodes a 4-bit
+  register index, 1-bit channel select (RGB vs alpha replicate), and 3-bit
+  input mapping (unsigned identity/invert, expand, halfbias, signed identity,
+  negate).  AB and CD products are computed (with optional dot-product mode),
+  then MUX or SUM'd with bias/scale output mapping.
+- **Input mapping:** 8 modes encoded in bits [7:5] of each input byte.
+  Implemented as branchless movc chains — no switch, uniform wavefront
+  execution.  Scalar `ApplyInputMappingScalar` variant for alpha path avoids
+  ~12 wasted float ops per stage.
+- **Output mapping:** Bias (subtract 0.5) and scale (×1/×2/×4/÷2) decoded
+  once per stage via `exp2((m+1)&3 - 1)` — single SFU instruction.
+- **NV2A math:** `nv2a_mul(a, b)` enforces 0 × anything = 0 per component,
+  even when the other operand is inf or NaN.  Standard GPU math produces NaN
+  for 0 × inf, breaking vertex transforms and combiner blending.
+- **Final combiner:** EFG phase computes `E*F → EF_PROD` and
+  `V1 + R0 → V1R0_SUM` (with optional complement/clamp), then ABCD phase
+  produces `saturate(lerp(C, B, A) + D)` for RGB and `G` for alpha.
+- **Texture stages:** 19 texture modes (PROJECT2D/3D, CUBEMAP, PASSTHRU,
+  CLIPPLANE, BUMPENVMAP, BUMPENVMAP_LUM, BRDF, DOT_ST, DOT_ZW,
+  DOT_RFLCT_DIFF, DOT_RFLCT_SPEC, DOT_STR_3D, DOT_STR_CUBE, DPNDNT_AR/GB,
+  DOTPRODUCT, DOT_RFLCT_SPEC_CONST) with conditional pre-loads for source
+  registers — early modes skip register reads entirely.
+- **Dot mapping:** `ApplyDotMapping()` handles 8 modes (ZERO_TO_ONE,
+  MINUS1_TO_1 D3D/GL/generic, HILO_1, HILO_HEMISPHERE D3D/GL/generic)
+  with NV2A-accurate two's complement conversion.
+- **Post-processing:** Per-stage `ApplyTexFmtFixup` (5 fixup modes for
+  BGRA/ABGR/luminance/alpha-luminance/opaque-alpha), `PerformColorSign`
+  (Xbox X_D3DTSS_COLORSIGN extension: expand [0,1]→[-1,1] or contract),
+  `PerformColorKeyOp` (alpha/RGBA kill at 8-bit precision), `PerformAlphaKill`.
+- **Alpha test:** Emulated in shader (`PerformAlphaTest`) since Vulkan has no
+  fixed-function alpha test.  Quantizes both alpha and reference to 8-bit
+  before D3DCMPFUNC comparison (NEVER/LESS/EQUAL/.../ALWAYS).
+- **Fog:** Register file FOG slot carries fog color in RGB (from
+  NV_PGRAPH_FOGCOLOR) and vertex fog factor in alpha.  Table fog modes
+  (EXP, EXP2, LINEAR) computed per-vertex in the VS; result interpolated and
+  blended in the PS.
+- **Specialisation constants:** `NUM_STAGES` (1–8) and `NUM_TEXTURE_STAGES`
+  (1–4) control loop unrolling.  The pipeline cache deduplicates variants.
+- **Unique C0/C1 per stage:** When `PS_COMBINERCOUNT_UNIQUE_C0/C1` flags are
+  set, each stage loads its own constant from the PGRAPH factor register array
+  (COMBINEFACTOR0/1, stride 4 per stage).  Otherwise all stages share stage 0.
+- **PGRAPH register access:** A `StructuredBuffer<uint>` (GLSL: SSBO) at
+  binding t12 provides direct access to the full PGRAPH register file
+  (2048 uint32, 8 KB).  Both VS and PS bind the same buffer.  Accessors:
+  `PG_UINT(byteOff)`, `PG_FLOAT(byteOff)`, `PG_COLOR(byteOff)` (ABGR
+  unpack: bits [0:7]=R, [8:15]=G, [16:23]=B, [24:31]=A → float4 RGBA).
+
+---
+
+**Vertex shader interpreter:**
+
+Rather than recompiling each Xbox vertex shader program into host SPIR-V, a
+single precompiled interpreter ubershader executes the raw NV2A microcode at
+runtime.  Reference design from the HLSL implementation:
+
+- **NV2A vertex ISA:** 136 instruction slots (XFPR — Transform Program RAM),
+  each a 128-bit container with 92 bits of instruction data.  Dual-issue:
+  MAC unit (13 opcodes: NOP/MOV/MUL/ADD/MAD/DP3/DPH/DP4/DST/MIN/MAX/SLT/SGE/ARL)
+  and ILU unit (8 opcodes: NOP/MOV/RCP/RCC/RSQ/EXP/LOG/LIT) can execute in
+  parallel.  Each instruction encodes 3 source inputs (A/B/C) with independent
+  mux (R/V/C), register index, 8-bit swizzle, and negate bit, plus output
+  destination with 4-bit writemask, temp register address, and output register
+  address.
+- **Interpreter state:** Per-vertex: `r[14]` (12 temp registers + 2 zero
+  guards), `v[16]` (input attribute registers), `oRegs[16]` (output registers:
+  oPos, oD0, oD1, oFog, oPts, oB0, oB1, oT0–oT3), `c[194]` (192 constants
+  + 2 guards), `a0` (address register).
+- **Guard register optimisation:** `r[]` and `c[]` are padded with zero-valued
+  guard elements at both ends.  Runtime indices are biased by +1 and clamped,
+  so out-of-bounds accesses (e.g. `c[-1]` via a0.x, or r13–r15) silently read
+  zero — matching NV2A hardware behaviour without a branch.
+- **Program start:** Read from `NV_PGRAPH_CSV0_C` register (CHEOPS_PROGRAM_START
+  field, bits [15:8]).  Interpreter loops from start slot until FLD_FINAL bit
+  or max 136 slots.
+- **Dual-issue correctness:** When paired (both MAC and ILU active), all 3
+  input values (A/B/C) are snapshot **before** either unit writes back.  ILU
+  always writes to r1 when paired; otherwise shares the output address with MAC.
+- **Context writes:** Output with `out_orb=0` writes back to the constant
+  register shadow array (writable `c[]`), not to output registers.  Subsequent
+  reads from the same program see the updated value.
+- **ARL (Address Register Load):** `floor(a.x + 0.001)` with bias to compensate
+  for GPU float precision on byte-normalised vertex attributes (NV2A normalises
+  e.g. 17 to 17/255; GPU float may represent 16.9999 after ×255, yielding
+  floor=16 without bias).
+- **ILU special functions:**
+  - `RCC`: sign-preserving clamp `clamp(|1/s|, 5.42e-20, 1.84e+19)` with sign
+    bit copy.
+  - `EXP`: returns `(2^floor(s), s-floor(s), 2^s, 1)` — exact floor (no ARL bias).
+  - `LOG(0)`: returns `(-inf, 1, -inf, 1)` matching xemu consensus.
+  - `LIT`: specular power clamped to ±(128 - 1/256).
+- **Fog output remapping:** NV2A remaps oFog writes so the most significant
+  masked component ends up in `.x` (the only component the rasterizer reads).
+- **Output footer:** `reverseScreenspaceTransform(oPos)` reverses the Xbox
+  screen-space scale+offset convention, `TEXCOORDINDEX` remapping routes
+  texture coordinates to stages, and `xboxTextureScaleRcp` applies per-stage
+  reciprocal texture coordinate scaling.
+
+---
+
+**Fixed-function vertex shader:**
+
+For draws that don't use a programmable VS, a fixed-function pipeline shader
+replicates NV2A's T&L hardware:
+
+- **Vertex blending:** 1–4 world-view matrices blended with per-vertex weights
+  from the weight attribute.  `VertexBlend_CalcLastWeight` computes the final
+  weight as `1 - sum(prior weights)`.
+- **Lighting:** Up to 8 lights (point, spot, directional) with per-light
+  attenuation, range cutoff, spotlight falloff (`cos(alpha) - cos(phi/2)` /
+  `cos(theta/2) - cos(phi/2)`).  Blinn-Phong specular with `SpecularEnable`
+  zeroing specular colours when disabled.  Two-sided lighting: back-face
+  uses `-Normal` for NdotL/NdotH.
+- **ColorVertex:** Material sources (ambient/diffuse/specular/emissive) can
+  read from vertex colour (D3DMCS_COLOR1/COLOR2) instead of material state,
+  independently for front and back faces.  Only applied when the corresponding
+  vertex register is declared present.
+- **Fog:** Depth mode (Z, W, range-based, or vertex fog passthrough) and
+  table mode (EXP, EXP2, LINEAR) computed per-vertex.
+
+---
+
+**Fixed-function pixel shader:**
+
+For draws not using the register combiner (D3D8-style texture stage state):
+
+- Up to 4 texture stages with D3DTEXTUREOP operations (22 ops: SELECTARG,
+  MODULATE/2X/4X, ADD/ADDSIGNED/SUBTRACT/ADDSMOOTH, BLEND variants,
+  DOTPRODUCT3, MULTIPLYADD, LERP, BUMPENVMAP).
+- D3DTA arguments: DIFFUSE, CURRENT, TEXTURE, TFACTOR, SPECULAR, TEMP — with
+  ALPHAREPLICATE and COMPLEMENT modifiers.
+- Per-stage: color sign conversion, color key, alpha kill, bump environment
+  matrix (2×2), format fixup (BGRA/ABGR/luminance/alpha-luminance/opaque-alpha).
+- Alpha test emulated in shader.
+
+---
+
+**Passthrough vertex shader:**
+
+For pre-transformed vertices (2D/HUD draws): vertex attributes are fetched from
+the buffer, output registers assigned directly from input slots, and the screen-
+space transform is reversed to produce clip-space coordinates.
 
 ---
 
 **Vertex fetch and topology conversion:**
 
 NV2A vertex data lives in guest RAM and is fetched directly via buffer device
-address in the vertex shader.  NV2A-specific formats are decoded inline:
+address in the vertex shader.  The VS receives only `gl_VertexIndex`
+(`SV_VertexID`) — all 16 vertex attributes are fetched from a storage buffer
+containing the raw Xbox vertex stream data.
 
-- **CMP format** (11+11+10 packed): sign-extended bit extraction in GLSL.
-- **Topology conversion** (quad list → triangle list, triangle fan → triangle
-  list): index arithmetic in the vertex shader using `gl_VertexIndex`.  No
-  index buffer rewrite — the VS computes the source vertex from the triangle
-  vertex ID.
+Per-attribute descriptors (byte offset, stride, format, stream base) drive a
+format decode switch covering 20 Xbox vertex formats:
+
+| Format           | Decode                                              |
+|------------------|-----------------------------------------------------|
+| FLOAT1/2/3/4     | Direct `uintBitsToFloat` loads                      |
+| D3DCOLOR         | BGRA→RGBA byte unpack + normalise                   |
+| SHORT2/4         | Signed 16-bit unnormalised → float                  |
+| SHORT2N/4N       | Signed 16-bit normalised (÷32767)                   |
+| NORMPACKED3 (CMP)| 11+11+10 signed packed: `(raw<<21)>>21` etc.        |
+| PBYTE1/2/3/4     | Unsigned byte(s) normalised (÷255)                  |
+| FLOAT2H          | Xbox "half" with W: {x,y,w} stored as 3 floats     |
+| SHORT1/3/1N/3N   | 1 or 3 signed 16-bit values with W=1.0              |
+| NONE             | Use sticky default value (NV2A register persistence) |
+
+Topology conversion (no index buffer rewrite — VS computes source index from
+host triangle vertex ID):
+
+| NV2A Topology    | Host Topology | Index Arithmetic                     |
+|------------------|---------------|--------------------------------------|
+| Quad list        | Triangle list | 6 verts/quad: LUT `{0,1,2,0,2,3}`   |
+| Triangle fan     | Triangle list | Apex=0, `(0, tri+1, tri+2)`          |
+| Quad strip       | Triangle list | `{+0,+1,+2,+2,+1,+3}` per quad      |
+| Line loop        | Line list     | `(seg, (seg+1) % N)` per segment     |
+| Indexed (16/32)  | Passthrough   | Index buffer indirection + base vertex|
+
+Unaligned reads are handled with shift-merge (`ReadU32`/`ReadU16`) since Xbox
+vertex data is not guaranteed to be 4-byte aligned within streams.
 
 ---
 
@@ -990,13 +1158,53 @@ and Intel Arc.
 ---
 
 **Known remaining NV2A items** (independent of Vulkan backend):
-- `PSCompareMode` — clip-plane comparison mode in the combiner interpreter
-- `PSDotMapping` — normal mapping for dot-product texture modes
-- `PSInputTexture` — dependent-texture input routing
-- `DOT_RFLCT_SPEC_CONST` eye vector wiring
-- Full `BUMPENVMAP` perturbation coordinate routing
-- Full `BRDF` mode — requires eye and light sigma vector inputs
-- Framebuffer readback — GPU→CPU path for guest CPU surface reads
+- `PSCompareMode` — per-stage 4-bit RSTQ clip-plane comparison (LT vs GE per
+  component).  Reference implementation: `ApplyCompareMode()` in the RC
+  interpreter's CLIPPLANE texture mode.
+- `PSDotMapping` — 8 dot-product remapping modes (ZERO_TO_ONE, MINUS1_TO_1
+  D3D/GL/generic, HILO_1, HILO_HEMISPHERE D3D/GL/generic).  Reference:
+  `ApplyDotMapping()` and `ApplyDotMappingForStage()`.
+- `PSInputTexture` — dependent-texture source stage routing (stage 2: 1-bit
+  selector, stage 3: 2-bit selector, decoded from NV_PGRAPH_SHADERCTL bits
+  12–27).  Reference: `GetSourceStage()`.
+- `DOT_RFLCT_SPEC` — eye vector from VS output q-components (iT1.w, iT2.w,
+  iT3.w), saved before DOTPRODUCT stages overwrite T registers.  Reference:
+  `eyeVec` in the RC interpreter main().
+- `DOT_RFLCT_SPEC_CONST` — simplified variant: eye=(0,0,1), saves one
+  normalize() and one dot vs the general case.  Reference: implemented.
+- Full `BUMPENVMAP` — perturbation via 2×2 BEM matrix (BUMPMAT00/01/10/11)
+  from PGRAPH, with optional luminance (BUMPSCALE/BUMPOFFSET).  Reference:
+  implemented in FetchTexture.
+- Full `BRDF` mode — requires eye and light sigma vector inputs (stubbed in
+  reference as simple 2D sample).
+- Framebuffer readback — GPU→CPU path for guest CPU surface reads.
+- `PREMODULATE` texture op — multiplies next stage's CURRENT by its texture.
+- Fixed-function PS texture coordinate transforms (VS-side, per-stage
+  TEXTURETRANSFORMFLAGS count + projected flag).
+- Point sprite size attenuation (PointScaleABC in the fixed-function VS).
+
+**Reference shader file inventory** (`doc/reference/`):
+
+| File                                     | Purpose                             |
+|------------------------------------------|-------------------------------------|
+| `CxbxRegisterCombinerInterpreter.hlsl`   | RC ubershader (8-stage combiner + final combiner + texture fetch) |
+| `CxbxRegisterCombinerInterpreterState.hlsli` | RC auxiliary cbuffer layout (C++/HLSL shared) |
+| `CxbxVertexShaderInterpreter.hlsl`       | VS interpreter ubershader (136-slot NV2A microcode executor) |
+| `CxbxVertexShaderInterpreterState.hlsli` | VS instruction field constants (C++/HLSL shared) |
+| `CxbxFixedFunctionVertexShader.hlsl`     | Fixed-function T&L (lights, blending, materials, fog) |
+| `CxbxFixedFunctionVertexShaderState.hlsli` | FF VS state block (transforms, lights, materials, modes) |
+| `CxbxFixedFunctionPixelShader.hlsl`      | Fixed-function PS (D3DTEXTUREOP stages) |
+| `CxbxFixedFunctionPixelShader.hlsli`     | FF PS state block (stage ops, args, bump env, fog, alpha test) |
+| `CxbxVertexShaderPassthrough.hlsl`       | Pre-transformed vertex passthrough (2D/HUD) |
+| `CxbxVertexFetch.hlsli`                 | Vertex fetch from ByteAddressBuffer (20 formats, topology) |
+| `CxbxVertexShaderCommon.hlsli`           | VS I/O structs, fog formula, TEXCOORDINDEX |
+| `CxbxVertexOutputFooter.hlsli`           | VS output: screen→clip, fog, texcoord remap, scale |
+| `CxbxScreenspaceTransform.hlsli`         | Reverse Xbox screen-space transform |
+| `CxbxPixelShaderInput.hlsli`             | PS_INPUT struct (matches VS_OUTPUT) |
+| `CxbxPixelShaderFunctions.hlsli`         | Pure-math PS helpers (color sign, color key, alpha test, dot mapping, tex fmt fixup) |
+| `CxbxPGRAPHRegs.hlsli`                  | PGRAPH register offsets + StructuredBuffer accessors |
+| `CxbxNV2APixelShaderConstants.hlsli`     | PS_REGISTER/PS_CHANNEL/PS_INPUTMAPPING/PS_TEXTUREMODES constants (C++/HLSL shared) |
+| `CxbxNV2AMathHelpers.hlsli`             | NV2A-accurate mul (0×anything=0), dot3, dot4 |
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
