@@ -130,6 +130,14 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
                           GuestContext* ctx, bool save_flags);
 
+bool emit_handler_enter(Emitter& e, const ZydisDecodedInstruction& insn,
+                        const ZydisDecodedOperand* ops, const uint8_t* raw,
+                        GuestContext* ctx, bool save_flags);
+
+bool emit_handler_xlatb(Emitter& e, const ZydisDecodedInstruction& insn,
+                        const ZydisDecodedOperand* ops, const uint8_t* raw,
+                        GuestContext* ctx, bool save_flags);
+
 // ---------------------------------------------------------------------------
 // Dispatch table — Level 1 maps mnemonic → compact index, Level 2 has class
 // ---------------------------------------------------------------------------
@@ -156,6 +164,8 @@ enum InsnClassId : uint8_t {
     IC_PUSHAD,      // PUSHAD — push all GP regs onto guest stack
     IC_POPAD,       // POPAD — pop all GP regs from guest stack
     IC_FLAGMEM,     // SETcc/CMOVcc [mem] — reads EFLAGS, has memory operand
+    IC_ENTER,       // ENTER imm16, imm8 — create stack frame
+    IC_XLATB,       // XLATB — table lookup [EBX + AL]
     IC_TERMINATOR,  // JMP/CALL/RET/Jcc/LOOP — trace exit
     IC_PRIVILEGED,  // HLT/LGDT/CLI/... — trap
     IC_MAX
@@ -180,9 +190,11 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_PUSHFD     */ { emit_handler_pushfd,    ICF_HAS_DISPATCH },
     /* IC_POPFD      */ { emit_handler_popfd,     ICF_HAS_DISPATCH },
     /* IC_STRING     */ { emit_handler_string,    ICF_HAS_DISPATCH },
-    /* IC_PUSHAD     */ { emit_handler_pushad,   ICF_HAS_DISPATCH },
-    /* IC_POPAD      */ { emit_handler_popad,    ICF_HAS_DISPATCH },
-    /* IC_FLAGMEM    */ { emit_handler_flagmem,  ICF_HAS_DISPATCH },
+    /* IC_PUSHAD     */ { emit_handler_pushad,    ICF_HAS_DISPATCH },
+    /* IC_POPAD      */ { emit_handler_popad,     ICF_HAS_DISPATCH },
+    /* IC_FLAGMEM    */ { emit_handler_flagmem,   ICF_HAS_DISPATCH },
+    /* IC_ENTER      */ { emit_handler_enter,     ICF_HAS_DISPATCH },
+    /* IC_XLATB      */ { emit_handler_xlatb,     ICF_HAS_DISPATCH },
     /* IC_TERMINATOR */ { nullptr,                ICF_TERMINATOR },
     /* IC_PRIVILEGED */ { nullptr,                ICF_PRIVILEGED },
 };
@@ -218,6 +230,8 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_OUTSB,  ZYDIS_MNEMONIC_OUTSD,  ZYDIS_MNEMONIC_OUTSW,
         ZYDIS_MNEMONIC_CLI,    ZYDIS_MNEMONIC_STI,    ZYDIS_MNEMONIC_LMSW,
         ZYDIS_MNEMONIC_CPUID,
+        ZYDIS_MNEMONIC_INT,    ZYDIS_MNEMONIC_INT3,   ZYDIS_MNEMONIC_INT1,
+        ZYDIS_MNEMONIC_INTO,
     }) MNEMONIC_CLASS[m] = IC_PRIVILEGED;
 
     // ---- LEA — no memory access ----
@@ -277,6 +291,10 @@ inline void init_mnemonic_table() {
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_PUSH]   = IC_PUSH;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_POP]    = IC_POP;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_LEAVE]  = IC_LEAVE;
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_ENTER]  = IC_ENTER;
+
+    // ---- XLATB — implicit [EBX+AL] memory access ----
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_XLAT]   = IC_XLATB;
 
     // ---- Zero/sign extending loads ----
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_MOVZX]  = IC_MOVZX_MEM;

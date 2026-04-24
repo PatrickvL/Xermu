@@ -133,6 +133,45 @@ void popad_helper(GuestContext* ctx) {
     ctx->gp[GP_ESP] = esp;
 }
 
+// ENTER helper: ENTER imm16, nesting_level.
+// Level 0 (common): PUSH EBP; MOV EBP, ESP; SUB ESP, size.
+// Higher levels push additional frame pointers.
+void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
+    nesting &= 0x1F; // mask to 0..31
+
+    // Step 1: PUSH EBP
+    uint32_t esp = ctx->gp[GP_ESP] - 4;
+    write_guest_mem32(ctx, esp, ctx->gp[GP_EBP]);
+    uint32_t frame_ptr = esp; // value after the initial PUSH EBP
+
+    // Step 2: higher nesting levels push previous frame pointers
+    if (nesting > 0) {
+        for (uint32_t i = 1; i < nesting; ++i) {
+            ctx->gp[GP_EBP] -= 4;
+            esp -= 4;
+            write_guest_mem32(ctx, esp, read_guest_mem32(ctx, ctx->gp[GP_EBP]));
+        }
+        // Push the new frame pointer itself
+        esp -= 4;
+        write_guest_mem32(ctx, esp, frame_ptr);
+    }
+
+    // Step 3: MOV EBP, frame_ptr; SUB ESP, alloc_size
+    ctx->gp[GP_EBP] = frame_ptr;
+    ctx->gp[GP_ESP] = esp - alloc_size;
+}
+
+// XLATB helper: AL = byte at [EBX + zero_extend(AL)].
+// Returns the byte value to store in AL.
+uint32_t xlatb_helper(GuestContext* ctx) {
+    uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
+    if (ea < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        return base[ea];
+    }
+    return ctx->mmio ? ctx->mmio->read(ea, 1) : 0xFF;
+}
+
 // IRETD helper: pop EIP, CS, EFLAGS from guest stack (12 bytes).
 // Sets ctx->next_eip and ctx->eflags.  CS is ignored (flat model).
 void iret_helper(GuestContext* ctx) {
@@ -571,6 +610,49 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     e.emit8(0x0F); e.emit8(0x0B);              // UD2
 
     Emitter::patch_rel32(done_site, e.cur());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_enter — ENTER imm16, imm8 (create stack frame via C helper)
+// ---------------------------------------------------------------------------
+bool emit_handler_enter(Emitter& e, const ZydisDecodedInstruction& insn,
+                        const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
+                        GuestContext* /*ctx*/, bool save_flags) {
+    // ops[0] = imm16 (allocation size), ops[1] = imm8 (nesting level)
+    if (insn.operand_count_visible < 2) return false;
+    uint32_t alloc_size = (uint32_t)(uint16_t)ops[0].imm.value.u;
+    uint32_t nesting    = (uint32_t)(uint8_t)ops[1].imm.value.u;
+
+    if (save_flags) emit_save_flags(e);
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_imm(e, alloc_size);
+    emit_ccall_arg2_imm(e, nesting);
+    emit_call_abs(e, reinterpret_cast<void*>(enter_helper));
+    emit_load_all_gp(e);
+    if (save_flags) emit_restore_flags(e);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_xlatb — XLATB: AL = [EBX + zero_extend(AL)]
+// Calls C helper which reads the byte and returns it; we then store to AL.
+// ---------------------------------------------------------------------------
+bool emit_handler_xlatb(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
+                        const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                        GuestContext* /*ctx*/, bool save_flags) {
+    if (save_flags) emit_save_flags(e);
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);
+    emit_call_abs(e, reinterpret_cast<void*>(xlatb_helper));
+    // EAX = byte value returned by helper.
+    // We need to merge into just AL of the saved EAX in ctx.
+    // MOV byte [R13 + gp_offset(EAX)], AL
+    //   REX.B=0x41, opcode=0x88, ModRM: mod=01, reg=0(AL), rm=5(R13), disp8=0
+    e.emit8(0x41); e.emit8(0x88); e.emit8(0x45); e.emit8(gp_offset(GP_EAX));
+    emit_load_all_gp(e);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
