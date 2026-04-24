@@ -381,5 +381,64 @@
     bswap ecx
     ASSERT_EQ ecx, 0x04030201        ; 36: bytes reversed
 
+; ========================= PUSH ESP / POP ESP ==============================
+; PUSH ESP pushes the value of ESP *before* the decrement.
+; POP ESP sets ESP to [old ESP] (the +4 from POP is overwritten).
+
+; Save current ESP into EBX for comparison, then PUSH ESP.
+; After PUSH ESP, [new ESP] should equal old ESP (= EBX).
+    mov  dword [0x60000], 0          ; scratch for readback
+    ; Read current ESP indirectly via PUSHAD trick:
+    ; We use the guest stack at a known region. Set up ESP to 0x70100.
+    mov  ebx, 0x70100
+    ; Save current ESP (we'll need to restore later)
+    ; Use a fixed address to stash it.
+    ; Actually: just set ESP to a known value, do PUSH ESP, check memory.
+    push eax                         ; save EAX
+    push ebx                         ; save EBX
+
+    ; Store a marker at the target address so we can detect the write
+    mov  dword [0x700FC], 0xBAADCAFE ; memory at where PUSH ESP will write
+
+    ; We need to set guest ESP to a known value. Use the enter/leave
+    ; trick: we know PUSH/POP work for non-ESP regs. Let's use a fresh
+    ; stack area.
+    ;
+    ; Simpler approach: just call a small subroutine that uses PUSH ESP.
+    ; Actually simplest: write ESP to known location via PUSH ESP, then
+    ; read it back and verify.
+
+    ; Set up a clean stack area at 0x70100
+    mov  ebp, 0x70100               ; use EBP as a temp
+    ; XCHG ESP, EBP — swap (sets ESP=0x70100, EBP=old ESP)
+    xchg esp, ebp
+    ; Now ESP=0x70100, EBP=old ESP
+
+    push esp                         ; should push 0x70100 to [0x700FC]
+    ; [0x700FC] should be 0x70100 (pre-decrement ESP value)
+    ASSERT_EQ_MEM 0x700FC, 0x70100   ; 37: PUSH ESP stores pre-dec value
+
+    ; ESP should now be 0x700FC (0x70100 - 4)
+    ; Verify by doing another push and checking where it lands
+    push 0xAAAAAAAA                  ; should go to [0x700F8]
+    ASSERT_EQ_MEM 0x700F8, 0xAAAAAAAA ; 38: ESP decremented correctly
+
+    ; Test POP ESP: write a known value at [current ESP], then POP ESP.
+    ; Current ESP = 0x700F4 (after two pushes from 0x70100: 0x70100-4-4=0x700F8,
+    ; wait, we pushed twice: 0x70100 → push esp → 0x700FC → push imm → 0x700F8).
+    ; Actually ESP = 0x700F8 after the two pushes.
+    ; [0x700F8] = 0xAAAAAAAA. If we POP ESP, ESP should become 0xAAAAAAAA.
+    ; But that's a weird address. Let's write something sensible first.
+    mov  dword [0x700F8], 0x70200    ; put a sane ESP value at [current ESP]
+    pop  esp                         ; ESP = [0x700F8] = 0x70200
+    ; Now verify ESP by pushing a marker and checking where it lands
+    push 0xBBBBBBBB                  ; should go to [0x701FC] (0x70200 - 4)
+    ASSERT_EQ_MEM 0x701FC, 0xBBBBBBBB ; 39: POP ESP loaded correct value
+
+    ; Restore original ESP from EBP
+    mov  esp, ebp
+    pop  ebx                         ; restore EBX
+    pop  eax                         ; restore EAX
+
 ; ========================= All done =======================================
     PASS
