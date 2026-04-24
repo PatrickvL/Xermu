@@ -151,6 +151,30 @@ int main() {
     uint32_t clear_all = 0xF3;
     memcpy(ram + pos, &clear_all, 4); pos += 4;
 
+    // === Command 16: SET_VIEWPORT_OFFSET (4 floats: x, y, z, w) ===
+    uint32_t hdr16 = pb_inc(SET_VIEWPORT_OFFSET_X, 0, 4);
+    memcpy(ram + pos, &hdr16, 4); pos += 4;
+    float vp_off[4] = { 320.0f, 240.0f, 0.0f, 0.0f };
+    memcpy(ram + pos, vp_off, 16); pos += 16;
+
+    // === Command 17: SET_VIEWPORT_SCALE (4 floats: x, y, z, w) ===
+    uint32_t hdr17 = pb_inc(SET_VIEWPORT_SCALE_X, 0, 4);
+    memcpy(ram + pos, &hdr17, 4); pos += 4;
+    float vp_sc[4] = { 320.0f, -240.0f, 16777215.0f, 0.0f };
+    memcpy(ram + pos, vp_sc, 16); pos += 16;
+
+    // === Command 18: SET_SHADE_MODE = 0x1D01 (SMOOTH) ===
+    uint32_t hdr18 = pb_inc(SET_SHADE_MODE, 0, 1);
+    memcpy(ram + pos, &hdr18, 4); pos += 4;
+    uint32_t shade = 0x1D01;
+    memcpy(ram + pos, &shade, 4); pos += 4;
+
+    // === Command 19: SET_COLOR_MASK = 0x01010101 (RGBA all enabled) ===
+    uint32_t hdr19 = pb_inc(SET_COLOR_MASK, 0, 1);
+    memcpy(ram + pos, &hdr19, 4); pos += 4;
+    uint32_t cmask = 0x01010101;
+    memcpy(ram + pos, &cmask, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -200,6 +224,14 @@ int main() {
     // Surface offsets
     CHECK(pgraph.reg(SET_SURFACE_COLOR_OFFSET) == 0x00100000, "color_offset == 0x100000 (decode)");
     CHECK(pgraph.reg(SET_SURFACE_ZETA_OFFSET)  == 0x00500000, "zeta_offset == 0x500000");
+
+    // Viewport state
+    CHECK(pgraph.reg_float(SET_VIEWPORT_OFFSET_X)     == 320.0f, "vp_offset_x == 320");
+    CHECK(pgraph.reg_float(SET_VIEWPORT_OFFSET_X + 4)  == 240.0f, "vp_offset_y == 240");
+    CHECK(pgraph.reg_float(SET_VIEWPORT_SCALE_X)       == 320.0f, "vp_scale_x == 320");
+    CHECK(pgraph.reg_float(SET_VIEWPORT_SCALE_X + 4)   == -240.0f, "vp_scale_y == -240");
+    CHECK(pgraph.reg(SET_SHADE_MODE)  == 0x1D01, "shade_mode == SMOOTH");
+    CHECK(pgraph.reg(SET_COLOR_MASK)  == 0x01010101, "color_mask == all-enabled");
 
     free(ram);
 
