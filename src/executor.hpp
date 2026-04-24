@@ -43,6 +43,14 @@ struct Executor {
     // Pending hardware IRQ bitmap (set by device callbacks, checked in run loop).
     uint32_t    pending_irq = 0;
 
+    // HLE callback: if non-null, INT with this vector calls the handler
+    // instead of delivering through IDT. Handler receives ordinal from EAX.
+    // Returns true if handled, false to fall through to IDT delivery.
+    using HleHandler = bool(*)(Executor& exec, uint32_t ordinal, void* user);
+    HleHandler  hle_handler = nullptr;
+    uint8_t     hle_vector  = 0x20;   // INT vector used for HLE traps
+    void*       hle_user    = nullptr;
+
     // -----------------------------------------------------------------------
     bool init(MmioMap* mmio = nullptr);
     void destroy();

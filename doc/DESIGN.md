@@ -607,9 +607,37 @@ This is by far the largest single implementation effort.
 - PCI configuration space
 - MCPX boot ROM
 
-#### 5.19 XBE Loader
-**Priority: HIGH** — Parse Xbox executable format (.xbe) headers, set up initial
-memory layout, resolve kernel imports. Without this, can't load actual games.
+#### 5.19 XBE Loader ✅
+
+Implemented in `src/xbe_loader.hpp`:
+
+- **XBE header parsing**: validates magic (`XBEH`), extracts base address
+  (typically `0x00010000`), section count, entry point, kernel thunk address.
+- **Section loading**: copies raw data to virtual addresses, zero-fills padding.
+- **XOR key decoding**: entry point and kernel thunk address are XOR-encoded
+  with retail (`0xA8FC57AB` / `0x5B6D40B6`) or debug keys. Loader tries retail
+  first, falls back to debug.
+- **Kernel thunk resolution**: the thunk table is an array of ordinal entries
+  (bit 31 set + ordinal number). Each is replaced with the address of an HLE
+  stub. Stubs live at guest PA `0x80000`: `MOV EAX, ordinal / INT 0x20 / RET`.
+- **TLS directory**: reads TLS raw data range, writes TLS index = 0.
+- **HLE kernel handler**: `INT 0x20` traps are intercepted by the executor
+  (new `hle_handler` callback on `Executor`). A default handler implements:
+  - Memory: `ExAllocatePool`, `MmAllocateContiguousMemory[Ex]`,
+    `MmFreeContiguousMemory`, `MmGetPhysicalAddress`,
+    `NtAllocateVirtualMemory`, `NtFreeVirtualMemory` (bump allocator at 16 MB+)
+  - Threading: `KeGetCurrentThread` (fake KTHREAD ptr), `PsCreateSystemThread`
+    (stub), `PsTerminateSystemThread`
+  - I/O: `NtClose` (stub)
+  - Display: `AvSetDisplayMode`, `AvGetSavedDataAddress` (stubs)
+  - System: `HalReturnToFirmware` (halts guest), `DbgPrint`, `RtlInitAnsiString`
+  - Unhandled ordinals: log + return `STATUS_NOT_IMPLEMENTED`
+- **stdcall cleanup**: args are removed from guest stack by relocating the
+  return address before the stub's RET instruction.
+
+Test runner `--xbox` mode writes HLE stubs to guest RAM and installs the handler.
+`tests/hle.asm` exercises 4 kernel calls: `KeGetCurrentThread`,
+`MmGetPhysicalAddress`, `NtClose`, `ExAllocatePool`.
 
 #### 5.20 Kernel HLE or LLE
 Two paths:
