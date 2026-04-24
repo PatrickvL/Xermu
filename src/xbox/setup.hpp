@@ -43,6 +43,8 @@ static void hw_tick_callback(void* user) {
     auto* hw = static_cast<XboxHardware*>(user);
     hw->pit.tick();
     hw->nv2a.tick_timer();
+    hw->usb0.tick_frame();
+    hw->usb1.tick_frame();
     // PFIFO is processed by the NV2A thread (nv2a_thread.hpp), not here.
     if (hw->nv2a.vblank_irq_pending) {
         hw->nv2a.vblank_irq_pending = false;

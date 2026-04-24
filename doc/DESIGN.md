@@ -287,6 +287,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/ptimer_alarm.asm` | NV2A PTIMER: alarm fire, W1C, NUM/DEN (8)     | ✅ ALL PASS   |
 | `tests/smbus_smc.asm`   | SMC commands: version, temps, fan, scratch (12)| ✅ ALL PASS   |
 | `tests/ide_dma.asm`      | IDE Bus Master DMA: cmd, status W1C, PRDT (10) | ✅ ALL PASS   |
+| `tests/usb_ohci.asm`     | OHCI: frame regs, HCCA, ED ptrs, interrupts (10)| ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
