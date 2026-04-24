@@ -405,6 +405,16 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_INT: {
         // Software interrupt: INT imm8
         uint8_t vector = (uint8_t)ops[0].imm.value.u;
+        // HLE intercept: if this vector matches the HLE trap vector,
+        // call the handler instead of delivering through the IDT.
+        if (hle_handler && vector == hle_vector) {
+            uint32_t ordinal = ctx.gp[GP_EAX];
+            ctx.eip += insn.length; // advance past INT
+            if (hle_handler(*this, ordinal, hle_user))
+                return;
+            // Handler returned false — fall through to IDT delivery.
+            ctx.eip -= insn.length; // undo advance
+        }
         deliver_interrupt(vector, ctx.eip + insn.length);
         return;
     }

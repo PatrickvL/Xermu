@@ -15,6 +15,7 @@
 
 #include "executor.hpp"
 #include "xbox.hpp"
+#include "xbe_loader.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -113,10 +114,11 @@ int main(int argc, char** argv) {
     exec->load_guest(load_pa, buf.get(), file_size);
 
     // Stack with sentinel return address.
-    static constexpr uint32_t STACK_TOP    = 0x0008'0000;
+    // In xbox mode, 0x80000 is used for HLE stubs, so stack goes higher.
+    uint32_t stack_top = xbox_mode ? 0x000A'0000u : 0x0008'0000u;
     static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
-    exec->ctx.gp[GP_ESP] = STACK_TOP;
-    memcpy(exec->ram + STACK_TOP, &SENTINEL_EIP, 4);
+    exec->ctx.gp[GP_ESP] = stack_top;
+    memcpy(exec->ram + stack_top, &SENTINEL_EIP, 4);
     exec->ctx.eflags = 0x0000'0202;
 
     // Segment bases: FS points to a scratch area for tests.
@@ -128,6 +130,15 @@ int main(int argc, char** argv) {
     // Register I/O ports (in non-xbox mode; xbox_setup already registers them).
     if (!xbox_mode)
         exec->register_io(0xE9, nullptr, io_debug_write);
+
+    // In xbox mode, install HLE kernel stubs and handler.
+    static xbe::XbeHeap hle_heap;
+    if (xbox_mode) {
+        xbe::write_hle_stubs(exec->ram);
+        hle_heap = xbe::XbeHeap();  // reset allocator
+        exec->hle_handler = xbe::default_hle_handler;
+        exec->hle_user    = &hle_heap;
+    }
 
     // Run.
     exec->run(load_pa, /*max_steps=*/10'000'000);
