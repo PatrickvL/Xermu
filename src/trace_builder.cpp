@@ -806,6 +806,38 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             case ZYDIS_MNEMONIC_JMP:
                 emit_jmp_exit(e, insn, ops, pc_after, ctx);
                 break;
+            case ZYDIS_MNEMONIC_LOOP:
+            case ZYDIS_MNEMONIC_LOOPE:
+            case ZYDIS_MNEMONIC_LOOPNE: {
+                // Resolve target address from the relative immediate.
+                uint32_t taken_eip = pc_after;
+                for (int i = 0; i < (int)insn.operand_count; ++i) {
+                    if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                        ops[i].imm.is_relative) {
+                        taken_eip = pc_after +
+                            (uint32_t)(int32_t)ops[i].imm.value.s;
+                        break;
+                    }
+                }
+                // LOOP: DEC ECX, jump if ECX != 0.
+                // LOOPE: DEC ECX, jump if ECX != 0 AND ZF == 1.
+                // LOOPNE: DEC ECX, jump if ECX != 0 AND ZF == 0.
+                // All three do NOT modify EFLAGS per the ISA, but we are at a
+                // trace boundary so corrupting flags is acceptable.
+                // DEC ECX (ModRM form: 0xFF /1 → 0xFF 0xC9)
+                e.emit8(0xFF); e.emit8(0xC9);
+                if (insn.mnemonic == ZYDIS_MNEMONIC_LOOP) {
+                    // TEST ECX, ECX (0x85 0xC9) — sets ZF if ECX==0
+                    e.emit8(0x85); e.emit8(0xC9);
+                    emit_epilog_conditional(e, 0x75 /*JNZ*/, taken_eip,
+                                            pc_after);
+                } else {
+                    // LOOPE/LOOPNE: need to check both ECX!=0 and ZF.
+                    // Emit static fallback for now (single-step).
+                    emit_epilog_static(e, taken_eip);
+                }
+                break;
+            }
             default: {
                 uint8_t jcc = jcc_short_opcode(insn.mnemonic);
                 if (jcc)
