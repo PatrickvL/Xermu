@@ -194,6 +194,7 @@ and rebuild.
 | `tests/string.asm`    | MOVS/STOS/LODS/CMPS/SCAS + REP (36 assertions)  | ✅ ALL PASS   |
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
+| `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT (11 assertions)   | ✅ ALL PASS   |
 
 ---
 
@@ -238,7 +239,8 @@ and rebuild.
 - [x] PUSH [mem] / POP [mem] via C helpers (push_mem_helper / pop_mem_helper)
 - [x] 8/16-bit register MOV memory forms (AL/CL/DL/BL, AX-DI via guest_reg_enc)
 - [x] PUSHAD/POPAD via C helpers (IC_PUSHAD/IC_POPAD dispatch classes)
-- [x] NASM test infrastructure: 9 suites, 369 total assertions, CMake integration
+- [x] Privileged insn emulation: CLI/STI/CPUID/RDTSC/RDMSR/WRMSR/LGDT/LIDT
+- [x] NASM test infrastructure: 10 suites, 380 total assertions, CMake integration
 
 ---
 
