@@ -329,30 +329,64 @@ enum KernelOrdinal : uint32_t {
     ORD_AvSetSavedDataAddress          = 4,
     ORD_DbgPrint                       = 7,
     ORD_ExAllocatePool                 = 15,
+    ORD_ExAllocatePoolWithTag          = 16,
     ORD_ExFreePool                     = 17,
+    ORD_ExQueryPoolBlockSize           = 20,
     ORD_HalReturnToFirmware            = 49,
+    ORD_InterlockedCompareExchange     = 58,
+    ORD_InterlockedDecrement           = 59,
+    ORD_InterlockedIncrement           = 60,
+    ORD_InterlockedExchange            = 61,
     ORD_KeGetCurrentThread             = 104,
     ORD_KeInitializeDpc                = 107,
+    ORD_KeInitializeEvent              = 108,
+    ORD_KeInitializeMutex              = 112,
+    ORD_KeInitializeSemaphore          = 114,
+    ORD_KeInitializeTimerEx            = 116,
     ORD_KeQueryPerformanceCounter      = 126,
     ORD_KeQueryPerformanceFrequency    = 127,
     ORD_KeQuerySystemTime              = 131,
+    ORD_KeResetEvent                   = 133,
+    ORD_KeSetEvent                     = 144,
     ORD_KeSetTimer                     = 145,
     ORD_KeSetTimerEx                   = 146,
     ORD_KeCancelTimer                  = 96,
+    ORD_KeReleaseMutex                 = 132,
+    ORD_KeReleaseSemaphore             = 134,
     ORD_KeTickCount                    = 156,
+    ORD_KeWaitForSingleObject          = 157,
+    ORD_KeWaitForMultipleObjects       = 158,
     ORD_MmAllocateContiguousMemory     = 165,
     ORD_MmAllocateContiguousMemoryEx   = 166,
     ORD_MmFreeContiguousMemory         = 171,
     ORD_MmGetPhysicalAddress           = 173,
+    ORD_MmMapIoSpace                   = 174,
+    ORD_MmUnmapIoSpace                 = 183,
     ORD_NtAllocateVirtualMemory        = 184,
     ORD_NtClose                        = 187,
+    ORD_NtCreateEvent                  = 188,
+    ORD_NtCreateMutant                 = 190,
+    ORD_NtCreateSemaphore              = 193,
     ORD_NtFreeVirtualMemory            = 199,
+    ORD_NtSetEvent                     = 210,
+    ORD_NtClearEvent                   = 211,
+    ORD_NtWaitForSingleObject          = 218,
+    ORD_NtWaitForMultipleObjects       = 219,
+    ORD_ObReferenceObjectByHandle      = 246,
+    ORD_ObDereferenceObject            = 244,
     ORD_PsCreateSystemThread           = 254,
     ORD_PsTerminateSystemThread        = 258,
     ORD_RtlEnterCriticalSection        = 264,
     ORD_RtlLeaveCriticalSection        = 267,
     ORD_RtlInitAnsiString             = 268,
     ORD_RtlInitializeCriticalSection   = 270,
+    ORD_RtlInitUnicodeString           = 272,
+    ORD_RtlCompareMemory               = 261,
+    ORD_RtlCopyMemory                  = 262,
+    ORD_RtlFillMemory                  = 265,
+    ORD_RtlZeroMemory                  = 285,
+    ORD_RtlMoveMemory                  = 275,
+    ORD_RtlEqualString                 = 273,
     ORD_XeLoadSection                  = 327,
 };
 
@@ -605,6 +639,337 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS (already loaded)
         stdcall_cleanup(exec, 1);
         return true;
+
+    // ---- ExAllocatePoolWithTag / ExQueryPoolBlockSize ----
+
+    case ORD_ExAllocatePoolWithTag: {
+        // PVOID ExAllocatePoolWithTag(ULONG size, ULONG tag)
+        uint32_t size = stack_arg(exec, 0);
+        uint32_t addr = heap->alloc(size);
+        if (addr) memset(exec.ram + addr, 0, size);
+        exec.ctx.gp[GP_EAX] = addr;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_ExQueryPoolBlockSize:
+        // ULONG ExQueryPoolBlockSize(PVOID)
+        exec.ctx.gp[GP_EAX] = 0x1000; // return page-sized block
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    // ---- Synchronisation primitives (single-threaded stubs) ----
+
+    case ORD_KeInitializeEvent:
+        // void KeInitializeEvent(PKEVENT, EVENT_TYPE, BOOLEAN InitialState)
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeInitializeMutex:
+        // void KeInitializeMutex(PKMUTEX, ULONG Level)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_KeInitializeSemaphore:
+        // void KeInitializeSemaphore(PKSEMAPHORE, LONG Count, LONG Limit)
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeInitializeTimerEx:
+        // void KeInitializeTimerEx(PKTIMER, TIMER_TYPE)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_KeSetEvent:
+        // LONG KeSetEvent(PKEVENT, KPRIORITY Increment, BOOLEAN Wait)
+        exec.ctx.gp[GP_EAX] = 0; // previous state = not-signaled
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeResetEvent:
+        // LONG KeResetEvent(PKEVENT)
+        exec.ctx.gp[GP_EAX] = 0; // previous state
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_KeReleaseMutex:
+        // LONG KeReleaseMutex(PKMUTEX, BOOLEAN Wait)
+        exec.ctx.gp[GP_EAX] = 0; // previous count
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_KeReleaseSemaphore:
+        // LONG KeReleaseSemaphore(PKSEMAPHORE, KPRIORITY, LONG Adjustment, BOOLEAN Wait)
+        exec.ctx.gp[GP_EAX] = 0; // previous count
+        stdcall_cleanup(exec, 4);
+        return true;
+
+    case ORD_KeWaitForSingleObject:
+        // NTSTATUS KeWaitForSingleObject(PVOID Object, KWAIT_REASON, KPROCESSOR_MODE,
+        //                                BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS (object signaled immediately)
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    case ORD_KeWaitForMultipleObjects:
+        // NTSTATUS KeWaitForMultipleObjects(ULONG Count, PVOID *Objects,
+        //          WAIT_TYPE, KWAIT_REASON, KPROCESSOR_MODE, BOOLEAN Alertable,
+        //          PLARGE_INTEGER Timeout, PKWAIT_BLOCK WaitBlockArray)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_WAIT_0
+        stdcall_cleanup(exec, 8);
+        return true;
+
+    case ORD_NtCreateEvent: {
+        // NTSTATUS NtCreateEvent(PHANDLE Handle, ...)
+        // Write a fake handle to *Handle
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t fake_handle = 0x100;
+            memcpy(exec.ram + handle_ptr, &fake_handle, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 5);
+        return true;
+    }
+
+    case ORD_NtCreateMutant: {
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t fake_handle = 0x104;
+            memcpy(exec.ram + handle_ptr, &fake_handle, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        return true;
+    }
+
+    case ORD_NtCreateSemaphore: {
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t fake_handle = 0x108;
+            memcpy(exec.ram + handle_ptr, &fake_handle, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 5);
+        return true;
+    }
+
+    case ORD_NtSetEvent:
+        // NTSTATUS NtSetEvent(HANDLE, PLONG PreviousState)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_NtClearEvent:
+        // NTSTATUS NtClearEvent(HANDLE)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_NtWaitForSingleObject:
+        // NTSTATUS NtWaitForSingleObject(HANDLE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_NtWaitForMultipleObjects:
+        // NTSTATUS NtWaitForMultipleObjects(ULONG Count, PHANDLE Handles,
+        //          WAIT_TYPE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    // ---- Object manager stubs ----
+
+    case ORD_ObReferenceObjectByHandle:
+        // NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE,
+        //          KPROCESSOR_MODE, PVOID *Object, POBJECT_HANDLE_INFORMATION)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 6);
+        return true;
+
+    case ORD_ObDereferenceObject:
+        // void ObDereferenceObject(PVOID Object)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    // ---- Interlocked operations ----
+
+    case ORD_InterlockedCompareExchange: {
+        // LONG InterlockedCompareExchange(LONG volatile *Dest, LONG Exchange, LONG Comparand)
+        // fastcall: Dest=ECX, Exchange=EDX, Comparand=stack_arg(0)
+        // Actually stdcall on Xbox: 3 args on stack
+        uint32_t dest_ptr  = stack_arg(exec, 0);
+        uint32_t exchange  = stack_arg(exec, 1);
+        uint32_t comparand = stack_arg(exec, 2);
+        uint32_t current = 0;
+        if (dest_ptr + 4 <= GUEST_RAM_SIZE) {
+            memcpy(&current, exec.ram + dest_ptr, 4);
+            if (current == comparand)
+                memcpy(exec.ram + dest_ptr, &exchange, 4);
+        }
+        exec.ctx.gp[GP_EAX] = current; // returns old value
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_InterlockedDecrement: {
+        // LONG InterlockedDecrement(LONG volatile *Addend)
+        uint32_t ptr = stack_arg(exec, 0);
+        int32_t val = 0;
+        if (ptr + 4 <= GUEST_RAM_SIZE) {
+            memcpy(&val, exec.ram + ptr, 4);
+            val--;
+            memcpy(exec.ram + ptr, &val, 4);
+        }
+        exec.ctx.gp[GP_EAX] = (uint32_t)val;
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_InterlockedIncrement: {
+        // LONG InterlockedIncrement(LONG volatile *Addend)
+        uint32_t ptr = stack_arg(exec, 0);
+        int32_t val = 0;
+        if (ptr + 4 <= GUEST_RAM_SIZE) {
+            memcpy(&val, exec.ram + ptr, 4);
+            val++;
+            memcpy(exec.ram + ptr, &val, 4);
+        }
+        exec.ctx.gp[GP_EAX] = (uint32_t)val;
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_InterlockedExchange: {
+        // LONG InterlockedExchange(LONG volatile *Target, LONG Value)
+        uint32_t ptr = stack_arg(exec, 0);
+        uint32_t new_val = stack_arg(exec, 1);
+        uint32_t old_val = 0;
+        if (ptr + 4 <= GUEST_RAM_SIZE) {
+            memcpy(&old_val, exec.ram + ptr, 4);
+            memcpy(exec.ram + ptr, &new_val, 4);
+        }
+        exec.ctx.gp[GP_EAX] = old_val;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    // ---- Memory mapping ----
+
+    case ORD_MmMapIoSpace: {
+        // PVOID MmMapIoSpace(PHYSICAL_ADDRESS PhysAddr, SIZE_T Size, ULONG CacheType)
+        // On Xbox, MMIO is identity-mapped. Return PhysAddr as-is.
+        uint32_t phys = stack_arg(exec, 0);
+        exec.ctx.gp[GP_EAX] = phys;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_MmUnmapIoSpace:
+        // void MmUnmapIoSpace(PVOID BaseAddress, SIZE_T Size)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    // ---- Rtl memory/string utilities ----
+
+    case ORD_RtlInitUnicodeString: {
+        // void RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Src)
+        uint32_t dest = stack_arg(exec, 0);
+        uint32_t src  = stack_arg(exec, 1);
+        uint16_t len = 0;
+        if (src && src < GUEST_RAM_SIZE) {
+            // Count bytes until double-null (wchar_t = 2 bytes)
+            while (src + len + 1 < GUEST_RAM_SIZE) {
+                uint16_t ch;
+                memcpy(&ch, exec.ram + src + len, 2);
+                if (ch == 0) break;
+                len += 2;
+            }
+        }
+        if (dest + 8 <= GUEST_RAM_SIZE) {
+            uint16_t max_len = len + 2;
+            memcpy(exec.ram + dest + 0, &len, 2);
+            memcpy(exec.ram + dest + 2, &max_len, 2);
+            memcpy(exec.ram + dest + 4, &src, 4);
+        }
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_RtlCompareMemory: {
+        // SIZE_T RtlCompareMemory(const VOID *Src1, const VOID *Src2, SIZE_T Length)
+        // Returns number of bytes that match (from the beginning).
+        uint32_t src1 = stack_arg(exec, 0);
+        uint32_t src2 = stack_arg(exec, 1);
+        uint32_t len  = stack_arg(exec, 2);
+        uint32_t matched = 0;
+        for (uint32_t i = 0; i < len; i++) {
+            if (src1 + i >= GUEST_RAM_SIZE || src2 + i >= GUEST_RAM_SIZE) break;
+            if (exec.ram[src1 + i] != exec.ram[src2 + i]) break;
+            matched++;
+        }
+        exec.ctx.gp[GP_EAX] = matched;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_RtlCopyMemory:
+    case ORD_RtlMoveMemory: {
+        // void RtlCopyMemory(VOID *Dest, const VOID *Src, SIZE_T Length)
+        // RtlMoveMemory handles overlaps (memmove).
+        uint32_t dst = stack_arg(exec, 0);
+        uint32_t src = stack_arg(exec, 1);
+        uint32_t len = stack_arg(exec, 2);
+        if (dst + len <= GUEST_RAM_SIZE && src + len <= GUEST_RAM_SIZE && len > 0)
+            memmove(exec.ram + dst, exec.ram + src, len);
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_RtlFillMemory: {
+        // void RtlFillMemory(VOID *Dest, SIZE_T Length, UCHAR Fill)
+        uint32_t dst  = stack_arg(exec, 0);
+        uint32_t len  = stack_arg(exec, 1);
+        uint32_t fill = stack_arg(exec, 2);
+        if (dst + len <= GUEST_RAM_SIZE && len > 0)
+            memset(exec.ram + dst, (int)(fill & 0xFF), len);
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_RtlZeroMemory: {
+        // void RtlZeroMemory(VOID *Dest, SIZE_T Length)
+        uint32_t dst = stack_arg(exec, 0);
+        uint32_t len = stack_arg(exec, 1);
+        if (dst + len <= GUEST_RAM_SIZE && len > 0)
+            memset(exec.ram + dst, 0, len);
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_RtlEqualString: {
+        // BOOLEAN RtlEqualString(PSTRING Str1, PSTRING Str2, BOOLEAN CaseInsensitive)
+        // ANSI_STRING: { USHORT Length, USHORT MaxLength, PCHAR Buffer }
+        uint32_t s1_ptr = stack_arg(exec, 0);
+        uint32_t s2_ptr = stack_arg(exec, 1);
+        uint16_t len1 = 0, len2 = 0;
+        uint32_t buf1 = 0, buf2 = 0;
+        if (s1_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(&len1, exec.ram + s1_ptr, 2);
+            memcpy(&buf1, exec.ram + s1_ptr + 4, 4);
+        }
+        if (s2_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(&len2, exec.ram + s2_ptr, 2);
+            memcpy(&buf2, exec.ram + s2_ptr + 4, 4);
+        }
+        bool eq = (len1 == len2);
+        if (eq && len1 > 0 && buf1 + len1 <= GUEST_RAM_SIZE && buf2 + len2 <= GUEST_RAM_SIZE)
+            eq = (memcmp(exec.ram + buf1, exec.ram + buf2, len1) == 0);
+        exec.ctx.gp[GP_EAX] = eq ? 1u : 0u;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
 
     default:
         // Unhandled: log and return STATUS_NOT_IMPLEMENTED

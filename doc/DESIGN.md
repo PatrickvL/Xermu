@@ -262,7 +262,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
 | `tests/paging.asm`    | Page table walk, 4KB/4MB pages, INVLPG (9)         | ✅ ALL PASS   |
 | `tests/xbox.asm`      | Xbox address map: RAM mirror, PCI, NV2A, Flash (9) | ✅ ALL PASS   |
-| `tests/hle.asm`       | HLE kernel stubs: timing, sync, memory (11)        | ✅ ALL PASS   |
+| `tests/hle.asm`       | HLE kernel stubs: timing, sync, memory, interlocked (21) | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
 | `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
@@ -1598,26 +1598,40 @@ Implemented in `src/xbe_loader.hpp`:
 - **TLS directory**: reads TLS raw data range, writes TLS index = 0.
 - **HLE kernel handler**: `INT 0x20` traps are intercepted by the executor
   (new `hle_handler` callback on `Executor`). A default handler implements:
-  - Memory: `ExAllocatePool`, `MmAllocateContiguousMemory[Ex]`,
-    `MmFreeContiguousMemory`, `MmGetPhysicalAddress`,
+  - Memory: `ExAllocatePool`, `ExAllocatePoolWithTag`, `ExFreePool`,
+    `MmAllocateContiguousMemory[Ex]`, `MmFreeContiguousMemory`,
+    `MmGetPhysicalAddress`, `MmMapIoSpace`, `MmUnmapIoSpace`,
     `NtAllocateVirtualMemory`, `NtFreeVirtualMemory` (bump allocator at 16 MB+)
   - Threading: `KeGetCurrentThread` (fake KTHREAD ptr), `PsCreateSystemThread`
     (stub), `PsTerminateSystemThread`
   - I/O: `NtClose` (stub)
   - Display: `AvSetDisplayMode`, `AvGetSavedDataAddress` (stubs)
-  - System: `HalReturnToFirmware` (halts guest), `DbgPrint`, `RtlInitAnsiString`
-  - Timing: `KeQueryPerformanceCounter` (host RDTSC), `KeQueryPerformanceFrequency`
-    (733 MHz), `KeQuerySystemTime` (RDTSC-derived 100 ns units)
-  - Synchronisation: `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`,
+  - System: `HalReturnToFirmware` (halts guest), `DbgPrint`, `XeLoadSection`
+  - Synchronisation: `KeInitializeEvent`, `KeInitializeMutex`,
+    `KeInitializeSemaphore`, `KeInitializeTimerEx`, `KeSetEvent`,
+    `KeResetEvent`, `KeReleaseMutex`, `KeReleaseSemaphore`,
+    `KeWaitForSingleObject`, `KeWaitForMultipleObjects`,
+    `NtCreateEvent`, `NtCreateMutant`, `NtCreateSemaphore`,
+    `NtSetEvent`, `NtClearEvent`, `NtWaitForSingleObject`,
+    `NtWaitForMultipleObjects`,
+    `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`,
     `RtlLeaveCriticalSection` (single-threaded stubs)
+  - Interlocked: `InterlockedIncrement`, `InterlockedDecrement`,
+    `InterlockedExchange`, `InterlockedCompareExchange`
   - Timers: `KeSetTimer`, `KeSetTimerEx`, `KeCancelTimer`, `KeInitializeDpc` (stubs)
+  - Timing: `KeQueryPerformanceCounter` (host RDTSC), `KeQueryPerformanceFrequency`
+    (733 MHz), `KeQuerySystemTime` (RDTSC-derived 100 ns units), `KeTickCount`
+  - Object manager: `ObReferenceObjectByHandle`, `ObDereferenceObject` (stubs)
+  - String/memory: `RtlInitAnsiString`, `RtlInitUnicodeString`,
+    `RtlCompareMemory`, `RtlCopyMemory`, `RtlMoveMemory`,
+    `RtlFillMemory`, `RtlZeroMemory`, `RtlEqualString`
   - Unhandled ordinals: log + return `STATUS_NOT_IMPLEMENTED`
 - **stdcall cleanup**: args are removed from guest stack by relocating the
   return address before the stub's RET instruction.
 
 Test runner `--xbox` mode writes HLE stubs to guest RAM and installs the handler.
-`tests/hle.asm` exercises 11 kernel calls: memory, threading, timing,
-synchronisation, and timer stubs.
+`tests/hle.asm` exercises 21 kernel calls: memory, interlocked ops, events,
+synchronisation, timers, memory/string utilities, and MMIO mapping stubs.
 
 #### 5.20 Kernel: Dual-Mode (HLE + LLE)
 
