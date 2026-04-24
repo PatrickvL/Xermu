@@ -596,7 +596,7 @@ Guest PA          Size       Type
 0xFF000000         1 MB      BIOS shadow (Flash alias)
 ```
 
-Implemented in `src/xbox.hpp` with `xbox_setup()` function:
+Implemented in `src/xbox/` component files with `xbox_setup()` in `src/xbox/setup.hpp`:
 - **RAM mirror** at 0x0C000000: reads/writes alias main RAM (modulo 64 MB).
 - **Flash ROM** at 0xF0000000: 1 MB read-only, defaults to 0xFF (empty).
 - **BIOS shadow** at 0xFF000000: maps to Flash ROM.
@@ -1373,7 +1373,7 @@ initialization and operation:
   with proper read-back via OCW3.
 - **OCW2 EOI**: non-specific and specific end-of-interrupt commands.
 - **Cascade**: slave on master IRQ 2; slave provides vector on cascade ack.
-- **Integration**: `PicPair` struct in `xbox.hpp`, wired to executor via
+- **Integration**: `PicPair` struct in `src/xbox/pic.hpp`, wired to executor via
   `irq_check`/`irq_ack` function pointers.  Devices call `pic.raise_irq(N)`
   to assert lines.  Test-only I/O port 0xEB triggers IRQs for testing.
 
