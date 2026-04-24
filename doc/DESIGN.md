@@ -186,7 +186,7 @@ and rebuild.
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (58 assertions)                   | ✅ ALL PASS   |
-| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE/8-16bit (51)    | ✅ ALL PASS   |
+| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE/8-16bit/PUSHAD (58) | ✅ ALL PASS   |
 | `tests/flow.asm`      | Control flow: LOOP/Jcc/CALL/RET/recursion (27)   | ✅ ALL PASS   |
 | `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
 | `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
@@ -237,7 +237,8 @@ and rebuild.
 - [x] CALL [mem] / JMP [mem] via C helpers (read_guest_mem32 / call_mem_helper)
 - [x] PUSH [mem] / POP [mem] via C helpers (push_mem_helper / pop_mem_helper)
 - [x] 8/16-bit register MOV memory forms (AL/CL/DL/BL, AX-DI via guest_reg_enc)
-- [x] NASM test infrastructure: 9 suites, 359 total assertions, CMake integration
+- [x] PUSHAD/POPAD via C helpers (IC_PUSHAD/IC_POPAD dispatch classes)
+- [x] NASM test infrastructure: 9 suites, 369 total assertions, CMake integration
 
 ---
 
@@ -333,11 +334,11 @@ C helper functions (`read_guest_mem32`, `write_guest_mem32`, `call_mem_helper`,
 `push_mem_helper`, `pop_mem_helper`). The helpers handle both fastmem and MMIO
 paths transparently. Verified by `tests/indirect.asm` (20 assertions).
 
-#### 5.9 ~~PUSH/POP Immediate~~ ✅ DONE + ~~Memory Forms~~ ✅ DONE
-**PUSH imm8/imm32 resolved.** The `emit_handler_push` detects immediate operands
-and emits SUB ESP,4 + fastmem store of the immediate. `PUSH [mem]` and `POP [mem]`
-now handled via C helpers. Still needed:
-- `PUSHA` / `POPA` (used by some Xbox code)
+#### 5.9 ~~PUSH/POP Immediate~~ ✅ DONE + ~~Memory Forms~~ ✅ DONE + ~~PUSHAD/POPAD~~ ✅ DONE
+**All PUSH/POP forms resolved.** PUSH imm8/imm32 via inline fastmem store.
+`PUSH [mem]` and `POP [mem]` via C helpers. `PUSHAD` and `POPAD` via C helpers
+(`pushad_helper`/`popad_helper`) that operate directly on `ctx->gp[]` and guest
+stack. Dispatch table classes: `IC_PUSHAD`/`IC_POPAD`.
 
 #### 5.10 Privileged Instruction Handling — Partially Done
 **Priority: MEDIUM** (for kernel boot) — `handle_privileged()` now handles HLT

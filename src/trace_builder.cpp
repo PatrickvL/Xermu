@@ -100,6 +100,39 @@ void pop_mem_helper(GuestContext* ctx, uint32_t pa) {
     write_guest_mem32(ctx, pa, val);
 }
 
+// PUSHAD helper: push EAX, ECX, EDX, EBX, original-ESP, EBP, ESI, EDI
+void pushad_helper(GuestContext* ctx) {
+    uint32_t orig_esp = ctx->gp[GP_ESP];
+    uint32_t esp = orig_esp;
+    static constexpr int order[] = { GP_EAX, GP_ECX, GP_EDX, GP_EBX };
+    for (int i : order) {
+        esp -= 4;
+        write_guest_mem32(ctx, esp, ctx->gp[i]);
+    }
+    esp -= 4;
+    write_guest_mem32(ctx, esp, orig_esp); // push original ESP
+    static constexpr int order2[] = { GP_EBP, GP_ESI, GP_EDI };
+    for (int i : order2) {
+        esp -= 4;
+        write_guest_mem32(ctx, esp, ctx->gp[i]);
+    }
+    ctx->gp[GP_ESP] = esp;
+}
+
+// POPAD helper: pop EDI, ESI, EBP, skip-ESP, EBX, EDX, ECX, EAX
+void popad_helper(GuestContext* ctx) {
+    uint32_t esp = ctx->gp[GP_ESP];
+    ctx->gp[GP_EDI] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_ESI] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_EBP] = read_guest_mem32(ctx, esp); esp += 4;
+    esp += 4; // skip ESP slot
+    ctx->gp[GP_EBX] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_EDX] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_ECX] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_EAX] = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_ESP] = esp;
+}
+
 // ---------------------------------------------------------------------------
 // String instruction helpers (MOVS/STOS/LODS/CMPS/SCAS).
 //
@@ -634,6 +667,36 @@ bool emit_handler_push_imm(Emitter& e, const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand* ops, const uint8_t* raw,
                            GuestContext* ctx, bool save_flags) {
     return emit_handler_push(e, insn, ops, raw, ctx, save_flags);
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_pushad — PUSHAD: push all 8 GP regs onto guest stack.
+// ---------------------------------------------------------------------------
+bool emit_handler_pushad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
+                         const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                         GuestContext* /*ctx*/, bool save_flags) {
+    if (save_flags) emit_save_flags(e);
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);
+    emit_call_abs(e, reinterpret_cast<void*>(pushad_helper));
+    emit_load_all_gp(e);
+    if (save_flags) emit_restore_flags(e);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_popad — POPAD: pop all 8 GP regs from guest stack (skip ESP).
+// ---------------------------------------------------------------------------
+bool emit_handler_popad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
+                        const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                        GuestContext* /*ctx*/, bool save_flags) {
+    if (save_flags) emit_save_flags(e);
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);
+    emit_call_abs(e, reinterpret_cast<void*>(popad_helper));
+    emit_load_all_gp(e);
+    if (save_flags) emit_restore_flags(e);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
