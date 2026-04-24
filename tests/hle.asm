@@ -13,6 +13,16 @@
 ;   9. RtlEnterCriticalSection (ordinal 264) — returns cleanly
 ;  10. RtlLeaveCriticalSection (ordinal 267) — returns cleanly
 ;  11. KeCancelTimer (ordinal 96) — returns 0 (not in queue)
+;  12. InterlockedIncrement (ordinal 60) — increments [ptr]
+;  13. InterlockedDecrement (ordinal 59) — decrements [ptr]
+;  14. InterlockedExchange (ordinal 61) — swaps value
+;  15. KeSetEvent (ordinal 144) — returns 0 (previous state)
+;  16. KeWaitForSingleObject (ordinal 157) — returns STATUS_SUCCESS
+;  17. NtCreateEvent (ordinal 188) — writes handle, returns SUCCESS
+;  18. RtlZeroMemory (ordinal 285) — zeroes buffer
+;  19. RtlFillMemory (ordinal 265) — fills buffer
+;  20. RtlCompareMemory (ordinal 261) — returns matching byte count
+;  21. MmMapIoSpace (ordinal 174) — returns physical address
 ;
 ; Convention: these tests call the HLE stubs directly (not through a thunk
 ; table). The HLE stub at address 0x80000 + ordinal * 8 does:
@@ -101,5 +111,100 @@ ORG 0x1000
     push 0x50100               ; arg: fake timer pointer
     call HLE_STUB(96)
     ASSERT_EQ eax, 0           ; timer was not in queue
+
+; === 12. InterlockedIncrement (ordinal 60) ===
+; stdcall: 1 arg (ptr to LONG). Increments and returns new value.
+    mov dword [0x60100], 41    ; initial value = 41
+    push 0x60100               ; arg: pointer to value
+    call HLE_STUB(60)
+    ASSERT_EQ eax, 42          ; should return 42 after increment
+
+; === 13. InterlockedDecrement (ordinal 59) ===
+; stdcall: 1 arg (ptr to LONG). Decrements and returns new value.
+    mov dword [0x60100], 10
+    push 0x60100
+    call HLE_STUB(59)
+    ASSERT_EQ eax, 9           ; should return 9 after decrement
+
+; === 14. InterlockedExchange (ordinal 61) ===
+; stdcall: 2 args (ptr, new value). Returns old value.
+    mov dword [0x60100], 0xAA
+    push 0xBB                  ; new value
+    push 0x60100               ; target pointer
+    call HLE_STUB(61)
+    ASSERT_EQ eax, 0xAA        ; returns old value
+    mov eax, [0x60100]
+    ASSERT_EQ eax, 0xBB        ; memory now has new value
+
+; === 15. KeSetEvent (ordinal 144) ===
+; stdcall: 3 args. Returns previous state (0).
+    push 0                     ; Wait = FALSE
+    push 0                     ; Increment
+    push 0x50200               ; PKEVENT
+    call HLE_STUB(144)
+    ASSERT_EQ eax, 0           ; previous state = not-signaled
+
+; === 16. KeWaitForSingleObject (ordinal 157) ===
+; stdcall: 5 args. Returns STATUS_SUCCESS (0).
+    push 0                     ; Timeout = NULL
+    push 0                     ; Alertable = FALSE
+    push 0                     ; ProcessorMode
+    push 0                     ; WaitReason
+    push 0x50200               ; Object
+    call HLE_STUB(157)
+    ASSERT_EQ eax, 0           ; STATUS_SUCCESS
+
+; === 17. NtCreateEvent (ordinal 188) ===
+; stdcall: 5 args. Writes handle to first arg pointer.
+    mov dword [0x60200], 0     ; clear handle location
+    push 0                     ; InitialState
+    push 0                     ; EventType
+    push 0                     ; ObjectAttributes
+    push 0                     ; DesiredAccess
+    push 0x60200               ; PHANDLE
+    call HLE_STUB(188)
+    ASSERT_EQ eax, 0           ; STATUS_SUCCESS
+    mov eax, [0x60200]
+    ASSERT_NE eax, 0           ; handle should be non-zero
+
+; === 18. RtlZeroMemory (ordinal 285) ===
+; stdcall: 2 args (dest, length). Zeroes memory.
+    mov dword [0x60300], 0xDEADBEEF
+    mov dword [0x60304], 0xCAFEBABE
+    push 8                     ; length
+    push 0x60300               ; dest
+    call HLE_STUB(285)
+    mov eax, [0x60300]
+    ASSERT_EQ eax, 0
+    mov eax, [0x60304]
+    ASSERT_EQ eax, 0
+
+; === 19. RtlFillMemory (ordinal 265) ===
+; stdcall: 3 args (dest, length, fill byte).
+    push 0xAA                  ; fill byte
+    push 4                     ; length
+    push 0x60300               ; dest
+    call HLE_STUB(265)
+    mov eax, [0x60300]
+    ASSERT_EQ eax, 0xAAAAAAAA  ; 4 bytes filled with 0xAA
+
+; === 20. RtlCompareMemory (ordinal 261) ===
+; stdcall: 3 args (src1, src2, length). Returns matching count.
+    mov dword [0x60400], 0x11223344
+    mov dword [0x60410], 0x11223344   ; identical
+    mov byte  [0x60412], 0xFF        ; differs at byte 2 (byte index 2 of the dword)
+    push 4                     ; length = 4 bytes
+    push 0x60410               ; src2
+    push 0x60400               ; src1
+    call HLE_STUB(261)
+    ASSERT_EQ eax, 2           ; first 2 bytes match (0x44, 0x33), byte 2 differs
+
+; === 21. MmMapIoSpace (ordinal 174) ===
+; stdcall: 3 args. Returns physical address (identity-mapped).
+    push 0                     ; CacheType
+    push 0x1000                ; Size
+    push 0xFD000000            ; PhysAddr (NV2A base)
+    call HLE_STUB(174)
+    ASSERT_EQ eax, 0xFD000000  ; returns same address
 
     PASS
