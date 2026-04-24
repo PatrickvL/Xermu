@@ -159,21 +159,41 @@ to the two-byte `FF /0` / `FF /1` forms.
 
 Page-granular version tags (`PageVersions`). Each guest page has a `uint32_t`
 version counter. Every inline fastmem store emits a page-version bump sequence
-(`emit_smc_page_bump`) wrapped in PUSHFQ/POPFQ to preserve guest EFLAGS.
-The C-helper slow path (`write_guest_mem32`) also bumps the version.
-Before executing a cached trace, the run loop compares the trace's recorded page
-version against the current version. On mismatch: invalidate and rebuild.
+(`emit_smc_page_bump`). The C-helper slow path (`write_guest_mem32`) also bumps
+the version. Before executing a cached trace, the run loop compares the trace's
+recorded page version against the current version. On mismatch: invalidate and
+rebuild.
 
-The bump sequence (16 bytes per store):
+The bump sequence per store (12 or 16 bytes):
 ```
-PUSHFQ                       ; save EFLAGS
-PUSH RAX                     ; save scratch
+[PUSHFQ]                     ; only when guest insn produces live flags
+PUSH RAX                     ; save guest EAX
 MOV RAX, [R13+120]           ; load page_versions pointer
 SHR R14D, 12                 ; page index from PA in R14
 INC DWORD [RAX+R14*4]        ; bump version
 POP RAX                      ; restore
-POPFQ                        ; restore EFLAGS
+[POPFQ]                      ; only when guest insn produces live flags
 ```
+
+**EFLAGS handling**: This JIT does **not** use lazy flag evaluation — guest
+instructions execute natively, so guest EFLAGS live in host RFLAGS. The bump's
+SHR+INC clobbers arithmetic flags. Whether PUSHFQ/POPFQ are needed depends on
+the call site:
+
+| Call site             | Guest produces flags? | PUSHFQ/POPFQ? | Bytes |
+|-----------------------|-----------------------|---------------|-------|
+| MOV [mem], reg/imm    | No                    | Skipped       | 12    |
+| ALU [mem] (ADD/SUB…)  | Yes                   | Emitted       | 16    |
+| SETcc/CMOVcc [mem]    | No (reads only)       | Emitted†      | 16    |
+| PUSH imm/reg          | No                    | Skipped       | 12    |
+| FPU/SSE [mem] store   | No (x86 flags)        | Skipped       | 12    |
+| CALL exit (retaddr)   | N/A (trace exit)      | Skipped       | 12    |
+
+† SETcc/CMOVcc: flags are live (just read by the instruction) and must survive
+  to any subsequent flag-reading instruction in the trace.
+
+**CMP/TEST [mem]**: These ALU instructions read memory but don't write back.
+The bump is correctly skipped for them (they are not stores).
 
 ---
 
@@ -438,18 +458,28 @@ delivery sequence, or return to the run loop with an exception code that trigger
 delivery before the next trace.
 
 #### 5.13 ~~SMC Write-Side Version Bumping~~ ✅ DONE
-**Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a 16-byte
-PUSHFQ/POPFQ-wrapped sequence that loads the `page_versions` pointer from
-`GuestContext` (offset 120), right-shifts R14D (PA) by 12 to get the page index,
-and increments the version counter. The C-helper slow path (`write_guest_mem32`)
-also bumps the version. Nine JIT call sites covered: `emit_fastmem_dispatch`,
-`emit_fastmem_dispatch_store_imm`, `emit_handler_alu_mem`, `emit_handler_flagmem`,
-`emit_handler_push` (imm/reg), `emit_handler_fpu_mem`, `emit_call_exit`
-(direct/register). Additionally fixed a pre-existing bug where CALL direct/register
-clobbered guest ECX by using `MOV ECX, retaddr` as scratch — replaced with
-`emit_fastmem_store_imm32` which writes the immediate directly to memory.
-Verified by `tests/smc.asm` (11 assertions: patch immediate, patch opcode, patch
-JMP target, patch ALU operation, repeated patches).
+**Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
+12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
+(offset 120), right-shifts R14D (PA) by 12, and increments the version counter.
+The PUSHFQ/POPFQ wrapper is conditional: emitted only when the guest instruction
+produces arithmetic flags that may be live (ALU read-modify-write, SETcc/CMOVcc
+stores). Skipped for MOV stores, FPU stores, PUSH, and trace exit paths (12
+bytes). CMP/TEST [mem] are correctly excluded (read-only, no bump needed).
+The C-helper slow path (`write_guest_mem32`) also bumps.
+
+Nine JIT call sites: `emit_fastmem_dispatch`, `emit_fastmem_dispatch_store_imm`,
+`emit_handler_alu_mem`, `emit_handler_flagmem`, `emit_handler_push` (imm/reg),
+`emit_handler_fpu_mem`, `emit_call_exit` (direct/register).
+
+Additionally fixed: CALL direct/register clobbered guest ECX via `MOV ECX, retaddr`
+scratch — replaced with `emit_fastmem_store_imm32` (imm-to-mem, no clobber).
+
+> **Design note**: This JIT does not use lazy flag evaluation. Guest instructions
+> run natively, so guest EFLAGS live in host RFLAGS. A `mprotect`/SIGSEGV-based
+> approach (zero per-store cost, fault on actual SMC) would eliminate the bump
+> overhead entirely but adds implementation complexity. The current per-store
+> bump is correct and sufficient; the conditional PUSHFQ/POPFQ avoids the worst
+> overhead on non-flag-producing stores (MOV, PUSH, FPU — the common case).
 
 ---
 
