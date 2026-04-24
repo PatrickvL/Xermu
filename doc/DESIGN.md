@@ -110,7 +110,7 @@ PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 All instruction classification is driven by a **two-level O(1) dispatch table**:
 
 - **Level 1**: `uint8_t MNEMONIC_CLASS[ZYDIS_MNEMONIC_MAX_VALUE+1]` — maps every
-  Zydis mnemonic enum to a compact `InsnClassId` (0–13). Initialized once by
+  Zydis mnemonic enum to a compact `InsnClassId` (0–17). Initialized once by
   `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
 
 - **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
@@ -135,8 +135,11 @@ Class IDs and their handlers:
 | IC_MOVZX_MEM  | MOVZX                                    | `emit_handler_movzx_mem` |
 | IC_MOVSX_MEM  | MOVSX                                    | `emit_handler_movsx_mem` |
 | IC_FPU_MEM    | FLD/FST/FISTP/FADD/FSUB/FMUL/FDIV/FCOM/FLDCW/... (27 x87 mnemonics) | `emit_handler_fpu_mem` |
-| IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/IRETD             | (inline in build loop) |
-| IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (inline UD2 trap)      |
+| IC_SSE_MEM    | MOVAPS/ADDPS/MULPS/XORPS/SHUFPS/... (36 SSE1 + 37 MMX; SSE2 gated) | `emit_handler_fpu_mem` (shared) |
+| IC_PUSHFD     | PUSHFD                                   | `emit_handler_pushfd`  |
+| IC_POPFD      | POPFD                                    | `emit_handler_popfd`   |
+| IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/LOOPE/LOOPNE/IRETD | (inline in build loop) |
+| IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (stop_reason + RET)    |
 
 The `build()` loop in Phase 1 uses `lookup_flags()` for dispatch detection and
 termination. Phase 3 uses `lookup_insn_class()` to fetch the handler callback —
@@ -179,6 +182,14 @@ and rebuild.
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
+| `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
+| `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
+| `tests/alu.asm`       | ALU test suite (58 assertions)                   | ✅ ALL PASS   |
+| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE (41 assertions) | ✅ ALL PASS   |
+| `tests/flow.asm`      | Control flow: LOOP/Jcc/CALL/RET/recursion (27)   | ✅ ALL PASS   |
+| `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
+| `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
+| `tests/advanced.asm`  | CMOVcc/SETcc/BT/BSF/BSWAP/SHLD/IMUL (42)        | ✅ ALL PASS   |
 
 ---
 
@@ -209,6 +220,15 @@ and rebuild.
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
 - [x] Self-tests pass: sum loop, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm, x87 reg ops, x87 mem store
+- [x] SSE1/MMX memory-operand dispatch (36 SSE1 + 37 MMX mnemonics, `IC_SSE_MEM`)
+- [x] SSE2+ mnemonics conditionally compiled (`XBOX_TARGET_SSE` flag)
+- [x] PUSHFD/POPFD guest-stack handlers (`IC_PUSHFD`/`IC_POPFD`)
+- [x] LOOP/LOOPE/LOOPNE terminator handling (DEC ECX + conditional exit)
+- [x] MOVZX/MOVSX register-register forms (verbatim copy)
+- [x] Privileged instruction stop_reason mechanism (replaces UD2 with RET to run loop)
+- [x] I/O port dispatch (IN/OUT emulation with IoPortEntry table)
+- [x] Debug console (port 0xE9 Bochs-style character output)
+- [x] NASM test infrastructure: 6 suites, 271 total assertions, CMake integration
 
 ---
 
@@ -244,9 +264,21 @@ now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 112) and `host_fpu`
   MXCSR = 0x1F80 (all SSE exceptions masked).
 - Verified by Test 4 (FLD1+FADDP+FCOMPP+FNSTSW AX) and Test 5 (FISTP [mem]).
 
-**Still needed**: SSE memory-operand forms (MOVAPS, MOVUPS, etc.) — the generic
-rewriter supports them structurally, but they are not yet registered in the
-dispatch table. MMX memory forms also not yet registered.
+**SSE1/MMX now registered.** 36 SSE1 single-precision mnemonics (MOVAPS, ADDPS,
+MULPS, SHUFPS, COMISS, CVTSI2SS, LDMXCSR, etc.) and 37 MMX mnemonics (PADDB,
+PSHUFW, MASKMOVQ, etc.) are registered under `IC_SSE_MEM` and share the same
+`emit_handler_fpu_mem` handler (generic rewriter for memory forms, verbatim copy
+for register-only). SSE2+ mnemonics are gated behind `#if XBOX_TARGET_SSE >= 2`
+(default: 1, matching the Xbox Pentium III). Verified by `tests/sse.asm` (48
+assertions covering all major SSE1 instruction categories).
+
+**PUSHFD/POPFD** now have dedicated JIT handlers (`IC_PUSHFD`/`IC_POPFD`).
+PUSHFD captures host EFLAGS via PUSHFQ+POP R14, then calls a C helper to store
+onto the guest stack (ctx->gp[ESP], not host RSP). POPFD calls a C helper to read
+from the guest stack, then sets host EFLAGS via PUSH RAX + POPFQ.
+
+**MOVZX/MOVSX register-register** forms now verbatim-copy instead of returning
+failure. The memory-operand path is unchanged.
 
 #### 5.3 String Instructions (REP MOVS/STOS/CMPS/SCAS/LODS)
 **Priority: HIGH** — Used by memcpy/memset/strlen and compiler intrinsics.
@@ -288,19 +320,20 @@ and emits SUB ESP,4 + fastmem store of the immediate. Verified by Test 3
 - `PUSH [mem]` / `POP [mem]`
 - `PUSHA` / `POPA` (used by some Xbox code)
 
-#### 5.10 Privileged Instruction Handling
-**Priority: MEDIUM** (for kernel boot) — `handle_privileged()` currently halts.
-Needs real emulation for each opcode class:
+#### 5.10 Privileged Instruction Handling — Partially Done
+**Priority: MEDIUM** (for kernel boot) — `handle_privileged()` now handles HLT
+(set virtual_if=false), IN/OUT (I/O port dispatch table), and returns to the run
+loop via a `stop_reason` field instead of UD2. Remaining emulation:
 
 | Instruction       | Emulation needed                                   |
 |-------------------|----------------------------------------------------|
 | RDMSR / WRMSR     | MSR table (APIC_BASE, SYSENTER_*, etc.)            |
 | MOV CRn, r / r, CRn | Update ctx->cr0/cr2/cr3/cr4                     |
-| IN / OUT          | I/O port dispatch table                            |
+| IN / OUT          | ✅ DONE — IoPortEntry dispatch table in XboxExecutor |
 | LGDT / LIDT       | Update ctx->gdtr/idtr_base/limit                  |
 | LLDT / LTR        | Update ctx->ldtr/tr                                |
 | CLI / STI         | Toggle ctx->virtual_if                             |
-| PUSHF / POPF      | Merge virtual_if into/from EFLAGS image            |
+| PUSHF / POPF      | ✅ DONE — Guest-stack handlers (IC_PUSHFD/IC_POPFD) |
 | IRET              | Pop EIP/CS/EFLAGS from guest stack, restore IF     |
 | INVLPG            | Invalidate shadow TLB entry (once paging exists)   |
 | CPUID             | Return Xbox-appropriate CPUID leaves               |
