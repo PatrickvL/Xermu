@@ -465,6 +465,16 @@ delivery sequence, or return to the run loop with an exception code that trigger
 delivery before the next trace.
 
 #### 5.13 ~~SMC Write-Side Version Bumping~~ ✅ DONE
+
+#### 5.14 ~~Correctness audit~~ ✅ DONE
+Full codebase audit for correctness, efficiency, and consistency.  Fixes:
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| `TraceCache::invalidate()` sets slot to EMPTY, breaking open-addressing probe chains for subsequent entries | Stale / duplicate traces after SMC invalidation | Tombstone sentinel (`DELETED = 0xFFFFFFFE`); `lookup` already skips non-matching keys; `insert` now reuses tombstone slots |
+| IRETD exit missing `emit_load_all_gp` after C call | EAX/ECX/EDX corrupted by volatile-register clobber; trampoline saves junk to `ctx->gp[]` | Added `emit_load_all_gp(e)` + EFLAGS restore via `MOV R14D,[R13+36]; PUSH R14; POPFQ` before RET |
+| LOOPE/LOOPNE always branch to `taken_eip` | Incorrect control flow — ZF and ECX conditions ignored | Check original ZF (JNZ/JZ rel32) before DEC ECX; each path decrements ECX and branches correctly |
+| CALL direct/register write return address with no ESP bounds check | Host memory corruption if guest ESP is out of range | Added `CMP R14, R15; JAE` → UD2 guard before `emit_fastmem_store_imm32` |
 **Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
 12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
 (offset 120), right-shifts R14D (PA) by 12, and increments the version counter.

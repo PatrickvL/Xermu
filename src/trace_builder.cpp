@@ -1233,9 +1233,13 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             uint32_t target = pc_after + (uint32_t)(int32_t)op.imm.value.s;
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
-            emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
-            emit_smc_page_bump(e, false);  // trace exit, flags irrelevant
-            emit_epilog_static(e, target);
+            emit_cmp_r14_r15(e);
+            uint8_t* oob = emit_jae_fwd(e);
+            emit_fastmem_store_imm32(e, pc_after);
+            emit_smc_page_bump(e, false);
+            emit_epilog_static(e, target);  // ends with RET
+            Emitter::patch_rel32(oob, e.cur());
+            e.emit8(0x0F); e.emit8(0x0B);  // UD2 — stack OOB
             return;
         }
         if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -1243,9 +1247,13 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             if (reg32_enc(op.reg.value, enc)) {
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
-                emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
-                emit_smc_page_bump(e, false);  // trace exit, flags irrelevant
-                emit_epilog_dynamic(e, enc);
+                emit_cmp_r14_r15(e);
+                uint8_t* oob = emit_jae_fwd(e);
+                emit_fastmem_store_imm32(e, pc_after);
+                emit_smc_page_bump(e, false);
+                emit_epilog_dynamic(e, enc);  // ends with RET
+                Emitter::patch_rel32(oob, e.cur());
+                e.emit8(0x0F); e.emit8(0x0B);  // UD2 — stack OOB
                 return;
             }
         }
@@ -1461,7 +1469,15 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 emit_save_all_gp(e);
                 emit_ccall_arg0_ctx(e);
                 emit_call_abs(e, reinterpret_cast<void*>(iret_helper));
-                // next_eip and eflags set by helper; just RET to trampoline
+                // Restore guest EFLAGS into host RFLAGS from ctx->eflags (offset 36).
+                // MOV R14D, [R13+36]  (REX=0x45, MOV r,r/m, mod=01 reg=6 rm=5)
+                e.emit8(0x45); e.emit8(0x8B);
+                e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
+                e.emit8(36);
+                e.emit8(0x41); e.emit8(0x56);  // PUSH R14
+                e.emit8(0x9D);                  // POPFQ — set host EFLAGS
+                // Reload GP regs from ctx (C call clobbered EAX/ECX/EDX).
+                emit_load_all_gp(e);
                 e.emit8(0xC3);
                 break;
             case ZYDIS_MNEMONIC_CALL:
@@ -1488,17 +1504,39 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 // LOOPNE: DEC ECX, jump if ECX != 0 AND ZF == 0.
                 // All three do NOT modify EFLAGS per the ISA, but we are at a
                 // trace boundary so corrupting flags is acceptable.
-                // DEC ECX (ModRM form: 0xFF /1 → 0xFF 0xC9)
-                e.emit8(0xFF); e.emit8(0xC9);
                 if (insn.mnemonic == ZYDIS_MNEMONIC_LOOP) {
+                    // DEC ECX (ModRM form: 0xFF /1 → 0xFF 0xC9)
+                    e.emit8(0xFF); e.emit8(0xC9);
                     // TEST ECX, ECX (0x85 0xC9) — sets ZF if ECX==0
                     e.emit8(0x85); e.emit8(0xC9);
                     emit_epilog_conditional(e, 0x75 /*JNZ*/, taken_eip,
                                             pc_after);
+                } else if (insn.mnemonic == ZYDIS_MNEMONIC_LOOPE) {
+                    // Check original ZF before DEC clobbers it.
+                    // ZF==0 → not taken (skip to DEC + fallthrough).
+                    e.emit8(0x0F); e.emit8(0x85);  // JNZ rel32
+                    uint8_t* zf_fail = e.reserve_rel32();
+                    e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
+                    e.emit8(0x85); e.emit8(0xC9);  // TEST ECX, ECX
+                    emit_epilog_conditional(e, 0x75 /*JNZ*/, taken_eip,
+                                            pc_after);
+                    // ZF==0 landing: still DEC ECX, then fallthrough.
+                    Emitter::patch_rel32(zf_fail, e.cur());
+                    e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
+                    emit_epilog_static(e, pc_after);
                 } else {
-                    // LOOPE/LOOPNE: need to check both ECX!=0 and ZF.
-                    // Emit static fallback for now (single-step).
-                    emit_epilog_static(e, taken_eip);
+                    // LOOPNE: check original ZF before DEC clobbers it.
+                    // ZF==1 → not taken (skip to DEC + fallthrough).
+                    e.emit8(0x0F); e.emit8(0x84);  // JZ rel32
+                    uint8_t* zf_fail = e.reserve_rel32();
+                    e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
+                    e.emit8(0x85); e.emit8(0xC9);  // TEST ECX, ECX
+                    emit_epilog_conditional(e, 0x75 /*JNZ*/, taken_eip,
+                                            pc_after);
+                    // ZF==1 landing: still DEC ECX, then fallthrough.
+                    Emitter::patch_rel32(zf_fail, e.cur());
+                    e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
+                    emit_epilog_static(e, pc_after);
                 }
                 break;
             }
