@@ -240,7 +240,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
 | `xbox/flash.hpp`      | Flash ROM + MCPX: BIOS loading, shadow           | ✅ Working    |
 | `xbox/pci.hpp`        | PCI config space: BARs, IRQs, bridge, all devices | ✅ Working    |
-| `xbox/smbus.hpp`      | SMBus: EEPROM, SMC, video encoder                | ✅ Working    |
+| `xbox/smbus.hpp`      | SMBus: EEPROM, SMC (smc:: commands), video enc   | ✅ Working    |
 | `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
 | `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
 | `xbox/misc_io.hpp`    | System control port 0x61, debug console 0xE9     | ✅ Working    |
@@ -285,6 +285,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pbus.asm`     | NV2A PBUS: interrupt W1C, FBIO_RAM, debug (7)     | ✅ ALL PASS   |
 | `tests/pramdac.asm`  | NV2A PCRTC+PRAMDAC: START, RASTER, PLLs, TV (10)  | ✅ ALL PASS   |
 | `tests/ptimer_alarm.asm` | NV2A PTIMER: alarm fire, W1C, NUM/DEN (8)     | ✅ ALL PASS   |
+| `tests/smbus_smc.asm`   | SMC commands: version, temps, fan, scratch (12)| ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---

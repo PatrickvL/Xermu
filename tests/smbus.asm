@@ -75,9 +75,9 @@ ORG 0x1000
     SMBUS_READ 0x10, 0x01
     ASSERT_EQ eax, 0xD0
 
-; === 5. SMC CPU temperature (device 0x10, cmd 0x09) = 25 ===
+; === 5. SMC CPU temperature (device 0x10, cmd 0x09) = 40 ===
     SMBUS_READ 0x10, 0x09
-    ASSERT_EQ eax, 25
+    ASSERT_EQ eax, 40
 
 ; === 6. Write EEPROM byte, read it back ===
 ; Write 0x42 to EEPROM offset 0xF0 (audio flags — safe to modify)
