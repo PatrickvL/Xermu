@@ -32,62 +32,67 @@ struct Trace {
     }
 };
 
-// Flat open-addressed hash table mapping guest_eip → Trace*.
-// Capacity must be a power of two.
+// Two-level direct-mapped trace cache: page_map[eip >> 12][offset >> 1].
+// Level 1: fixed array indexed by (guest_page & L1_MASK).
+// Level 2: per-page array of 2048 Trace* slots, allocated on demand.
+// Full guest_eip is verified on lookup to handle L1 aliasing.
 struct TraceCache {
-    static constexpr size_t CAPACITY = 1u << 16; // 65536 slots
-    static constexpr uint32_t EMPTY   = 0xFFFF'FFFF;
-    static constexpr uint32_t DELETED = 0xFFFF'FFFE; // tombstone
+    static constexpr size_t L1_BITS = 15;                 // 32768 pages (128 MB)
+    static constexpr size_t L1_SIZE = 1u << L1_BITS;
+    static constexpr size_t L1_MASK = L1_SIZE - 1;
+    static constexpr size_t L2_SIZE = 2048;               // 4096 >> 1
 
-    struct Slot {
-        uint32_t key  = EMPTY;
-        Trace*   trace = nullptr;
+    struct PageTable {
+        Trace* slots[L2_SIZE] = {};
     };
 
-    Slot slots[CAPACITY] = {};
+    PageTable* page_map[L1_SIZE] = {};
 
-    TraceCache() { clear(); }
+    TraceCache() = default;
+    ~TraceCache() { destroy(); }
 
-    void clear() {
-        for (auto& s : slots) { s.key = EMPTY; s.trace = nullptr; }
-    }
-
-    // Insert (overwrites existing entry for the same eip).
-    void insert(Trace* t) {
-        uint32_t h = hash(t->guest_eip);
-        while (slots[h].key != EMPTY && slots[h].key != DELETED &&
-               slots[h].key != t->guest_eip)
-            h = (h + 1) & (CAPACITY - 1);
-        slots[h] = { t->guest_eip, t };
-    }
-
-    // Returns nullptr on miss.
-    Trace* lookup(uint32_t eip) const {
-        uint32_t h = hash(eip);
-        while (slots[h].key != EMPTY) {
-            if (slots[h].key == eip) return slots[h].trace;
-            h = (h + 1) & (CAPACITY - 1);
+    // Free all page tables (destructor only — after this the cache is unusable).
+    void destroy() {
+        for (size_t i = 0; i < L1_SIZE; ++i) {
+            delete page_map[i];
+            page_map[i] = nullptr;
         }
-        return nullptr;
+    }
+
+    // Mark every cached trace invalid and null all slots.
+    // Page tables are kept allocated for reuse.
+    void clear() {
+        for (size_t i = 0; i < L1_SIZE; ++i) {
+            if (!page_map[i]) continue;
+            for (size_t j = 0; j < L2_SIZE; ++j) {
+                Trace* t = page_map[i]->slots[j];
+                if (t) { t->valid = false; page_map[i]->slots[j] = nullptr; }
+            }
+        }
+    }
+
+    void insert(Trace* t) {
+        size_t l1 = (t->guest_eip >> 12) & L1_MASK;
+        size_t l2 = (t->guest_eip & 0xFFF) >> 1;
+        if (!page_map[l1]) page_map[l1] = new PageTable{};
+        page_map[l1]->slots[l2] = t;
+    }
+
+    Trace* lookup(uint32_t eip) const {
+        size_t l1 = (eip >> 12) & L1_MASK;
+        if (!page_map[l1]) return nullptr;
+        Trace* t = page_map[l1]->slots[(eip & 0xFFF) >> 1];
+        return (t && t->guest_eip == eip) ? t : nullptr;
     }
 
     void invalidate(uint32_t eip) {
-        uint32_t h = hash(eip);
-        while (slots[h].key != EMPTY) {
-            if (slots[h].key == eip) {
-                if (slots[h].trace) slots[h].trace->valid = false;
-                slots[h].key   = DELETED;
-                slots[h].trace = nullptr;
-                return;
-            }
-            h = (h + 1) & (CAPACITY - 1);
+        size_t l1 = (eip >> 12) & L1_MASK;
+        if (!page_map[l1]) return;
+        size_t l2 = (eip & 0xFFF) >> 1;
+        Trace* t = page_map[l1]->slots[l2];
+        if (t && t->guest_eip == eip) {
+            t->valid = false;
+            page_map[l1]->slots[l2] = nullptr;
         }
-    }
-
-    static uint32_t hash(uint32_t k) {
-        k ^= k >> 16;
-        k *= 0x45d9f3b;
-        k ^= k >> 16;
-        return k & (CAPACITY - 1);
     }
 };
