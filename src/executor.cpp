@@ -54,9 +54,9 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         "mov %%rsi, %%r14\n\t"
 
         // ---- Save host FPU/SSE state, load guest FPU/SSE state ----------
-        "lea 624(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "lea 640(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
         "fxsave (%%rax)\n\t"
-        "lea 112(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "lea 128(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
         "fxrstor (%%rax)\n\t"
 
         // ---- Load guest GP registers into host registers -----------------
@@ -83,9 +83,9 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         "movl %%edi, 28(%%r13)\n\t"
 
         // ---- Save guest FPU/SSE state, restore host FPU/SSE state -------
-        "lea 112(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "lea 128(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
         "fxsave (%%rax)\n\t"
-        "lea 624(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "lea 640(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
         "fxrstor (%%rax)\n\t"
 
         // ---- Epilog: restore host registers ------------------------------

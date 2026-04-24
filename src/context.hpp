@@ -41,11 +41,16 @@ struct alignas(16) GuestContext {
     uint32_t  gdtr_base; uint16_t gdtr_limit; uint16_t _p1;
     uint32_t  idtr_base; uint16_t idtr_limit; uint16_t _p2;
     bool      virtual_if;
+    uint8_t   _pad_vif[3];   // alignment padding
+
+    // Segment base addresses (only FS/GS are non-zero on Xbox)
+    uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
+    uint32_t  gs_base;        // [112] GS segment base
 
     // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
-    alignas(16) uint8_t guest_fpu[512];  // [112] guest x87/MMX/SSE state
-    alignas(16) uint8_t host_fpu[512];   // [624] saved host state
+    alignas(16) uint8_t guest_fpu[512];  // [128] guest x87/MMX/SSE state
+    alignas(16) uint8_t host_fpu[512];   // [640] saved host state
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);
@@ -54,12 +59,14 @@ static_assert(offsetof(GuestContext, next_eip)     == 40);
 static_assert(offsetof(GuestContext, fastmem_base) == 48);
 static_assert(offsetof(GuestContext, ram_size)     == 56);
 static_assert(offsetof(GuestContext, mmio)         == 64);
-static_assert(offsetof(GuestContext, guest_fpu)    == 112);
-static_assert(offsetof(GuestContext, host_fpu)     == 624);
+static_assert(offsetof(GuestContext, fs_base)      == 108);
+static_assert(offsetof(GuestContext, gs_base)      == 112);
+static_assert(offsetof(GuestContext, guest_fpu)    == 128);
+static_assert(offsetof(GuestContext, host_fpu)     == 640);
 
 // Offsets used by asm trampolines (MASM + inline asm)
-inline constexpr int CTX_GUEST_FPU = 112;
-inline constexpr int CTX_HOST_FPU  = 624;
+inline constexpr int CTX_GUEST_FPU = 128;
+inline constexpr int CTX_HOST_FPU  = 640;
 
 // GP register indices (match x86 ModRM/SIB encoding order)
 enum : int {
