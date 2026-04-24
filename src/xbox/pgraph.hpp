@@ -94,51 +94,25 @@ static constexpr uint32_t NO_OPERATION                = 0x0100;
 // ============================= PGRAPH State ================================
 
 struct PgraphState {
-    // --- Surface / render target ---
-    uint32_t surface_format        = 0;
-    uint32_t surface_pitch         = 0;
-    uint32_t surface_color_offset  = 0;
-    uint32_t surface_zeta_offset   = 0;
-    uint32_t surface_clip_x        = 0;
-    uint32_t surface_clip_y        = 0;
+    // --- Flat register file ---
+    // Indexed by method/4.  Covers the NV097 method space (0x0000..0x1FFF).
+    // Some slots hold integer data, others hold IEEE 754 floats (e.g. viewport).
+    static constexpr uint32_t METHOD_SPACE = 0x2000;          // 8 KB method range
+    static constexpr uint32_t REG_COUNT    = METHOD_SPACE / 4; // 2048 uint32_t slots
+    uint32_t regs[REG_COUNT] = {};
 
-    // --- Blend ---
-    uint32_t blend_enable          = 0;
-    uint32_t blend_sfactor         = 1;   // ONE
-    uint32_t blend_dfactor         = 0;   // ZERO
-    uint32_t blend_equation        = 0x8006; // FUNC_ADD
-    uint32_t blend_color           = 0;
+    // Typed access helpers.
+    uint32_t& reg(uint32_t method)       { return regs[method / 4]; }
+    uint32_t  reg(uint32_t method) const { return regs[method / 4]; }
 
-    // --- Depth / stencil ---
-    uint32_t depth_test_enable     = 0;
-    uint32_t depth_func            = 0x0201; // LESS
-    uint32_t depth_mask            = 1;
-    uint32_t stencil_test_enable   = 0;
-    uint32_t stencil_func          = 0x0207; // ALWAYS
-    uint32_t stencil_ref           = 0;
-    uint32_t stencil_mask          = 0xFFFFFFFF;
-    uint32_t stencil_op_fail       = 0x1E00; // KEEP
-    uint32_t stencil_op_zfail      = 0x1E00;
-    uint32_t stencil_op_zpass      = 0x1E00;
+    float reg_float(uint32_t method) const {
+        float f; memcpy(&f, &regs[method / 4], 4); return f;
+    }
+    void set_reg_float(uint32_t method, float f) {
+        memcpy(&regs[method / 4], &f, 4);
+    }
 
-    // --- Rasterizer ---
-    uint32_t cull_face_enable      = 0;
-    uint32_t cull_face             = 0x0405; // BACK
-    uint32_t front_face            = 0x0901; // CCW
-    uint32_t shade_mode            = 0x1D01; // SMOOTH
-    uint32_t color_mask            = 0x01010101;
-
-    // --- Texture (4 stages) ---
-    struct TextureState {
-        uint32_t offset   = 0;
-        uint32_t format   = 0;
-        uint32_t control0 = 0;
-        uint32_t filter   = 0;
-        uint32_t image_rect = 0;
-    };
-    TextureState textures[4] = {};
-
-    // --- Vertex shader program ---
+    // --- Vertex shader program (streaming upload, not direct registers) ---
     uint32_t vs_program_load  = 0;  // current load slot
     uint32_t vs_program[136 * 4] = {};  // 136 instruction slots × 4 dwords
     uint32_t vs_program_write_pos = 0;
@@ -147,21 +121,6 @@ struct PgraphState {
     uint32_t vs_const_load = 0;  // current load index
     float    vs_constants[192][4] = {};
     uint32_t vs_const_write_pos = 0;
-
-    // --- Register combiners ---
-    uint32_t combiner_control = 0;
-    uint32_t combiner_color_icw[8] = {};
-    uint32_t combiner_color_ocw[8] = {};
-    uint32_t combiner_alpha_icw[8] = {};
-    uint32_t combiner_alpha_ocw[8] = {};
-    uint32_t combiner_specular_fog_cw0 = 0;
-    uint32_t combiner_specular_fog_cw1 = 0;
-
-    // --- Primitive ---
-    uint32_t begin_end_mode = 0;  // 0 = END, 1-10 = primitive type
-
-    // --- Clear ---
-    uint32_t clear_surface = 0;
 
     // --- Stats ---
     uint32_t draw_count = 0;  // number of SET_BEGIN_END transitions from 0→nonzero
@@ -173,162 +132,61 @@ struct PgraphState {
         (void)subchannel;
         total_methods++;
 
+        // --- Methods that need special handling ---
         switch (method) {
-        // Surface
-        case nv097::SET_SURFACE_FORMAT:       surface_format = data; break;
-        case nv097::SET_SURFACE_PITCH:        surface_pitch = data; break;
-        case nv097::SET_SURFACE_COLOR_OFFSET: surface_color_offset = data; break;
-        case nv097::SET_SURFACE_ZETA_OFFSET:  surface_zeta_offset = data; break;
-        case nv097::SET_SURFACE_CLIP_HORIZONTAL: surface_clip_x = data; break;
-        case nv097::SET_SURFACE_CLIP_VERTICAL:   surface_clip_y = data; break;
+        case nv097::SET_BEGIN_END:
+            if (reg(nv097::SET_BEGIN_END) == 0 && data != 0)
+                draw_count++;
+            reg(method) = data;
+            return;
 
-        // Blend
-        case nv097::SET_BLEND_ENABLE:       blend_enable = data; break;
-        case nv097::SET_BLEND_FUNC_SFACTOR: blend_sfactor = data; break;
-        case nv097::SET_BLEND_FUNC_DFACTOR: blend_dfactor = data; break;
-        case nv097::SET_BLEND_EQUATION:     blend_equation = data; break;
-        case nv097::SET_BLEND_COLOR:        blend_color = data; break;
+        case nv097::CLEAR_SURFACE:
+            reg(method) = data;
+            clear_count++;
+            return;
 
-        // Depth
-        case nv097::SET_DEPTH_TEST_ENABLE: depth_test_enable = data; break;
-        case nv097::SET_DEPTH_FUNC:        depth_func = data; break;
-        case nv097::SET_DEPTH_MASK:        depth_mask = data; break;
-
-        // Stencil
-        case nv097::SET_STENCIL_TEST_ENABLE: stencil_test_enable = data; break;
-        case nv097::SET_STENCIL_FUNC:        stencil_func = data; break;
-        case nv097::SET_STENCIL_FUNC_REF:    stencil_ref = data; break;
-        case nv097::SET_STENCIL_FUNC_MASK:   stencil_mask = data; break;
-        case nv097::SET_STENCIL_OP_FAIL:     stencil_op_fail = data; break;
-        case nv097::SET_STENCIL_OP_ZFAIL:    stencil_op_zfail = data; break;
-        case nv097::SET_STENCIL_OP_ZPASS:    stencil_op_zpass = data; break;
-
-        // Rasterizer
-        case nv097::SET_CULL_FACE_ENABLE: cull_face_enable = data; break;
-        case nv097::SET_CULL_FACE:        cull_face = data; break;
-        case nv097::SET_FRONT_FACE:       front_face = data; break;
-        case nv097::SET_SHADE_MODE:       shade_mode = data; break;
-        case nv097::SET_COLOR_MASK:       color_mask = data; break;
-
-        // Textures (4 stages, 64-byte stride)
-        case nv097::SET_TEXTURE_OFFSET + 0*64:
-        case nv097::SET_TEXTURE_OFFSET + 1*64:
-        case nv097::SET_TEXTURE_OFFSET + 2*64:
-        case nv097::SET_TEXTURE_OFFSET + 3*64: {
-            uint32_t stage = (method - nv097::SET_TEXTURE_OFFSET) / 64;
-            textures[stage].offset = data;
-            break;
-        }
-        case nv097::SET_TEXTURE_FORMAT + 0*64:
-        case nv097::SET_TEXTURE_FORMAT + 1*64:
-        case nv097::SET_TEXTURE_FORMAT + 2*64:
-        case nv097::SET_TEXTURE_FORMAT + 3*64: {
-            uint32_t stage = (method - nv097::SET_TEXTURE_FORMAT) / 64;
-            textures[stage].format = data;
-            break;
-        }
-        case nv097::SET_TEXTURE_CONTROL0 + 0*64:
-        case nv097::SET_TEXTURE_CONTROL0 + 1*64:
-        case nv097::SET_TEXTURE_CONTROL0 + 2*64:
-        case nv097::SET_TEXTURE_CONTROL0 + 3*64: {
-            uint32_t stage = (method - nv097::SET_TEXTURE_CONTROL0) / 64;
-            textures[stage].control0 = data;
-            break;
-        }
-        case nv097::SET_TEXTURE_FILTER + 0*64:
-        case nv097::SET_TEXTURE_FILTER + 1*64:
-        case nv097::SET_TEXTURE_FILTER + 2*64:
-        case nv097::SET_TEXTURE_FILTER + 3*64: {
-            uint32_t stage = (method - nv097::SET_TEXTURE_FILTER) / 64;
-            textures[stage].filter = data;
-            break;
-        }
-        case nv097::SET_TEXTURE_IMAGE_RECT + 0*64:
-        case nv097::SET_TEXTURE_IMAGE_RECT + 1*64:
-        case nv097::SET_TEXTURE_IMAGE_RECT + 2*64:
-        case nv097::SET_TEXTURE_IMAGE_RECT + 3*64: {
-            uint32_t stage = (method - nv097::SET_TEXTURE_IMAGE_RECT) / 64;
-            textures[stage].image_rect = data;
-            break;
-        }
-
-        // Vertex shader program upload
         case nv097::SET_TRANSFORM_PROGRAM_LOAD:
             vs_program_load = data;
             vs_program_write_pos = data * 4;
-            break;
+            reg(method) = data;
+            return;
+
+        case nv097::SET_TRANSFORM_CONSTANT_LOAD:
+            vs_const_load = data;
+            vs_const_write_pos = data * 4;
+            reg(method) = data;
+            return;
+
         default:
-            // Vertex shader program data (4 dwords per instruction slot,
-            // 136 slots at methods 0x0B00-0x0B7C repeated)
-            if (method >= nv097::SET_TRANSFORM_PROGRAM_START &&
-                method <  nv097::SET_TRANSFORM_PROGRAM_START + 136 * 4 * 4) {
-                uint32_t idx = vs_program_write_pos;
-                if (idx < 136 * 4)
-                    vs_program[idx] = data;
-                vs_program_write_pos++;
-                break;
-            }
-
-            // Vertex shader constants (192 × 4 floats at methods 0x0B80+)
-            if (method >= nv097::SET_TRANSFORM_CONSTANT_LOAD &&
-                method == nv097::SET_TRANSFORM_CONSTANT_LOAD) {
-                vs_const_load = data;
-                vs_const_write_pos = data * 4;
-                break;
-            }
-            if (method >= nv097::SET_TRANSFORM_CONSTANT_START &&
-                method <  nv097::SET_TRANSFORM_CONSTANT_START + 192 * 4 * 4) {
-                uint32_t idx = vs_const_write_pos;
-                if (idx < 192 * 4) {
-                    float fval;
-                    memcpy(&fval, &data, 4);
-                    vs_constants[idx / 4][idx % 4] = fval;
-                }
-                vs_const_write_pos++;
-                break;
-            }
-
-            // Register combiners
-            if (method >= nv097::SET_COMBINER_COLOR_ICW_0 &&
-                method <  nv097::SET_COMBINER_COLOR_ICW_0 + 8 * 4) {
-                combiner_color_icw[(method - nv097::SET_COMBINER_COLOR_ICW_0) / 4] = data;
-                break;
-            }
-            if (method >= nv097::SET_COMBINER_COLOR_OCW_0 &&
-                method <  nv097::SET_COMBINER_COLOR_OCW_0 + 8 * 4) {
-                combiner_color_ocw[(method - nv097::SET_COMBINER_COLOR_OCW_0) / 4] = data;
-                break;
-            }
-            if (method >= nv097::SET_COMBINER_ALPHA_ICW_0 &&
-                method <  nv097::SET_COMBINER_ALPHA_ICW_0 + 8 * 4) {
-                combiner_alpha_icw[(method - nv097::SET_COMBINER_ALPHA_ICW_0) / 4] = data;
-                break;
-            }
-            if (method >= nv097::SET_COMBINER_ALPHA_OCW_0 &&
-                method <  nv097::SET_COMBINER_ALPHA_OCW_0 + 8 * 4) {
-                combiner_alpha_ocw[(method - nv097::SET_COMBINER_ALPHA_OCW_0) / 4] = data;
-                break;
-            }
-            break;  // unhandled method — ignored
-
-        // Primitive
-        case nv097::SET_BEGIN_END:
-            if (begin_end_mode == 0 && data != 0)
-                draw_count++;
-            begin_end_mode = data;
-            break;
-
-        // Clear
-        case nv097::CLEAR_SURFACE:
-            clear_surface = data;
-            clear_count++;
-            break;
-
-        // Combiner control
-        case nv097::SET_COMBINER_CONTROL:
-            combiner_control = data;
             break;
         }
+
+        // --- Vertex shader program upload (streaming) ---
+        if (method >= nv097::SET_TRANSFORM_PROGRAM_START &&
+            method <  nv097::SET_TRANSFORM_PROGRAM_START + 136 * 4 * 4) {
+            uint32_t idx = vs_program_write_pos;
+            if (idx < 136 * 4)
+                vs_program[idx] = data;
+            vs_program_write_pos++;
+            return;
+        }
+
+        // --- Vertex shader constant upload (streaming, float data) ---
+        if (method >= nv097::SET_TRANSFORM_CONSTANT_START &&
+            method <  nv097::SET_TRANSFORM_CONSTANT_START + 192 * 4 * 4) {
+            uint32_t idx = vs_const_write_pos;
+            if (idx < 192 * 4) {
+                float fval;
+                memcpy(&fval, &data, 4);
+                vs_constants[idx / 4][idx % 4] = fval;
+            }
+            vs_const_write_pos++;
+            return;
+        }
+
+        // --- Default: store data directly into the register file ---
+        if (method / 4 < REG_COUNT)
+            regs[method / 4] = data;
     }
 };
 

@@ -730,11 +730,18 @@ Standard PFIFO registers:| Register              | Offset     | Behaviour       
 | `CACHE1_STATUS`      | 0x003214  | Bit 4 = empty (init: 0x10)       |
 | `PFIFO_RUNOUT_STATUS`| 0x002400  | Bit 4 = empty (init: 0x10)       |
 
-**PGRAPH (3D engine)** ✅ DONE (register stubs + state shadow)
+**PGRAPH (3D engine)** ✅ DONE (register file + state shadow)
 
-Register stubs for the 3D graphics pipeline, plus a full PGRAPH state shadow
-(`src/xbox/pgraph.hpp`) that captures GPU method calls from the PFIFO DMA
-pusher.  The state shadow tracks:
+Flat register file (`src/xbox/pgraph.hpp`) that captures GPU method calls
+from the PFIFO DMA pusher.  `PgraphState` stores a `uint32_t regs[2048]`
+array indexed by `method / 4`, covering the full 8 KB NV097 method space.
+Some slots contain integer data, others IEEE 754 floats (e.g. viewport
+offset/scale); typed access helpers `reg()`, `reg_float()`, `set_reg_float()`
+read/write them appropriately.  Most methods store directly into the array;
+special cases (BEGIN_END draw counting, CLEAR_SURFACE counting, VS program/
+constant streaming uploads) have dedicated handling.
+
+The register file covers:
 
 - **Surface**: format, pitch, colour/zeta offsets, clip dimensions
 - **Blend**: enable, src/dst factors, equation, colour
