@@ -1241,29 +1241,43 @@ waiting for DSP status transitions.
 **Test:** `tests/apu.asm` — 12 assertions covering init defaults, R/W,
 and W1C behaviour.
 
-**Audio backend — XAudio2:**
+**Audio backend — Cubeb (cross-platform):**
 
-Host audio output uses XAudio2 (Windows 10+ SDK, zero external deps).
-The XAudio2 voice graph maps directly to the MCPX APU pipeline:
+Host audio output uses [Cubeb](https://github.com/mozilla/cubeb) (Mozilla's
+cross-platform audio library, used by Firefox).  Cubeb provides a single C
+callback API that wraps native backends:
 
-| MCPX sub-unit | XAudio2 equivalent | Role |
+| Platform | Cubeb backend |
+|---|---|
+| Windows | WASAPI |
+| Linux | PulseAudio / ALSA |
+| macOS | CoreAudio |
+| Android | AAudio / OpenSLES |
+
+Integration via CMake `FetchContent` (same pattern as Zydis).
+
+The Cubeb stream model maps to the MCPX APU pipeline:
+
+| MCPX sub-unit | Cubeb equivalent | Role |
 |---|---|---|
-| VP (Voice Processor) | Source voices (up to 256) | Per-voice ADPCM decode, pitch shift, volume envelope |
-| GP (Global Processor) | Submix voice | Global mix, reverb/chorus DSP effects |
-| EP (Encode Processor) | Mastering voice | Final stereo/5.1 output to host audio device |
+| VP (Voice Processor) | Software mixer input (up to 256 voices) | Per-voice ADPCM decode, pitch shift, volume envelope |
+| GP (Global Processor) | Mix buffer + DSP callback | Global mix, reverb/chorus DSP effects |
+| EP (Encode Processor) | Output stream → host device | Final stereo/5.1 output |
 
 Implementation plan:
-1. Create `IXAudio2` engine + mastering voice on xbox_setup().
+1. `cubeb_init()` on xbox_setup(), create a single output stream
+   (48 kHz stereo float32, ~10 ms latency target).
 2. VP voice activation: when guest writes a voice descriptor with
-   `NV_PAPU_VOICE_ON`, create an XAudio2 source voice, configure
-   format (PCM8/PCM16/ADPCM) from the voice parameters, point the
-   buffer at `guest_ram + voice_buf_base`.
-3. GP mixing: single submix voice collects all active source voices.
-   Per-voice 3D panning and volume applied via `SetOutputMatrix()`.
-4. EP output: mastering voice → host audio device (WASAPI backend).
+   `NV_PAPU_VOICE_ON`, add the voice to an internal active-voice list.
+   Each voice tracks format (PCM8/PCM16/ADPCM), pitch, volume,
+   and buffer pointer into guest RAM.
+3. GP mixing: the Cubeb data callback (fired from audio thread) iterates
+   active voices, decodes/resamples into a mix buffer, applies 3D
+   panning and volume.  Single lock-free ring buffer for thread safety.
+4. EP output: Cubeb writes the mixed buffer to the host audio device.
 5. Tick integration: VP voice list scanned each frame (~60 Hz) to
-   start/stop XAudio2 source voices matching guest state changes.
-   No per-sample emulation — let XAudio2 do the heavy lifting.
+   start/stop voices matching guest state changes.  No per-sample
+   emulation of the DSP — software mixing in the Cubeb callback.
 
 #### 5.18 Other Devices
 
