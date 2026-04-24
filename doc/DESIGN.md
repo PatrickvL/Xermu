@@ -249,6 +249,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
+| `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
 
 ---
 
@@ -306,7 +307,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 21 suites, CMake integration
+- [x] NASM test infrastructure: 22 suites, CMake integration
 
 ---
 
@@ -684,11 +685,25 @@ Remaining devices:
   loop for device ticks and IRQ delivery.
 
 Remaining devices:
-- SMBus (EEPROM, temperature sensor, video encoder) — stub
+- SMBus — implemented (see below)
 - IDE controller (HDD, DVD)
 - USB (controllers)
 - PCI configuration space — implemented
 - MCPX boot ROM
+
+**SMBus Controller** ✅ DONE
+
+I/O ports 0xC000–0xC00F (MCPX), devices on the I²C bus:
+
+- **EEPROM (24C02)** at address 0x54: 256-byte Xbox EEPROM with factory defaults
+  — game region (NTSC-NA), serial number, MAC address, video standard
+  (NTSC-M), language (English), DVD region.  Byte read and byte write.
+- **SMC (PIC16LC)** at address 0x10: system management controller stub.
+  Reports version (0xD0 = v1.0 retail), tray state (closed), CPU/MB
+  temperatures, AV pack type (composite).  Write commands silently accepted.
+- **Video encoder** stubs: Conexant CX25871 (0x45), Focus FS454 (0x6A).
+- **Protocol**: address + command + data registers, control write triggers
+  transaction, status W1C with done bit.
 
 #### 5.19 XBE Loader ✅
 
