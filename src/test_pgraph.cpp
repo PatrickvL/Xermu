@@ -104,6 +104,35 @@ int main() {
     uint32_t cull_face = 0x0404;
     memcpy(ram + pos, &cull_face, 4); pos += 4;
 
+    // === Command 9: SET_SURFACE_FORMAT = 0x00090105 ===
+    //   color=5 (X8R8G8B8), zeta=0 (none), type=1 (pitch),
+    //   aa=0, width_log2=9, height_log2=0
+    uint32_t hdr9 = pb_inc(SET_SURFACE_FORMAT, 0, 1);
+    memcpy(ram + pos, &hdr9, 4); pos += 4;
+    uint32_t surf_fmt = 0x00090105;
+    memcpy(ram + pos, &surf_fmt, 4); pos += 4;
+
+    // === Command 10: SET_SURFACE_PITCH = 0x00400100 ===
+    //   color pitch = 0x0100 (256), zeta pitch = 0x0040 (64)
+    uint32_t hdr10 = pb_inc(SET_SURFACE_PITCH, 0, 1);
+    memcpy(ram + pos, &hdr10, 4); pos += 4;
+    uint32_t surf_pitch = 0x00400100;
+    memcpy(ram + pos, &surf_pitch, 4); pos += 4;
+
+    // === Command 11: SET_SURFACE_CLIP_HORIZONTAL = 0x028000A0 ===
+    //   x=0x00A0 (160), width=0x0280 (640)
+    uint32_t hdr11 = pb_inc(SET_SURFACE_CLIP_HORIZONTAL, 0, 1);
+    memcpy(ram + pos, &hdr11, 4); pos += 4;
+    uint32_t clip_h = 0x028000A0;
+    memcpy(ram + pos, &clip_h, 4); pos += 4;
+
+    // === Command 12: SET_SURFACE_CLIP_VERTICAL = 0x01E00050 ===
+    //   y=0x0050 (80), height=0x01E0 (480)
+    uint32_t hdr12 = pb_inc(SET_SURFACE_CLIP_VERTICAL, 0, 1);
+    memcpy(ram + pos, &hdr12, 4); pos += 4;
+    uint32_t clip_v = 0x01E00050;
+    memcpy(ram + pos, &clip_v, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -132,6 +161,19 @@ int main() {
     CHECK(nv2a.pfifo_regs[pfifo::EXT_METHODS / 4] == pgraph.total_methods,
           "fifo_methods == pgraph.total_methods");
     CHECK(nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4] == pos, "DMA_GET == PUT (drained)");
+
+    // --- Surface decode tests ---
+    CHECK(pgraph.surface_color_format() == 5, "surface_color_format == 5 (X8R8G8B8)");
+    CHECK(pgraph.surface_zeta_format() == 0, "surface_zeta_format == 0 (none)");
+    CHECK(pgraph.surface_type() == 1, "surface_type == 1 (pitch)");
+    CHECK(pgraph.surface_aa_mode() == 0, "surface_aa_mode == 0");
+    CHECK(pgraph.surface_width_log2() == 9, "surface_width_log2 == 9");
+    CHECK(pgraph.surface_color_pitch() == 0x0100, "surface_color_pitch == 256");
+    CHECK(pgraph.surface_zeta_pitch() == 0x0040, "surface_zeta_pitch == 64");
+    CHECK(pgraph.surface_clip_x() == 0x00A0, "surface_clip_x == 160");
+    CHECK(pgraph.surface_clip_width() == 0x0280, "surface_clip_width == 640");
+    CHECK(pgraph.surface_clip_y() == 0x0050, "surface_clip_y == 80");
+    CHECK(pgraph.surface_clip_height() == 0x01E0, "surface_clip_height == 480");
 
     free(ram);
 
