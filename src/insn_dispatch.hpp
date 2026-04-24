@@ -232,6 +232,7 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_CPUID,
         ZYDIS_MNEMONIC_INT,    ZYDIS_MNEMONIC_INT3,   ZYDIS_MNEMONIC_INT1,
         ZYDIS_MNEMONIC_INTO,
+        ZYDIS_MNEMONIC_SYSENTER, ZYDIS_MNEMONIC_SYSEXIT,
     }) MNEMONIC_CLASS[m] = IC_PRIVILEGED;
 
     // ---- LEA — no memory access ----

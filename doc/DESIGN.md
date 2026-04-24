@@ -1485,16 +1485,42 @@ Test runner `--xbox` mode writes HLE stubs to guest RAM and installs the handler
 `tests/hle.asm` exercises 11 kernel calls: memory, threading, timing,
 synchronisation, and timer stubs.
 
-#### 5.20 Kernel HLE or LLE
-Two paths:
-- **HLE (High-Level Emulation)**: intercept Xbox kernel API calls at the symbol
-  boundary; stub or reimplement each export. Faster to develop, less accurate.
-  This is what Cxbx-Reloaded uses.
-- **LLE (Low-Level Emulation)**: boot the actual Xbox kernel ROM. Requires all
-  of Phase 2 + accurate hardware emulation. More accurate, much harder.
+#### 5.20 Kernel: Dual-Mode (HLE + LLE)
 
-A hybrid approach is likely: LLE for the CPU mechanics (this executor), HLE for
-kernel API stubs, with gradual replacement as hardware emulation matures.
+The executor supports two kernel modes, selectable at launch:
+
+**Mode 1 — HLE (High-Level Emulation)** *(current default)*
+
+- XBE loader patches the kernel thunk table with `INT 0x20` stubs.
+- Each kernel API call traps into `default_hle_handler`, which reimplements
+  the ordinal in C++ (see §5.19 for the current stub list).
+- **Pros**: fast to develop, no kernel binary needed, easy to debug.
+- **Cons**: incomplete — every new ordinal must be hand-implemented,
+  subtle behaviour differences from the real kernel.
+
+**Mode 2 — LLE (Low-Level Emulation)** *(planned)*
+
+- Load the real `xboxkrnl.exe` (PE format) into guest RAM.
+- Kernel does its own init: GDT/IDT setup, PCI enumeration, memory
+  manager, scheduler, device drivers — all running as guest code.
+- The executor already emulates the hardware the kernel needs:
+  PIC, PIT, PCI config space, SMBus (EEPROM/SMC), NV2A MMIO, APU, IDE.
+- **Remaining gaps for LLE boot:**
+
+| Gap | Difficulty | Status |
+|---|---|---|
+| SYSENTER / SYSEXIT | Easy | ✅ DONE |
+| SYSENTER MSRs (CS/EIP/ESP) | Easy | ✅ DONE |
+| PE loader for xboxkrnl.exe | Medium | Planned |
+| MCPX/2BL boot chain (or entry shim) | Medium | Can skip ROM, jump to kernel entry |
+| OHCI USB controller stub | Medium | Planned |
+| More complete GDT/TSS handling | Easy | Partially done (LGDT, segment bases) |
+| MTRR MSRs | Easy | Stub (write-back default) |
+
+**Hybrid operation:** Both modes can coexist.  The LLE kernel runs natively,
+but a hook can intercept specific kernel exports and redirect them to HLE
+stubs for unimplemented hardware paths (e.g. USB, network).  This allows
+incremental bring-up: start with HLE, test with LLE, gradually remove stubs.
 
 ---
 
