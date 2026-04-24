@@ -85,12 +85,6 @@ inline XboxHardware* xbox_setup(Executor& exec) {
                  ohci_read, ohci_write, &hw->usb0);
     hw->mmio.add(USB1_BASE, USB1_SIZE,
                  ohci_read, ohci_write, &hw->usb1);
-    {
-        uint32_t bar0 = USB0_BASE;
-        memcpy(hw->pci.config[0][4][0] + 0x10, &bar0, 4);
-        uint32_t bar1 = USB1_BASE;
-        memcpy(hw->pci.config[0][5][0] + 0x10, &bar1, 4);
-    }
     hw->mmio.add(BIOS_BASE, BIOS_SIZE,
                  flash_read, flash_write, &hw->flash);
 
