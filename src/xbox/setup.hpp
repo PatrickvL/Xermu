@@ -124,6 +124,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
         exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
     exec.register_io(0x376, ide_io_read, ide_io_write, &hw->ide);
 
+    // IDE Bus Master DMA (BAR4 = 0xFF60, 16 ports)
+    for (uint16_t p = 0xFF60; p <= 0xFF6F; p++)
+        exec.register_io(p, ide_bm_read, ide_bm_write, &hw->ide);
+
     // Start the NV2A PFIFO processing thread — must be last, after all
     // hardware wiring is complete.
     hw->nv2a_thread.start(&hw->nv2a, hw->ram, hw->ram_size);

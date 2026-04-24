@@ -39,6 +39,27 @@ static constexpr uint32_t STAT_CMD   = 7;   // read: status; write: command disp
 static constexpr uint32_t ALT_CTL    = 8;   // alternate status / device control
 } // namespace ide_tf
 
+// ===================== Bus Master DMA Offsets ==============================
+// PCI BAR4 offsets for primary (0x00-0x07) and secondary (0x08-0x0F) channels.
+// Each channel has 3 regs at offsets +0, +2, +4 (command, status, PRDT addr).
+
+namespace ide_bm {
+static constexpr uint32_t CMD        = 0x00; // Bus Master command (bit 0 = start/stop, bit 3 = write)
+static constexpr uint32_t STATUS     = 0x02; // Bus Master status (W1C bits 1,2; bit 0=active)
+static constexpr uint32_t PRDT_ADDR  = 0x04; // Physical Region Descriptor Table base (32-bit)
+
+// Command bits
+static constexpr uint8_t  CMD_START  = 0x01; // start DMA transfer
+static constexpr uint8_t  CMD_WRITE  = 0x08; // direction: 1=device→memory
+
+// Status bits
+static constexpr uint8_t  STAT_ACTIVE   = 0x01; // DMA transfer active
+static constexpr uint8_t  STAT_ERROR    = 0x02; // DMA error (W1C)
+static constexpr uint8_t  STAT_IRQ      = 0x04; // interrupt (W1C)
+static constexpr uint8_t  STAT_DMA0_CAP = 0x20; // drive 0 DMA capable
+static constexpr uint8_t  STAT_DMA1_CAP = 0x40; // drive 1 DMA capable
+} // namespace ide_bm
+
 // =========================== IDE Channel ===================================
 
 struct IdeChannel {
@@ -63,6 +84,11 @@ struct IdeChannel {
     uint16_t data_pos      = 0;   // byte offset into data_buf
     uint16_t data_len      = 0;   // bytes remaining in current transfer
     uint8_t  sectors_left  = 0;   // sectors remaining for multi-sector commands
+
+    // Bus Master DMA state
+    uint8_t  bm_cmd     = 0;     // command register
+    uint8_t  bm_status  = 0x60;  // status: drive 0+1 DMA capable by default
+    uint32_t bm_prdt    = 0;     // PRDT base address
 
     // Backing disk image (raw sector image, no header).
     uint8_t* image_data = nullptr;
@@ -315,6 +341,54 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
             ch->regs[ide_tf::LBA_MID]    = 0x00;
             ch->regs[ide_tf::LBA_HIGH]   = 0x00;
             ch->regs[ide_tf::DEVICE]     = 0x00;
+        }
+        break;
+    }
+}
+
+// ========================= Bus Master DMA I/O ==============================
+// BAR4 base is typically 0xFF60 on Xbox.
+// Primary channel: offsets 0x00-0x07, Secondary: 0x08-0x0F.
+
+static uint32_t ide_bm_read(uint16_t port, unsigned size, void* user) {
+    auto* ide = static_cast<IdeState*>(user);
+    uint32_t off = port & 0x0F;
+    IdeChannel* ch = (off < 8) ? &ide->primary : &ide->secondary;
+    uint32_t reg = off & 0x07;
+
+    switch (reg) {
+    case ide_bm::CMD:    return ch->bm_cmd;
+    case ide_bm::STATUS: return ch->bm_status;
+    case ide_bm::PRDT_ADDR:
+        if (size >= 4) return ch->bm_prdt;
+        return (uint8_t)(ch->bm_prdt >> ((off & 3) * 8));
+    default: return 0;
+    }
+}
+
+static void ide_bm_write(uint16_t port, uint32_t val, unsigned size, void* user) {
+    auto* ide = static_cast<IdeState*>(user);
+    uint32_t off = port & 0x0F;
+    IdeChannel* ch = (off < 8) ? &ide->primary : &ide->secondary;
+    uint32_t reg = off & 0x07;
+
+    switch (reg) {
+    case ide_bm::CMD:
+        ch->bm_cmd = (uint8_t)(val & 0x09);  // only bits 0,3 writable
+        if (!(val & ide_bm::CMD_START))
+            ch->bm_status &= ~ide_bm::STAT_ACTIVE;  // stop clears active
+        break;
+    case ide_bm::STATUS: {
+        // Bits 1,2 are W1C; bits 5,6 are writable (DMA capable); bit 0 read-only.
+        uint8_t w1c = (uint8_t)(val & (ide_bm::STAT_ERROR | ide_bm::STAT_IRQ));
+        ch->bm_status &= ~w1c;
+        // Bits 5,6 writable
+        ch->bm_status = (ch->bm_status & ~0x60) | (uint8_t)(val & 0x60);
+        break;
+    }
+    case ide_bm::PRDT_ADDR:
+        if (size >= 4) {
+            ch->bm_prdt = val & 0xFFFFFFFC;  // must be dword-aligned
         }
         break;
     }
