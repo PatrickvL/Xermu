@@ -420,7 +420,7 @@ a trap to the run loop.
 
 | Instruction       | Status                                             |
 |-------------------|----------------------------------------------------|
-| RDMSR / WRMSR     | ✅ Stub (advance EIP)                              |
+| RDMSR / WRMSR     | ✅ SYSENTER MSRs, TSC, MTRR (19 MSRs)             |
 | MOV CRn, r / r, CRn | ✅ Read/write ctx->cr0/cr2/cr3/cr4              |
 | IN / OUT          | ✅ IoPortEntry dispatch table in Executor          |
 | LGDT / LIDT       | ✅ Update ctx->gdtr/idtr base/limit                |
@@ -1544,7 +1544,7 @@ The executor supports two kernel modes, selectable at launch:
 | MCPX/2BL boot chain (or entry shim) | Medium | Can skip ROM, jump to kernel entry |
 | OHCI USB controller stub | Medium | ✅ DONE |
 | More complete GDT/TSS handling | Easy | Partially done (LGDT, segment bases) |
-| MTRR MSRs | Easy | Stub (write-back default) |
+| MTRR MSRs | Easy | ✅ DONE |
 
 **Hybrid operation:** Both modes can coexist.  The LLE kernel runs natively,
 but a hook can intercept specific kernel exports and redirect them to HLE

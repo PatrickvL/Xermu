@@ -64,6 +64,14 @@ struct alignas(16) GuestContext {
     uint32_t  sysenter_cs  = 0;   // MSR 0x174
     uint32_t  sysenter_esp = 0;   // MSR 0x175
     uint32_t  sysenter_eip = 0;   // MSR 0x176
+
+    // MTRR MSRs — Memory Type Range Registers
+    uint64_t  mtrr_physbase[8] = {};  // MSR 0x200, 0x202, ..., 0x20E
+    uint64_t  mtrr_physmask[8] = {};  // MSR 0x201, 0x203, ..., 0x20F
+    uint64_t  mtrr_fix64k      = 0;   // MSR 0x250
+    uint64_t  mtrr_fix16k[2]   = {};  // MSR 0x258, 0x259
+    uint64_t  mtrr_fix4k[8]    = {};  // MSR 0x268–0x26F
+    uint64_t  mtrr_def_type    = 0x00000006; // MSR 0xFE (default = write-back)
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);
