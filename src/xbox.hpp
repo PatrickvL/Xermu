@@ -270,12 +270,108 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // Silently drop unhandled writes.
 }
 
-// ============================= APU =========================================
+// ============================= APU (MCPX Audio) ============================
+//
+// Xbox MCPX APU @ 0xFE800000 (4 MB).
+// Register blocks:
+//   0x0000 – 0x1FFF   General APU control / front-end / setup engine
+//   0x20000 – 0x2FFFF  VP (Voice Processor) — 256 voice descriptors
+//   0x30000 – 0x3FFFF  GP (Global Processor) — DSP scratch + PMEM
+//   0x40000 – 0x4FFFF  EP (Encode Processor) — DSP scratch + PMEM
+//
+// Key register offsets within APU_BASE:
+//   NV_PAPU_ISTS     0x1000  Interrupt status
+//   NV_PAPU_IEN      0x1004  Interrupt enable mask
+//   NV_PAPU_FECTL    0x1100  Front-end control
+//   NV_PAPU_FECV     0x1104  Front-end current voice
+//   NV_PAPU_FESTATE  0x1108  Front-end state (0 = idle)
+//   NV_PAPU_FESTATUS 0x110C  Front-end status (bit 0 = busy)
+//   NV_PAPU_SECTL    0x2000  Setup engine control
+//   NV_PAPU_SESTATUS 0x200C  Setup engine status (0 = idle)
+//   NV_PAPU_GPRST    0x3000  GP reset
+//   NV_PAPU_GPISTS   0x3004  GP interrupt status
+//   NV_PAPU_GPSADDR  0x3008  GP scratch base addr
+//   NV_PAPU_EPRST    0x4000  EP reset
+//   NV_PAPU_EPISTS   0x4004  EP interrupt status
+//   NV_PAPU_EPSADDR  0x4008  EP scratch base addr
+// ---------------------------------------------------------------------------
 
-static uint32_t apu_read(uint32_t /*pa*/, unsigned /*size*/, void* /*user*/) {
-    return 0;  // stub: all zeros
+struct ApuState {
+    // General APU control
+    uint32_t ists       = 0;            // NV_PAPU_ISTS  — interrupt status
+    uint32_t ien        = 0;            // NV_PAPU_IEN   — interrupt enable
+    uint32_t fectl      = 0;            // NV_PAPU_FECTL — front-end control
+    uint32_t fecv       = 0;            // NV_PAPU_FECV  — front-end current voice
+    uint32_t festate    = 0;            // NV_PAPU_FESTATE — 0 = idle
+    uint32_t festatus   = 0;            // NV_PAPU_FESTATUS — bit 0 = busy
+
+    // Setup engine
+    uint32_t sectl      = 0;            // NV_PAPU_SECTL
+    uint32_t sestatus   = 0;            // NV_PAPU_SESTATUS — 0 = idle
+
+    // Global Processor
+    uint32_t gprst      = 0;            // NV_PAPU_GPRST
+    uint32_t gpists     = 0;            // NV_PAPU_GPISTS
+    uint32_t gpsaddr    = 0;            // NV_PAPU_GPSADDR  — GP scratch base address
+
+    // Encode Processor
+    uint32_t eprst      = 0;            // NV_PAPU_EPRST
+    uint32_t epists     = 0;            // NV_PAPU_EPISTS
+    uint32_t epsaddr    = 0;            // NV_PAPU_EPSADDR  — EP scratch base address
+};
+
+static uint32_t apu_read(uint32_t pa, unsigned /*size*/, void* user) {
+    auto* apu = static_cast<ApuState*>(user);
+    uint32_t off = pa - APU_BASE;
+
+    // General APU registers (0x1000 – 0x1FFF)
+    if (off == 0x1000) return apu->ists;
+    if (off == 0x1004) return apu->ien;
+    if (off == 0x1100) return apu->fectl;
+    if (off == 0x1104) return apu->fecv;
+    if (off == 0x1108) return apu->festate;    // 0 = idle
+    if (off == 0x110C) return apu->festatus;   // 0 = not busy
+
+    // Setup engine
+    if (off == 0x2000) return apu->sectl;
+    if (off == 0x200C) return apu->sestatus;   // 0 = idle
+
+    // Global Processor
+    if (off == 0x3000) return apu->gprst;
+    if (off == 0x3004) return apu->gpists;
+    if (off == 0x3008) return apu->gpsaddr;
+
+    // Encode Processor
+    if (off == 0x4000) return apu->eprst;
+    if (off == 0x4004) return apu->epists;
+    if (off == 0x4008) return apu->epsaddr;
+
+    return 0;  // default: bus float
 }
-static void apu_write(uint32_t, uint32_t, unsigned, void*) {}
+
+static void apu_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) {
+    auto* apu = static_cast<ApuState*>(user);
+    uint32_t off = pa - APU_BASE;
+
+    // General APU registers
+    if (off == 0x1000) { apu->ists &= ~val; return; }  // W1C
+    if (off == 0x1004) { apu->ien = val; return; }
+    if (off == 0x1100) { apu->fectl = val; return; }
+    if (off == 0x1108) { apu->festate = val; return; }
+
+    // Setup engine
+    if (off == 0x2000) { apu->sectl = val; return; }
+
+    // Global Processor
+    if (off == 0x3000) { apu->gprst = val; return; }
+    if (off == 0x3008) { apu->gpsaddr = val; return; }
+
+    // Encode Processor
+    if (off == 0x4000) { apu->eprst = val; return; }
+    if (off == 0x4008) { apu->epsaddr = val; return; }
+
+    // Silently drop unhandled writes.
+}
 
 // ============================= I/O APIC ====================================
 
@@ -843,6 +939,7 @@ static void debug_console_write(uint16_t, uint32_t val, unsigned, void*) {
 struct XboxHardware {
     MmioMap     mmio;
     Nv2aState   nv2a;
+    ApuState    apu;
     IoApicState ioapic;
     FlashState  flash;
     PciState    pci;
@@ -889,7 +986,7 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     hw->mmio.add(NV2A_BASE, NV2A_SIZE,
                  nv2a_read, nv2a_write, &hw->nv2a);
     hw->mmio.add(APU_BASE, APU_SIZE,
-                 apu_read, apu_write, nullptr);
+                 apu_read, apu_write, &hw->apu);
     hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,
                  ioapic_read, ioapic_write, &hw->ioapic);
     // BIOS shadow = flash alias
