@@ -53,6 +53,53 @@ uint32_t popfd_helper(GuestContext* ctx) {
     return 0;
 }
 
+// Read a 32-bit value from guest physical memory (or MMIO).
+// Used by JMP/CALL [mem] handlers.
+uint32_t read_guest_mem32(GuestContext* ctx, uint32_t pa) {
+    if (pa < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        return *reinterpret_cast<uint32_t*>(base + pa);
+    }
+    return ctx->mmio ? ctx->mmio->read(pa, 4) : 0xFFFF'FFFFu;
+}
+
+// Write a 32-bit value to guest physical memory (or MMIO).
+// Used by PUSH [mem] and CALL [mem] handlers.
+void write_guest_mem32(GuestContext* ctx, uint32_t pa, uint32_t val) {
+    if (pa < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        *reinterpret_cast<uint32_t*>(base + pa) = val;
+        return;
+    }
+    if (ctx->mmio) ctx->mmio->write(pa, val, 4);
+}
+
+// CALL [mem] helper: reads jump target from `pa`, pushes `retaddr` onto
+// guest stack, returns the call target address.
+uint32_t call_mem_helper(GuestContext* ctx, uint32_t pa, uint32_t retaddr) {
+    uint32_t target = read_guest_mem32(ctx, pa);
+    uint32_t esp = ctx->gp[GP_ESP] - 4;
+    ctx->gp[GP_ESP] = esp;
+    write_guest_mem32(ctx, esp, retaddr);
+    return target;
+}
+
+// PUSH [mem] helper: reads 32-bit value from `pa`, pushes onto guest stack.
+void push_mem_helper(GuestContext* ctx, uint32_t pa) {
+    uint32_t val = read_guest_mem32(ctx, pa);
+    uint32_t esp = ctx->gp[GP_ESP] - 4;
+    ctx->gp[GP_ESP] = esp;
+    write_guest_mem32(ctx, esp, val);
+}
+
+// POP [mem] helper: pops 32-bit value from guest stack, writes to `pa`.
+void pop_mem_helper(GuestContext* ctx, uint32_t pa) {
+    uint32_t esp = ctx->gp[GP_ESP];
+    uint32_t val = read_guest_mem32(ctx, esp);
+    ctx->gp[GP_ESP] = esp + 4;
+    write_guest_mem32(ctx, pa, val);
+}
+
 // ---------------------------------------------------------------------------
 // String instruction helpers (MOVS/STOS/LODS/CMPS/SCAS).
 //
@@ -487,31 +534,47 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
     }
 
     // PUSH r32
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    uint8_t reg_enc = 0;
-    if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        uint8_t reg_enc = 0;
+        if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
 
-    if (save_flags) emit_save_flags(e);
-    emit_sub_ctx_esp(e, 4);
-    emit_load_esp_to_r14(e);
+        if (save_flags) emit_save_flags(e);
+        emit_sub_ctx_esp(e, 4);
+        emit_load_esp_to_r14(e);
 
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_op(e, reg_enc, 32, false);
-    uint8_t* done_site = emit_jmp_fwd(e);
+        emit_cmp_r14_r15(e);
+        uint8_t* slow_site = emit_jae_fwd(e);
+        emit_fastmem_op(e, reg_enc, 32, false);
+        uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, reg_enc);
-    emit_ccall_arg3_imm(e, 4);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
-    emit_load_all_gp(e);
+        Emitter::patch_rel32(slow_site, e.cur());
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, reg_enc);
+        emit_ccall_arg3_imm(e, 4);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
+        emit_load_all_gp(e);
 
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
-    return true;
+        Emitter::patch_rel32(done_site, e.cur());
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
+
+    // PUSH [mem] — read from memory, push onto guest stack
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!emit_ea_to_r14(e, ops[0])) return false;
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_call_abs(e, reinterpret_cast<void*>(push_mem_helper));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -520,31 +583,48 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
 bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                       const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
                       GuestContext* /*ctx*/, bool save_flags) {
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    uint8_t reg_enc = 0;
-    if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
+    // POP r32
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        uint8_t reg_enc = 0;
+        if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
 
-    if (save_flags) emit_save_flags(e);
-    emit_load_esp_to_r14(e);
+        if (save_flags) emit_save_flags(e);
+        emit_load_esp_to_r14(e);
 
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_op(e, reg_enc, 32, true);
-    uint8_t* done_site = emit_jmp_fwd(e);
+        emit_cmp_r14_r15(e);
+        uint8_t* slow_site = emit_jae_fwd(e);
+        emit_fastmem_op(e, reg_enc, 32, true);
+        uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, reg_enc);
-    emit_ccall_arg3_imm(e, 4);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-    emit_load_all_gp(e);
+        Emitter::patch_rel32(slow_site, e.cur());
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, reg_enc);
+        emit_ccall_arg3_imm(e, 4);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+        emit_load_all_gp(e);
 
-    Emitter::patch_rel32(done_site, e.cur());
-    emit_add_ctx_esp(e, 4);
-    if (save_flags) emit_restore_flags(e);
-    return true;
+        Emitter::patch_rel32(done_site, e.cur());
+        emit_add_ctx_esp(e, 4);
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
+
+    // POP [mem] — pop from guest stack, write to memory address
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!emit_ea_to_r14(e, ops[0])) return false;
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_call_abs(e, reinterpret_cast<void*>(pop_mem_helper));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -877,14 +957,18 @@ void TraceBuilder::emit_jmp_exit(Emitter& e,
         }
         if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
             if (emit_ea_to_r14(e, op)) {
-                emit_cmp_r14_r15(e);
-                uint8_t* slow = emit_jae_fwd(e);
-                emit_fastmem_op(e, 0 /*EAX*/, 32, true);
-                uint8_t* done = emit_jmp_fwd(e);
-                Emitter::patch_rel32(slow, e.cur());
-                e.emit8(0x0F); e.emit8(0x0B); // UD2
-                Emitter::patch_rel32(done, e.cur());
-                emit_epilog_dynamic(e, GP_EAX);
+                // Save guest regs (preserves all original values in ctx)
+                emit_save_all_gp(e);
+                // Call read_guest_mem32(ctx, R14D) → EAX = target
+                emit_ccall_arg0_ctx(e);
+                emit_ccall_arg1_pa(e);
+                emit_call_abs(e, reinterpret_cast<void*>(read_guest_mem32));
+                // EAX = target. Write directly to ctx->next_eip (offset 40).
+                // MOV [R13+40], EAX : REX.B=0x41, 0x89, mod=01 reg=0 rm=5, disp8=40
+                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(40);
+                // Reload guest regs from ctx (C call clobbered host regs)
+                emit_load_all_gp(e);
+                e.emit8(0xC3); // RET
                 return;
             }
         }
@@ -921,6 +1005,23 @@ void TraceBuilder::emit_call_exit(Emitter& e,
                 e.emit8(0xB9); e.emit32(pc_after);
                 emit_fastmem_op(e, GP_ECX, 32, false);
                 emit_epilog_dynamic(e, enc);
+                return;
+            }
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (emit_ea_to_r14(e, op)) {
+                // Save guest regs (preserves all original values in ctx)
+                emit_save_all_gp(e);
+                // Call call_mem_helper(ctx, R14D, pc_after) → EAX = target
+                emit_ccall_arg0_ctx(e);
+                emit_ccall_arg1_pa(e);
+                emit_ccall_arg2_imm(e, pc_after);
+                emit_call_abs(e, reinterpret_cast<void*>(call_mem_helper));
+                // EAX = target. Write to ctx->next_eip (offset 40).
+                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(40);
+                // Reload guest regs from ctx (C call clobbered host regs)
+                emit_load_all_gp(e);
+                e.emit8(0xC3); // RET
                 return;
             }
         }

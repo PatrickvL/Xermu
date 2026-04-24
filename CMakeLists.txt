@@ -78,6 +78,7 @@ set(TEST_ASM_FILES
     tests/advanced.asm
     tests/string.asm
     tests/segment.asm
+    tests/indirect.asm
 )
 
 if(NASM_EXECUTABLE)
