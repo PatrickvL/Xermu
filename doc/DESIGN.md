@@ -236,7 +236,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/apu.hpp`        | APU register stubs (VP/GP/EP)                    | ✅ Working    |
 | `xbox/ide.hpp`        | IDE ATA: PIO sector read/write + IDENTIFY data   | ✅ Working    |
 | `xbox/usb.hpp`        | USB OHCI controller stubs (2 ports each)         | ✅ Working    |
-| `xbox/ioapic.hpp`     | I/O APIC register stubs                          | ✅ Working    |
+| `xbox/ioapic.hpp`     | I/O APIC: indirect regs, redir entries, RO bits  | ✅ Working    |
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
 | `xbox/flash.hpp`      | Flash ROM + MCPX: BIOS loading, shadow           | ✅ Working    |
 | `xbox/pci.hpp`        | PCI configuration space (type 0, CF8/CFC)        | ✅ Working    |
@@ -279,6 +279,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/flash.asm`     | Flash ROM: BIOS shadow + flash base reads (4)    | ✅ ALL PASS   |
 | `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
 | `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing, JUMP, CALL/RETURN (8) | ✅ ALL PASS   |
+| `tests/ioapic.asm`   | I/O APIC: indirect regs, redir entries, RO bits (12) | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
@@ -634,7 +635,10 @@ Implemented in `src/xbox/` component files with `xbox_setup()` in `src/xbox/setu
 - **NV2A GPU stub**: register reads return realistic defaults (PMC_BOOT_0 chip
   ID, PFB_CFG0 memory config, PTIMER, PCRTC, PVIDEO). Writes update state.
 - **APU stub**: all-zero reads, writes silently dropped.
-- **I/O APIC**: index/data register pair with 24 redirection entries.
+- **I/O APIC**: indirect IOREGSEL/IOWIN access, 24 redirection entries with
+  proper R/W masking (ID bits [27:24] writable, VER/ARB read-only, redir low
+  masks delivery_status/remote_irr as RO, redir high only [31:24] writable).
+  Entries default to masked (bit 16).  Named constants in `ioapic::` namespace.
 - **PCI configuration space**: I/O ports 0xCF8/0xCFC with Xbox device table
   (Host Bridge, LPC, SMBus, NV2A, APU, USB×2, IDE, AGP bridge).
 - **SMBus**: I/O ports 0xC000–0xC00E, status/control/address/data registers,
