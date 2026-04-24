@@ -698,16 +698,18 @@ retail hardware (crystal reference = 16.667 MHz):
 | `GENERAL_CONTROL`    | 0x680600  | 0x00000101   | DAC control (read-only) |
 
 #### 5.16a NV2A Rendering via Vulkan
-**Priority: CRITICAL for visual output** — the NV2A GPU will be emulated by
+**Priority: CRITICAL for visual output** — the NV2A GPU is emulated by
 translating its fixed-function and programmable pipeline into Vulkan shaders
-on the host GPU.
+on the host GPU.  The design targets a **GPU-driven architecture** where the
+CPU is entirely absent from the rendering data path after submitting dirty
+pages and a Vulkan command buffer.
 
-**Architecture:**
+**Architecture overview:**
 
 The NV2A is an NV20-class GPU (GeForce 3 derivative) with a fixed-function
 transform & lighting pipeline, 4 texture combiners, vertex shaders (vs.1.1),
 and register combiners for pixel shading.  Rather than software-rasterising
-the guest GPU commands, we translate them into equivalent Vulkan draw calls:
+guest GPU commands, we translate them into equivalent Vulkan draw calls:
 
 ```
 Guest push buffer (PFIFO DMA)
@@ -715,6 +717,7 @@ Guest push buffer (PFIFO DMA)
     ▼
 ┌────────────────────┐
 │  Command Parser     │  Read NV2A method/data pairs from push buffer
+│  (compute shader)   │  → runs on GPU, not CPU
 └────────┬───────────┘
          │
          ▼
@@ -731,49 +734,269 @@ Guest push buffer (PFIFO DMA)
          │
          ▼
 ┌────────────────────┐
-│  Vulkan Renderer    │  VkPipeline, VkRenderPass, draw calls
+│  Vulkan Renderer    │  Dynamic state, GPU-generated draw calls
 │                     │  Framebuffer → swapchain present
 └────────────────────┘
 ```
 
-**NV2A → Vulkan translation layers:**
+---
 
-| NV2A Feature                  | Vulkan Equivalent                          |
-|-------------------------------|--------------------------------------------|
-| Vertex shader (vs.1.1)        | SPIR-V vertex shader (compiled at runtime) |
-| Register combiners (8 stages) | SPIR-V fragment shader (compiled at runtime)|
-| Fixed-function T&L            | SPIR-V vertex shader (generated from state)|
-| Texture units (4)             | VkSampler + VkImageView                    |
-| Render target / Z-buffer      | VkFramebuffer + VkRenderPass               |
-| Vertex arrays (inline/DMA)    | VkBuffer (vertex/index)                    |
-| Anti-aliasing (2×/4× MSAA)    | VkPipeline multisample state               |
-| Alpha test / blend             | VkPipeline color blend state               |
-| Fog                           | Fragment shader uniform                    |
-| Depth / stencil               | VkPipeline depth-stencil state             |
-| Swizzled textures             | CPU de-swizzle or compute shader           |
-| DXT1/DXT3/DXT5 compressed     | VK_FORMAT_BC1/BC2/BC3 (native)             |
+**Memory model — single VkDeviceMemory allocation:**
+
+The guest's 64 MB unified RAM is represented as one `VkDeviceMemory` allocation.
+Multiple `VkResource` handles (buffers for vertex fetch / push buffer parsing,
+images for textures) are bound to overlapping ranges of this allocation at
+identity-mapped offsets — something Vulkan explicitly supports.
+
+- A `VkBuffer` with `STORAGE_BUFFER | UNIFORM_TEXEL_BUFFER | SHADER_DEVICE_ADDRESS`
+  usage covers the full 64 MB range for shader access.
+- `VK_KHR_buffer_device_address` (core 1.2) provides a `uint64_t` GPU VA for the
+  buffer.  Compute shaders dereference this directly via GLSL
+  `buffer_reference` — the NV2A's flat address model maps one-to-one onto
+  Vulkan's device address space, so surface/vertex/push-buffer pointers need
+  no translation.
+- On resizable-BAR hardware (all current discrete GPUs), the allocation uses
+  `HOST_VISIBLE | DEVICE_LOCAL` and is **persistently mapped**.  Guest CPU writes
+  from the JIT go directly into GPU memory at cache-line granularity with no
+  driver involvement.  Dirty page tracking uses the page-version system (§2.6).
+- On non-BAR hardware, a staging buffer with `vkCmdCopyBuffer` for dirty ranges
+  provides the fallback path.
+
+---
+
+**Texture handling — zero-copy Morton sampling:**
+
+The NV2A stores textures in Morton (Z-order) swizzled layout.  Vulkan can bind
+a `VkImage` and a `VkBuffer` to the same `VkDeviceMemory` region at the same
+offset.  Combined with `VK_EXT_image_drm_format_modifier`, a `VkImage` is
+created with a custom memory layout describing the Morton swizzle pattern.  The
+hardware sampler then traverses NV2A-format memory directly — **no deswizzle
+compute shader, no texture pool, no copy of any kind.**
+
+- The `VkImage` shares physical memory with the guest RAM buffer.  JIT guest CPU
+  writes go into the persistently-mapped buffer; the `VkImage` view at the same
+  offset reads the same bytes.
+- DXT1/DXT3/DXT5 compressed textures map directly to `VK_FORMAT_BC1/BC2/BC3`
+  (native hardware decode).
+- Each mip level and cube face has its own base address in PGRAPH.  Each level
+  is a separate `VkImage` bound to `xboxMemory` at the level's guest base address.
+- **Fallback:** on drivers without the specific Morton DRM format modifier, a
+  small CS writes directly into `VkImage` memory (not a separate staging
+  buffer).  This CS is triggered only on dirty pages — in the common case the
+  `VkImage` view is already valid.
+- **Invalidation:** tracked via the page-version system (§2.6).  When a page
+  containing texture data is written by the guest CPU, the texture is marked
+  dirty and re-uploaded (modifier path) or re-deswizzled (fallback) on next GPU
+  use.
+
+---
+
+**Pipeline state — extended dynamic state:**
+
+`VK_EXT_extended_dynamic_state3` (core in Vulkan 1.3, universal desktop support)
+exposes a `vkCmd*` call for nearly every NV2A pipeline state register, eliminating
+PSO creation and state-object caching entirely:
+
+| NV2A PGRAPH Register            | Vulkan Dynamic Command               |
+|----------------------------------|--------------------------------------|
+| `NV_PGRAPH_BLEND` (equation)    | `vkCmdSetColorBlendEquationEXT`      |
+| `NV_PGRAPH_CONTROL_0` (alpha)   | `vkCmdSetAlphaToOneEnableEXT`        |
+| `NV_PGRAPH_SETUPRASTER` (cull)  | `vkCmdSetCullModeEXT`                |
+| `NV_PGRAPH_ZCOMPRESSOCCLUDE`    | `vkCmdSetDepthCompareOpEXT`          |
+| `NV_PGRAPH_CONTROL_2` (stencil) | `vkCmdSetStencilOpEXT`               |
+| `NV_PGRAPH_CONTROL_0` (fill)    | `vkCmdSetPolygonModeEXT`             |
+| `NV_PGRAPH_CONTROL_0` (zbias)   | `vkCmdSetDepthBiasEnableEXT`         |
+| `NV_PGRAPH_BLEND` (write mask)  | `vkCmdSetColorWriteMaskEXT`          |
+| `NV_PGRAPH_BLEND` (logic op)    | `vkCmdSetLogicOpEXT`                 |
+
+A pipeline is created once per render-pass configuration (colour format, depth
+format, sample count) — a handful of variants total — and reused forever.
+Zero PSO creation per draw, zero state-object cache, zero stalls on first-seen
+state combinations.
+
+---
+
+**Push buffer replay on GPU:**
+
+`VK_EXT_device_generated_commands` (cross-vendor since 2024: Nvidia, AMD, Intel)
+allows a compute shader to write Vulkan command tokens into a buffer that the
+GPU then executes directly, including state changes, descriptor updates, push
+constant writes, and draw calls.
+
+A CS parses the Xbox push buffer from guest RAM and emits one token per NV097
+method:
+
+- `NV097_SET_BLEND_EQUATION` → emit `TOKEN_SET_COLOR_BLEND_EQUATION`
+- `NV097_DRAW_ARRAYS` → emit `VkDrawIndirectCommand` with topology-adjusted
+  vertex count
+- `NV097_SET_TEXTURE_OFFSET` → write texture descriptor into descriptor buffer
+  via `VK_EXT_descriptor_buffer` (GPU-side descriptor updates, no CPU involvement)
+- All other NV097 methods → corresponding dynamic state tokens or PGRAPH
+  shadow writes
+
+The CPU's per-frame sequence becomes:
+1. `memcpy` dirty pages into persistently-mapped `xboxMemory` (near-free on BAR)
+2. `vkCmdDispatch` push buffer parser CS
+3. `vkCmdExecuteGeneratedCommandsEXT`
+4. `vkQueueSubmit`
+
+Every state change, descriptor update, and draw call within the frame is
+determined and executed by the GPU.  The CPU issues ~6 Vulkan calls per frame.
+
+---
+
+**GPU-driven draw calls:**
+
+The push buffer parser CS writes `VkDrawIndirectCommand` structs into a buffer.
+`vkCmdDrawIndirectCount` executes all draws from this buffer in a single call —
+the CPU never computes vertex counts or issues individual draw calls.
+
+---
+
+**Register combiner interpreter (fragment shader):**
+
+The NV2A's 8-stage register combiner is translated to a GLSL fragment shader
+with a `NUM_STAGES` specialisation constant (`layout(constant_id=0) const int`),
+evaluated at `vkCreateGraphicsPipelines` time.  Key design:
+
+- `vec4 Regs[16]` register file replaces switch chains — GLSL supports indirect
+  indexing in fragment stages.
+- Merged RGB and alpha combiner pass per stage.
+- `NUM_STAGES` is set from `PSCombinerCount` in the push buffer.  The pipeline
+  cache handles deduplication.
+
+---
+
+**Vertex fetch and topology conversion:**
+
+NV2A vertex data lives in guest RAM and is fetched directly via buffer device
+address in the vertex shader.  NV2A-specific formats are decoded inline:
+
+- **CMP format** (11+11+10 packed): sign-extended bit extraction in GLSL.
+- **Topology conversion** (quad list → triangle list, triangle fan → triangle
+  list): index arithmetic in the vertex shader using `gl_VertexIndex`.  No
+  index buffer rewrite — the VS computes the source vertex from the triangle
+  vertex ID.
+
+---
 
 **Shader caching:** NV2A programs are short (max 136 vertex shader instructions,
 max 8 register combiner stages).  Compiled SPIR-V is cached keyed by the full
-NV2A program state hash.  Cache hit → reuse VkPipeline; miss → compile + link.
+NV2A program state hash.  Cache hit → reuse `VkPipeline`; miss → compile + link.
 
-**Texture handling:** Guest textures live in guest VRAM (the 64 MB main RAM
-region).  On first use, textures are uploaded to VkImage objects.  Texture
-invalidation is tracked via the page-version system (§2.6): when a page
-containing texture data is written by the CPU, the texture is marked dirty
-and re-uploaded on next GPU use.
+---
 
-**Framebuffer readback:** When the guest CPU reads from the framebuffer
-address (PCRTC_START), a VkBuffer readback copies the rendered image into
-guest RAM for CPU-side compositing or screenshot capture.
+**Framebuffer readback:** When the guest CPU reads from the framebuffer address
+(`PCRTC_START`), a `VkBuffer` readback copies the rendered image into guest RAM
+for CPU-side compositing or screenshot capture.
+
+---
+
+**Render pass architecture:**
+
+Xbox games frequently render to a surface and then read it as a texture in the
+same frame.  Vulkan render passes with explicit subpass dependencies declare
+these transitions upfront, and `VK_DEPENDENCY_BY_REGION_BIT` keeps data in tile
+cache between subpasses.  `VK_KHR_dynamic_rendering` (core 1.3) allows
+attachment changes without pre-compiled `VkRenderPass` objects.
+
+---
+
+**Upscaling:**
+
+- **Spatial upscalers** (bilinear blit, integer scale, FSR 1, NIS): no motion
+  vectors required; work immediately.
+- **Temporal upscalers** (FSR 2, FSR 3, XeSS, DLSS 3): require motion vectors
+  and jitter injection.  All have native Vulkan SDKs.
+  - **DLSS 3 frame generation** (Nvidia): available in Vulkan — combines
+    temporal upscaling with optical-flow-based frame generation via
+    `VK_NV_optical_flow`, effectively doubling output frame rate.
+  - **FSR 3 frame generation** (AMD): also available in Vulkan — cross-vendor
+    frame generation.
+- **Jitter injection:** In the GPU-driven path, VS constants flow directly from
+  guest CPU writes into guest RAM.  A two-pass approach handles this:
+  (1) parser CS writes constants unconditionally; (2) a small serial CS scans
+  completed constant writes for projection matrix candidates (perspective
+  divide row, rotation column magnitudes, near/far ratio) and applies Halton
+  jitter.  For known titles, a per-title override table lets the CPU write
+  jitter directly into the mapped buffer before the parser runs.
+- **Motion vectors:** The VS reprojects world-space vertex positions through
+  the previous frame's VP matrix.  `prevVP` is maintained by copying the
+  identified projection matrix slot at frame boundaries (64-byte `memcpy`).
+- **Reactive mask:** The combiner interpreter fragment shader outputs a second
+  attachment flagging reflection/emissive pixels for reduced temporal weight.
+- **2D / HUD pass detection:** The `NV097_SET_TRANSFORM_EXECUTION_MODE` method
+  in the push buffer identifies 2D passes.  Rendering switches to a native-
+  resolution attachment via `vkCmdBeginRendering` parameter change.
+
+---
+
+**Texture replacement:**
+
+- **Hashing:** xxHash64 over raw guest RAM bytes at the texture's surface
+  address.  Computed on CPU from the persistently-mapped pointer with no GPU
+  synchronisation.  Recomputed only when the texture's dirty page bit is set.
+- **Replacement loading:** When a replacement asset is ready (loaded on a
+  background thread), a standalone `VkImage` at replacement resolution with
+  `VK_IMAGE_TILING_OPTIMAL` replaces the modifier-path image for that address.
+  Descriptor buffer entry is updated atomically.
+- **Non-replaced textures** continue using the modifier path (zero-copy).
+- **Render target surfaces** skip the hash lookup — flagged when the surface
+  address appears in a push buffer `NV097_SET_SURFACE_*` method.
+
+---
+
+**Per-frame CPU work summary:**
+
+| Task                | Approach                                           |
+|---------------------|----------------------------------------------------|
+| Dirty page upload   | `memcpy` into BAR-mapped memory (near-free)        |
+| Texture deswizzle   | None — VkImage reads NV2A memory directly           |
+| Pipeline state      | GPU emits dynamic state tokens from push buffer     |
+| Draw calls          | GPU writes+executes `VkDrawIndirectCommand`         |
+| Vertex fetch        | VS from guest RAM device address                   |
+| Topology convert    | In-shader `gl_VertexIndex` arithmetic              |
+| Combiner interpreter| GLSL, specialisation constants                     |
+| CPU per-frame calls | ~6 total                                           |
+
+---
+
+**Required Vulkan extensions:**
+
+| Extension                              | Status              | Purpose                              |
+|----------------------------------------|---------------------|--------------------------------------|
+| `VK_KHR_buffer_device_address`         | Core 1.2            | Device address for guest RAM pointer |
+| `VK_EXT_extended_dynamic_state3`       | Core 1.3 / universal| Replace PSO state objects            |
+| `VK_EXT_image_drm_format_modifier`     | Universal desktop   | VkImage over Morton memory           |
+| `VK_EXT_device_generated_commands`     | Nvidia/AMD/Intel    | GPU push buffer replay               |
+| `VK_EXT_descriptor_buffer`             | Universal desktop   | GPU texture descriptor updates       |
+| `VK_KHR_dynamic_rendering`            | Core 1.3            | Subpass-free render passes           |
+
+All extensions marked "universal desktop" are available on RTX 20+, RX 5000+,
+and Intel Arc.
+
+---
 
 **Implementation phases:**
-1. Push buffer parser: decode NV2A methods from DMA push buffer
-2. PGRAPH state shadow: track all register combiner / vertex shader state
+1. Push buffer parser — decode NV2A methods from DMA push buffer (GPU-side CS)
+2. PGRAPH state shadow — track all register combiner / vertex shader state
 3. Vertex shader → SPIR-V compiler
 4. Register combiner → SPIR-V fragment shader compiler
-5. Vulkan render pass assembly: vertex buffers, textures, draw calls
-6. Swapchain presentation: present rendered frame to host window
+5. Vulkan render pass assembly — vertex buffers, textures, draw calls
+6. Swapchain presentation — present rendered frame to host window
+7. Upscaler integration — FSR 2/3, DLSS 3, jitter + motion vectors
+8. Texture replacement — hash-based lookup, async background loading
+
+---
+
+**Known remaining NV2A items** (independent of Vulkan backend):
+- `PSCompareMode` — clip-plane comparison mode in the combiner interpreter
+- `PSDotMapping` — normal mapping for dot-product texture modes
+- `PSInputTexture` — dependent-texture input routing
+- `DOT_RFLCT_SPEC_CONST` eye vector wiring
+- Full `BUMPENVMAP` perturbation coordinate routing
+- Full `BRDF` mode — requires eye and light sigma vector inputs
+- Framebuffer readback — GPU→CPU path for guest CPU surface reads
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
