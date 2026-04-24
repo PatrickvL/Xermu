@@ -65,6 +65,16 @@ struct Nv2aState {
     uint32_t ptimer_den = 1;
     uint32_t pcrtc_start = 0;
     uint32_t pvideo_intr = 0;
+
+    // PTIMER: 56-bit freerunning nanosecond counter.
+    // TIME_0 = bits[31:5] of nanosecond counter (bits[4:0] sub-ns, read as 0).
+    // TIME_1 = bits[28:0] of (nanoseconds >> 32).
+    // Tick rate: ~31.25 MHz crystal * (num/den).  Default num/den=1/1.
+    // We advance by a fixed quantum per executor tick.
+    uint64_t ptimer_ns = 0;   // monotonic nanosecond counter
+    static constexpr uint64_t NS_PER_TICK = 100;  // ~10 MHz effective
+
+    void tick_timer() { ptimer_ns += NS_PER_TICK; }
 };
 
 static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
@@ -87,8 +97,8 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     // PTIMER (0x009xxx) — timer
     if (off == 0x009200) return nv->ptimer_num;
     if (off == 0x009210) return nv->ptimer_den;
-    if (off == 0x009400) return 0;                  // PTIMER_TIME_0 (low)
-    if (off == 0x009410) return 0;                  // PTIMER_TIME_1 (high)
+    if (off == 0x009400) return (uint32_t)(nv->ptimer_ns & 0xFFFFFFE0u); // TIME_0 (bits[31:5])
+    if (off == 0x009410) return (uint32_t)(nv->ptimer_ns >> 32);         // TIME_1
     if (off == 0x009100) return 0;                  // PTIMER_INTR_0
 
     // PFB (0x100xxx) — framebuffer control
@@ -604,11 +614,6 @@ static void pit_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
     }
 }
 
-// Tick callback for executor run loop.
-static void pit_tick_callback(void* user) {
-    static_cast<PitState*>(user)->tick();
-}
-
 // ============================= System Port B (0x61) ========================
 
 static uint32_t sysctl_read(uint16_t, unsigned, void*) { return 0x20; /* timer 2 output */ }
@@ -634,6 +639,13 @@ struct XboxHardware {
     PicPair     pic;
     PitState    pit;
 };
+
+// Tick callback for executor run loop — advances PIT and NV2A PTIMER.
+static void hw_tick_callback(void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    hw->pit.tick();
+    hw->nv2a.tick_timer();
+}
 
 // Set up the Xbox MMIO map and I/O ports on an Executor.
 // Returns a heap-allocated XboxHardware whose lifetime must exceed the Executor.
@@ -680,9 +692,9 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     // Wire PIT channel 0 → IRQ 0 on PIC.
     hw->pit.pic = &hw->pic;
 
-    // Periodic tick: call PIT every trace dispatch.
-    exec.tick_fn     = pit_tick_callback;
-    exec.tick_user   = &hw->pit;
+    // Periodic tick: call PIT + NV2A PTIMER every trace dispatch.
+    exec.tick_fn     = hw_tick_callback;
+    exec.tick_user   = hw;
     exec.tick_period = 1;
 
     exec.register_io(0x61, sysctl_read, sysctl_write);         // System B
