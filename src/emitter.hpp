@@ -165,27 +165,23 @@ inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
 }
 
 // Write ctx->next_eip from a guest register already in ctx (via its gp index).
+// Precondition: emit_save_all_gp has stored the live value into ctx->gp[gp_idx].
+//
+//   MOV R14D, [R13 + gp_offset(gp_idx)]   ; load saved guest reg
+//   MOV [R13 + 40], R14D                   ; store to ctx->next_eip
+//
+// REX = 0x45 (REX.R for R14 dest/src, REX.B for R13 base).
+// Note: emit_load_gp cannot be reused here because it hardcodes REX=0x41
+// (REX.B only), which is wrong when the destination is R14 (needs REX.R too).
 inline void emit_write_next_eip_gpreg(Emitter& e, uint8_t gp_idx) {
-    // The value is already in ctx->gp[gp_idx] after emit_save_all_gp.
-    // Copy ctx->gp[gp_idx] → ctx->next_eip:
-    //   MOV R14D, [R13 + gp_offset(gp_idx)]
-    emit_load_gp(e, 6 /*R14&7=6, with REX.R→encoding differs*/,
-                 gp_offset(gp_idx));
-    // Wait: emit_load_gp uses REX.B(R13 base) + reg field for dest.
-    // For R14D as dest, reg=6, REX.R=1 → REX=0x45 not 0x41.
-    // Fixup: emit manually:
-    // Undo the emit_load_gp we just did (3 bytes for the call above already
-    // emitted - this is wrong). Instead, handle inline below.
-    // NOTE: the call above emitted the wrong encoding. We overwrite by
-    // backing up pos (valid since we know exact size = 4 bytes).
-    e.pos -= 4; // undo incorrect emit_load_gp
-    // Correct: MOV R14D, [R13 + offset]
-    // REX = 0x45 (REX.R=1 for R14 as dest, REX.B=1 for R13 as base)
-    e.emit8(0x45); e.emit8(0x8B);
-    e.emit8(uint8_t(0x40u | (6u << 3) | 5u)); // mod=01, reg=6(R14&7), rm=5(R13&7)
+    // MOV R14D, DWORD [R13 + gp_offset(gp_idx)]
+    e.emit8(0x45); e.emit8(0x8B);                              // REX.RB + MOV r,r/m
+    e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
     e.emit8(gp_offset(gp_idx));
-    // Now store R14D → ctx->next_eip (offset 40)
-    e.emit8(0x45); e.emit8(0x89); e.emit8(0x75); e.emit8(40);
+    // MOV DWORD [R13 + 40], R14D
+    e.emit8(0x45); e.emit8(0x89);                              // REX.RB + MOV r/m,r
+    e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
+    e.emit8(40);                                                // disp8 = offsetof(next_eip)
 }
 
 // ---------------------------------------------------------------------------
