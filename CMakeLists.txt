@@ -86,6 +86,7 @@ set(TEST_ASM_FILES
     tests/paging.asm
     tests/xbox.asm
     tests/hle.asm
+    tests/linking.asm
 )
 
 if(NASM_EXECUTABLE)

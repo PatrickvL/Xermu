@@ -90,6 +90,11 @@ struct Executor {
 
     // Is paging currently enabled?
     bool paging_enabled() const { return (ctx.cr0 & 0x80000000u) != 0; }
+
+    // Block linking: try to patch a trace's unlinked exits to their targets.
+    void try_link_trace(Trace* t);
+    // Unlink all traces that jump to the given trace (before invalidation).
+    void unlink_trace(Trace* t);
 };
 
 // ---------------------------------------------------------------------------

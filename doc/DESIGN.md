@@ -655,10 +655,49 @@ kernel API stubs, with gradual replacement as hardware emulation matures.
 ### Phase 4: Performance
 
 #### 5.20 Block Linking (Trace Chaining)
-**Priority: HIGH** — Currently every trace exits back to the C++ run loop for
-the next dispatch. Direct trace-to-trace chaining (patch the exit jump to point
-at the next trace's host code) eliminates the run-loop overhead for hot paths.
-This is the single largest performance win available.
+**Status: DONE**
+
+Each trace exit with a statically known target EIP now emits a **linkable
+JMP rel32** before the cold save-all-GP / write-next-EIP / RET fallback:
+
+```
+JMP rel32          ; 5 bytes — initially rel32=0 (falls through to cold path)
+; --- cold exit path ---
+save_all_gp        ; 7× MOV [R13+off], reg
+write_next_eip     ; MOV R14D, imm32 / MOV [R13+40], R14D
+RET                ; return to dispatch_trace trampoline
+```
+
+**Trace struct** carries up to 2 `LinkSlot`s (for Jcc: taken + fallthrough, or
+1 for unconditional exits).  Each slot records the address of the rel32 field
+and the target guest EIP.
+
+**Linking** happens eagerly in the run loop.  After a trace `t` is found or
+built, `try_link_trace(t)` patches every unlinked exit whose target trace is
+already in the cache (forward linking).  The previously executed trace
+`prev_trace` is also re-checked, handling the common backward-edge case (a loop
+branch back to its head).
+
+When linked, the JMP bypasses the entire save / trampoline / run-loop / lookup
+path — guest registers stay live in host registers, and execution continues
+directly into the next trace's first instruction.
+
+**Unlinking** on SMC: `unlink_trace(t)` scans all traces in the arena and
+resets any JMP rel32 that targets `t->guest_eip` back to 0 (cold fallthrough).
+This is called before invalidating a trace due to a page-version mismatch.
+
+**SMC safety**: traces that contain page-version bumps (`emit_smc_page_bump`)
+set `Emitter::smc_written = true`, which suppresses link-slot creation entirely.
+Additionally, `try_link_trace` validates the target's page version before
+patching, preventing links to stale traces.
+
+Link slot layout per trace:
+
+| Field        | Type      | Description                              |
+|-------------|-----------|------------------------------------------|
+| `jmp_rel32` | `uint8_t*`| Address of the rel32 in the JMP opcode   |
+| `target_eip`| `uint32_t`| Guest EIP this exit targets              |
+| `linked`    | `bool`    | `true` if patched to a real target trace |
 
 #### 5.21 Fastmem Window (4 GB VA Reservation)
 **Priority: MEDIUM** — Currently using a flat 128 MB `VirtualAlloc` slab. The

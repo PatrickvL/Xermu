@@ -16,6 +16,22 @@ struct Emitter {
     bool     paging   = false; // true when CR0.PG is set at build time
     uint32_t fault_eip = 0;    // guest EIP for #PF exit on translate fault
 
+    // Pending link slots collected during trace emission.
+    // Transferred to the Trace after building.
+    struct PendingLink {
+        uint8_t* patch_site;
+        uint32_t target_eip;
+    };
+    static constexpr int MAX_PENDING_LINKS = 4;
+    PendingLink pending_links[MAX_PENDING_LINKS] = {};
+    int num_pending_links = 0;
+    bool smc_written = false; // set when trace bumps a page version (SMC)
+
+    void add_pending_link(uint8_t* site, uint32_t target) {
+        if (num_pending_links < MAX_PENDING_LINKS)
+            pending_links[num_pending_links++] = { site, target };
+    }
+
     Emitter(uint8_t* b, size_t c) : buf(b), pos(0), cap(c) {}
 
     void emit8 (uint8_t  v) { assert(pos < cap); buf[pos++] = v; }
@@ -205,16 +221,39 @@ inline void emit_write_next_eip_gpreg(Emitter& e, uint8_t gp_idx) {
 }
 
 // ---------------------------------------------------------------------------
-// Trace epilog: save all GP regs, write next_eip, RET
+// Trace epilog: save all GP regs, write next_eip, RET.
+//
+// Block linking: static epilogs emit a JMP rel32 before the save/write/RET
+// sequence.  Initially the JMP targets the fallback (next instruction).
+// The caller records the JMP's rel32 address as a "link slot" — when the
+// target trace is later compiled the JMP is patched to go directly there,
+// bypassing the save/exit/trampoline/run-loop overhead entirely.
+//
+// Linkable epilog layout:
+//   JMP rel32   → fallback (5 bytes, rel32 initially = 0)
+//   fallback:     save_all_gp + write_next_eip + RET
+//
+// `patch_site` is set to the address of the rel32 in the JMP, or nullptr
+// for dynamic/unlinkable exits.
 // ---------------------------------------------------------------------------
 
-inline void emit_epilog_static(Emitter& e, uint32_t next_eip) {
+inline uint8_t* emit_epilog_static(Emitter& e, uint32_t next_eip) {
+    // JMP rel32 (link slot — initially points to the very next byte)
+    e.emit8(0xE9);
+    uint8_t* patch_site = e.cur();
+    e.emit32(0); // rel32 = 0 → fallthrough to the instruction right after
+
+    // Fallback exit path
     emit_save_all_gp(e);
     emit_write_next_eip_imm(e, next_eip);
     e.emit8(0xC3); // RET
+
+    e.add_pending_link(patch_site, next_eip);
+    return patch_site;
 }
 
 inline void emit_epilog_dynamic(Emitter& e, uint8_t eip_gp_idx) {
+    // Dynamic targets cannot be linked.
     emit_save_all_gp(e);
     emit_write_next_eip_gpreg(e, eip_gp_idx);
     e.emit8(0xC3); // RET
@@ -222,13 +261,17 @@ inline void emit_epilog_dynamic(Emitter& e, uint8_t eip_gp_idx) {
 
 // ---------------------------------------------------------------------------
 // Conditional trace exit:  save regs, Jcc taken/not-taken, then epilog each.
-// `jcc_short` is the 1-byte short Jcc opcode (e.g. 0x75 for JNZ).
+// Both paths get linkable JMP rel32 slots.
+//
+// Returns {fallthrough_patch, taken_patch} via out parameters.
 // ---------------------------------------------------------------------------
 
 inline void emit_epilog_conditional(Emitter& e,
                                      uint8_t  jcc_short,
                                      uint32_t taken_eip,
-                                     uint32_t fallthrough_eip) {
+                                     uint32_t fallthrough_eip,
+                                     uint8_t** out_ft_patch = nullptr,
+                                     uint8_t** out_tk_patch = nullptr) {
     // Save regs first (MOV does not affect EFLAGS — condition still valid).
     emit_save_all_gp(e);
 
@@ -237,14 +280,26 @@ inline void emit_epilog_conditional(Emitter& e,
     e.emit8(uint8_t(jcc_short + 0x10u));
     uint8_t* taken_site = e.reserve_rel32();
 
-    // Fallthrough path
+    // Fallthrough path: linkable JMP + fallback exit
+    e.emit8(0xE9);
+    uint8_t* ft_patch = e.cur();
+    e.emit32(0);
     emit_write_next_eip_imm(e, fallthrough_eip);
     e.emit8(0xC3);
 
-    // Taken path
+    // Taken path: linkable JMP + fallback exit
     Emitter::patch_rel32(taken_site, e.cur());
+    e.emit8(0xE9);
+    uint8_t* tk_patch = e.cur();
+    e.emit32(0);
     emit_write_next_eip_imm(e, taken_eip);
     e.emit8(0xC3);
+
+    e.add_pending_link(ft_patch, fallthrough_eip);
+    e.add_pending_link(tk_patch, taken_eip);
+
+    if (out_ft_patch) *out_ft_patch = ft_patch;
+    if (out_tk_patch) *out_tk_patch = tk_patch;
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +635,7 @@ inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
 // ---------------------------------------------------------------------------
 
 inline void emit_smc_page_bump(Emitter& e, bool preserve_flags = true) {
+    e.smc_written = true; // mark trace as containing an SMC write — inhibits linking
     if (preserve_flags) e.emit8(0x9C);          // PUSHFQ
     e.emit8(0x50);                               // PUSH RAX
     e.emit8(0x49); e.emit8(0x8B); e.emit8(0x45); // MOV RAX, [R13+disp8]

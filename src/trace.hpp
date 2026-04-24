@@ -5,11 +5,31 @@
 
 // A compiled trace: a run of guest instructions from guest_eip up to (but not
 // including) the first branch/call/ret, emitted into the code cache.
+//
+// Link slots: each trace can have up to 2 exit edges (e.g. Jcc taken +
+// fallthrough).  A link slot records the JMP rel32 patch site and the target
+// guest EIP.  When the target trace is compiled, the JMP is patched to go
+// directly to the target's host_code, bypassing the run loop.
 struct Trace {
     uint32_t  guest_eip   = 0;
     uint8_t*  host_code   = nullptr;   // pointer into CodeCache slab
     uint32_t  page_ver    = 0;         // page_versions[guest_eip>>12] at build time
     bool      valid       = false;
+
+    // Block linking: up to 2 exit edges.
+    static constexpr int MAX_LINKS = 2;
+    struct LinkSlot {
+        uint8_t* jmp_rel32 = nullptr;  // address of the rel32 field in the JMP
+        uint32_t target_eip = 0;       // guest EIP this edge targets
+        bool     linked     = false;   // true if patched to a real target
+    };
+    LinkSlot links[MAX_LINKS] = {};
+    int      num_links = 0;
+
+    void add_link(uint8_t* patch_site, uint32_t target) {
+        if (num_links < MAX_LINKS)
+            links[num_links++] = { patch_site, target, false };
+    }
 };
 
 // Flat open-addressed hash table mapping guest_eip → Trace*.
