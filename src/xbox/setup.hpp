@@ -1,0 +1,122 @@
+#pragma once
+// Xbox hardware setup — XboxHardware struct, tick callback, xbox_setup().
+#include "address_map.hpp"
+#include "nv2a.hpp"
+#include "apu.hpp"
+#include "ide.hpp"
+#include "usb.hpp"
+#include "ioapic.hpp"
+#include "ram_mirror.hpp"
+#include "flash.hpp"
+#include "pci.hpp"
+#include "smbus.hpp"
+#include "pic.hpp"
+#include "pit.hpp"
+#include "misc_io.hpp"
+#include "../executor.hpp"
+#include <cstring>
+
+namespace xbox {
+
+struct XboxHardware {
+    MmioMap     mmio;
+    Nv2aState   nv2a;
+    ApuState    apu;
+    IdeState    ide;
+    OhciState   usb0;
+    OhciState   usb1;
+    IoApicState ioapic;
+    FlashState  flash;
+    PciState    pci;
+    SmbusState  smbus;
+    PicPair     pic;
+    PitState    pit;
+    uint8_t*    ram = nullptr;
+    uint32_t    ram_size = 0;
+};
+
+static void hw_tick_callback(void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    hw->pit.tick();
+    hw->nv2a.tick_timer();
+    hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
+    if (hw->nv2a.vblank_irq_pending) {
+        hw->nv2a.vblank_irq_pending = false;
+        hw->pic.raise_irq(1);
+    }
+}
+
+inline XboxHardware* xbox_setup(Executor& exec) {
+    auto* hw = new XboxHardware();
+
+    hw->pci.init_xbox_devices();
+    exec.init(&hw->mmio);
+
+    hw->ram = exec.ram;
+    hw->ram_size = GUEST_RAM_SIZE;
+
+    hw->mmio.add(RAM_MIRROR_BASE, RAM_MIRROR_SIZE,
+                 ram_mirror_read, ram_mirror_write, exec.ram);
+    hw->mmio.add(FLASH_BASE, FLASH_SIZE,
+                 flash_read, flash_write, &hw->flash);
+    hw->mmio.add(NV2A_BASE, NV2A_SIZE,
+                 nv2a_read, nv2a_write, &hw->nv2a);
+    hw->mmio.add(APU_BASE, APU_SIZE,
+                 apu_read, apu_write, &hw->apu);
+    hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,
+                 ioapic_read, ioapic_write, &hw->ioapic);
+    hw->usb0.init(2);
+    hw->usb1.init(2);
+    hw->mmio.add(USB0_BASE, USB0_SIZE,
+                 ohci_read, ohci_write, &hw->usb0);
+    hw->mmio.add(USB1_BASE, USB1_SIZE,
+                 ohci_read, ohci_write, &hw->usb1);
+    {
+        uint32_t bar0 = USB0_BASE;
+        memcpy(hw->pci.config[0][4][0] + 0x10, &bar0, 4);
+        uint32_t bar1 = USB1_BASE;
+        memcpy(hw->pci.config[0][5][0] + 0x10, &bar1, 4);
+    }
+    hw->mmio.add(BIOS_BASE, BIOS_SIZE,
+                 flash_read, flash_write, &hw->flash);
+
+    exec.register_io(0x20, pic_master_read, pic_master_write, &hw->pic);
+    exec.register_io(0x21, pic_master_read, pic_master_write, &hw->pic);
+    exec.register_io(0xA0, pic_slave_read, pic_slave_write, &hw->pic);
+    exec.register_io(0xA1, pic_slave_read, pic_slave_write, &hw->pic);
+
+    exec.irq_check = pic_irq_check;
+    exec.irq_ack   = pic_irq_ack;
+    exec.irq_user  = &hw->pic;
+
+    exec.register_io(0x40, pit_io_read, pit_io_write, &hw->pit);
+    exec.register_io(0x41, pit_io_read, pit_io_write, &hw->pit);
+    exec.register_io(0x42, pit_io_read, pit_io_write, &hw->pit);
+    exec.register_io(0x43, pit_io_read, pit_io_write, &hw->pit);
+
+    hw->pit.pic  = &hw->pic;
+
+    exec.tick_fn     = hw_tick_callback;
+    exec.tick_user   = hw;
+    exec.tick_period = 1;
+
+    exec.register_io(0x61, sysctl_read, sysctl_write);
+    exec.register_io(0xE9, nullptr, debug_console_write);
+    exec.register_io(0xCF8, pci_io_read_cf8, pci_io_write_cf8, &hw->pci);
+    exec.register_io(0xCFC, pci_io_read_cfc, pci_io_write_cfc, &hw->pci);
+
+    for (uint16_t p = 0xC000; p <= 0xC00E; p += 2)
+        exec.register_io(p, smbus_io_read, smbus_io_write, &hw->smbus);
+
+    for (uint16_t p = 0x1F0; p <= 0x1F7; p++)
+        exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
+    exec.register_io(0x3F6, ide_io_read, ide_io_write, &hw->ide);
+
+    for (uint16_t p = 0x170; p <= 0x177; p++)
+        exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
+    exec.register_io(0x376, ide_io_read, ide_io_write, &hw->ide);
+
+    return hw;
+}
+
+} // namespace xbox
