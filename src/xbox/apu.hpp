@@ -98,15 +98,53 @@ struct ApuState {
     static constexpr uint32_t REG_COUNT = REG_SPACE / 4;     // 5120 slots
     uint32_t regs[REG_COUNT] = {};
 
+    // Voice Processor (VP) scratch state:
+    // The VP can address up to 256 voice slots. Each voice is 128 bytes
+    // (32 dwords) in the NV_PAVS voice memory region.
+    // For now we just provide a flat R/W array for software to configure.
+    static constexpr uint32_t MAX_VOICES       = 256;
+    static constexpr uint32_t VOICE_SIZE_DWORDS = 32;  // 128 bytes
+    uint32_t voices[MAX_VOICES * VOICE_SIZE_DWORDS] = {};
+
     uint32_t& reg(uint32_t off)       { return regs[off / 4]; }
     uint32_t  reg(uint32_t off) const { return regs[off / 4]; }
 };
+
+// ========================== NV_PAVS Voice Offsets ==========================
+// Voice memory base is at APU_BASE + 0x20000.
+// Each voice is 128 bytes (32 dwords), 256 voices total.
+// Offsets within each voice slot (per NV docs):
+
+namespace pavs {
+static constexpr uint32_t VP_BASE       = 0x20000;
+static constexpr uint32_t VP_SIZE       = 0x8000;  // 256 * 128 = 32KB
+
+// Per-voice register offsets (within 128-byte slot)
+static constexpr uint32_t V_CFG         = 0x00;  // configuration (format, state)
+static constexpr uint32_t V_CTL         = 0x04;  // control (pitch, etc.)
+static constexpr uint32_t V_TAR_PITCH   = 0x08;  // target pitch
+static constexpr uint32_t V_CUR_VOL     = 0x10;  // current volume
+static constexpr uint32_t V_TAR_VOL     = 0x14;  // target volume
+static constexpr uint32_t V_CUR_POS     = 0x30;  // current position (fractional)
+static constexpr uint32_t V_CUR_POS_F   = 0x34;  // position fraction
+static constexpr uint32_t V_EAR         = 0x40;  // envelope attack rate
+static constexpr uint32_t V_EDR         = 0x44;  // envelope decay rate
+static constexpr uint32_t V_ESR         = 0x48;  // envelope sustain rate
+static constexpr uint32_t V_ERR         = 0x4C;  // envelope release rate
+} // namespace pavs
 
 // ========================== MMIO Handlers ==================================
 
 static uint32_t apu_read(uint32_t pa, unsigned /*size*/, void* user) {
     auto* apu = static_cast<ApuState*>(user);
     uint32_t off = pa - APU_BASE;
+
+    // VP voice memory region
+    if (off >= pavs::VP_BASE && off < pavs::VP_BASE + pavs::VP_SIZE) {
+        uint32_t voff = off - pavs::VP_BASE;
+        return apu->voices[voff / 4];
+    }
+
     if (off / 4 >= ApuState::REG_COUNT) return 0;
 
     uint32_t val = apu->reg(off);
@@ -121,6 +159,14 @@ static uint32_t apu_read(uint32_t pa, unsigned /*size*/, void* user) {
 static void apu_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) {
     auto* apu = static_cast<ApuState*>(user);
     uint32_t off = pa - APU_BASE;
+
+    // VP voice memory region
+    if (off >= pavs::VP_BASE && off < pavs::VP_BASE + pavs::VP_SIZE) {
+        uint32_t voff = off - pavs::VP_BASE;
+        apu->voices[voff / 4] = val;
+        return;
+    }
+
     if (off / 4 >= ApuState::REG_COUNT) return;
 
     switch (off) {
