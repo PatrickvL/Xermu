@@ -65,6 +65,39 @@ inline bool reg32_enc(ZydisRegister r, uint8_t& out) {
     }
 }
 
+// Map any guest GP register (8/16/32-bit) to its 3-bit encoding.
+// For 8-bit: only low registers (AL/CL/DL/BL) are supported because
+// AH/CH/DH/BH encodings conflict with REX prefix (become SPL/BPL/SIL/DIL).
+// For 16-bit and 32-bit: all registers including SP/ESP map correctly.
+inline bool guest_reg_enc(ZydisRegister r, uint8_t& out) {
+    switch (r) {
+        // 32-bit
+        case ZYDIS_REGISTER_EAX: out = 0; return true;
+        case ZYDIS_REGISTER_ECX: out = 1; return true;
+        case ZYDIS_REGISTER_EDX: out = 2; return true;
+        case ZYDIS_REGISTER_EBX: out = 3; return true;
+        case ZYDIS_REGISTER_ESP: out = 4; return true;
+        case ZYDIS_REGISTER_EBP: out = 5; return true;
+        case ZYDIS_REGISTER_ESI: out = 6; return true;
+        case ZYDIS_REGISTER_EDI: out = 7; return true;
+        // 16-bit
+        case ZYDIS_REGISTER_AX:  out = 0; return true;
+        case ZYDIS_REGISTER_CX:  out = 1; return true;
+        case ZYDIS_REGISTER_DX:  out = 2; return true;
+        case ZYDIS_REGISTER_BX:  out = 3; return true;
+        case ZYDIS_REGISTER_SP:  out = 4; return true;
+        case ZYDIS_REGISTER_BP:  out = 5; return true;
+        case ZYDIS_REGISTER_SI:  out = 6; return true;
+        case ZYDIS_REGISTER_DI:  out = 7; return true;
+        // 8-bit low (safe with REX prefix)
+        case ZYDIS_REGISTER_AL:  out = 0; return true;
+        case ZYDIS_REGISTER_CL:  out = 1; return true;
+        case ZYDIS_REGISTER_DL:  out = 2; return true;
+        case ZYDIS_REGISTER_BL:  out = 3; return true;
+        default: return false; // AH/CH/DH/BH not supported (REX conflict)
+    }
+}
+
 // Map Zydis register to GP array index (same as encoding for EAX-EDI).
 inline int reg32_gp(ZydisRegister r) {
     uint8_t enc;

@@ -252,5 +252,75 @@
     dec  dword [0x5018]
     ASSERT_EQ_MEM 0x5018, 10                 ; 41
 
+; ========================= 8-bit register MOV [mem] ========================
+; MOV [mem], r8 (byte store from register)
+    mov  dword [0x5020], 0                   ; clear target
+    mov  al, 0xAB
+    mov  [0x5020], al
+    movzx ecx, byte [0x5020]
+    ASSERT_EQ ecx, 0xAB                      ; 42
+
+; MOV r8, [mem] (byte load to register)
+    mov  byte [0x5024], 0x7F
+    mov  cl, [0x5024]
+    movzx eax, cl
+    ASSERT_EQ eax, 0x7F                      ; 43
+    mov  eax, 0
+
+; MOV [reg+disp], r8
+    mov  ebx, 0x5020
+    mov  dl, 0xCD
+    mov  [ebx+8], dl
+    movzx ecx, byte [0x5028]
+    ASSERT_EQ ecx, 0xCD                      ; 44
+
+; MOV r8, [reg+disp]
+    mov  byte [0x502C], 0xEF
+    mov  bl, [0x502C]
+    movzx eax, bl
+    ASSERT_EQ eax, 0xEF                      ; 45
+    mov  eax, 0
+
+; ========================= 16-bit register MOV [mem] =======================
+; MOV [mem], r16 (word store from register)
+    mov  dword [0x5030], 0                   ; clear
+    mov  ax, 0xBEEF
+    mov  [0x5030], ax
+    movzx ecx, word [0x5030]
+    ASSERT_EQ ecx, 0xBEEF                    ; 46
+    mov  eax, 0
+
+; MOV r16, [mem] (word load to register)
+    mov  word [0x5034], 0x1234
+    mov  cx, [0x5034]
+    movzx eax, cx
+    ASSERT_EQ eax, 0x1234                    ; 47
+    mov  eax, 0
+
+; MOV [reg+disp], r16
+    mov  ebx, 0x5030
+    mov  dx, 0xFACE
+    mov  [ebx+8], dx
+    movzx ecx, word [0x5038]
+    ASSERT_EQ ecx, 0xFACE                    ; 48
+
+; MOV r16, [reg+disp]
+    mov  word [0x503C], 0x5678
+    mov  ebx, 0x5030
+    mov  si, [ebx+0xC]
+    movzx eax, si
+    ASSERT_EQ eax, 0x5678                    ; 49
+    mov  eax, 0
+
+; 8-bit MOV preserves upper bytes of register
+    mov  eax, 0xFF00FF00
+    mov  al, 0x42
+    ASSERT_EQ eax, 0xFF00FF42                ; 50
+
+; 16-bit MOV preserves upper word of register
+    mov  ecx, 0xDEAD0000
+    mov  cx, 0xBEEF
+    ASSERT_EQ ecx, 0xDEADBEEF               ; 51
+
 ; ============================== PASS =======================================
     PASS
