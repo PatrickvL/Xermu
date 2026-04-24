@@ -110,8 +110,8 @@ PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 All instruction classification is driven by a **two-level O(1) dispatch table**:
 
 - **Level 1**: `uint8_t MNEMONIC_CLASS[ZYDIS_MNEMONIC_MAX_VALUE+1]` — maps every
-  Zydis mnemonic enum to a compact `InsnClassId` (0–24). Initialized once by
-  `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
+  Zydis mnemonic enum to a compact `InsnClassId` (24 classes). Initialized once
+  by `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
 
 - **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
   `{EmitHandler, InsnClassFlags}` pair. `InsnClassFlags` encode properties:
@@ -129,7 +129,8 @@ Class IDs and their handlers:
 | IC_MOV_MEM    | MOV                                      | `emit_handler_mov_mem` |
 | IC_ALU_MEM    | ADD/SUB/AND/OR/XOR/CMP/ADC/SBB/INC/DEC/NEG/NOT/SHL/SHR/SAR/ROL/ROR/RCL/RCR | `emit_handler_alu_mem` |
 | IC_TEST_MEM   | TEST                                     | `emit_handler_test_mem`|
-| IC_PUSH       | PUSH (reg + imm)                         | `emit_handler_push`    |
+| IC_PUSH       | PUSH reg                                 | `emit_handler_push`    |
+| IC_PUSH_IMM   | PUSH imm8/imm32                          | `emit_handler_push`    |
 | IC_POP        | POP                                      | `emit_handler_pop`     |
 | IC_LEAVE      | LEAVE                                    | `emit_handler_leave`   |
 | IC_MOVZX_MEM  | MOVZX                                    | `emit_handler_movzx_mem` |
@@ -141,6 +142,9 @@ Class IDs and their handlers:
 | IC_STRING     | MOVSB/W/D, STOSB/W/D, LODSB/W/D, CMPSB/W/D, SCASB/W/D (15 mnemonics) | `emit_handler_string` |
 | IC_ENTER      | ENTER                                    | `emit_handler_enter`   |
 | IC_XLATB      | XLAT                                     | `emit_handler_xlatb`   |
+| IC_FLAGMEM    | SETcc/CMOVcc [mem]                       | `emit_handler_flagmem` |
+| IC_PUSHAD     | PUSHAD                                   | `emit_handler_pushad`  |
+| IC_POPAD      | POPAD                                    | `emit_handler_popad`   |
 | IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/LOOPE/LOOPNE/IRETD | (inline in build loop) |
 | IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/INT/INT3/... | (stop_reason + RET)    |
 
@@ -237,6 +241,10 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC (33)    | ✅ ALL PASS   |
 | `tests/smc.asm`       | Self-modifying code: patch imm/opcode/jmp/alu (11) | ✅ ALL PASS   |
 | `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
+| `tests/paging.asm`    | Page table walk, 4KB/4MB pages, INVLPG (9)         | ✅ ALL PASS   |
+| `tests/xbox.asm`      | Xbox address map: RAM mirror, PCI, NV2A, Flash (9) | ✅ ALL PASS   |
+| `tests/hle.asm`       | HLE kernel stubs: thread, memory, handle (4)       | ✅ ALL PASS   |
+| `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 
 ---
 
@@ -294,7 +302,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 12 suites, 401 total assertions, CMake integration
+- [x] NASM test infrastructure: 17 suites, CMake integration
 
 ---
 
@@ -317,8 +325,8 @@ sequence where ZF must survive a memory load).
 #### 5.2 ~~FPU / x87 / MMX / SSE State~~ ✅ DONE (x87 core)
 **Resolved for x87.** Guest FPU/SSE state is saved/restored via FXSAVE/FXRSTOR
 in the dispatch trampoline (both MASM and GCC/Clang inline asm). `GuestContext`
-now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 112) and `host_fpu`
-(offset 624), both 16-byte aligned.
+now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 128) and `host_fpu`
+(offset 640), both 16-byte aligned.
 
 - **Register-only x87 instructions** (FLD1, FADD ST(i), FCOMPP, FNSTSW AX, etc.)
   run natively — verbatim-copied by the trace builder.
@@ -382,8 +390,8 @@ Verified by Test 3 (`MOV DWORD PTR [0x4000], 0x42`).
 #### 5.7 ~~LEA / Multi-Memory-Operand Classification~~ ✅ DONE
 **Resolved.** LEA is classified as `IC_LEA` with `ICF_CLEAN_COPY` — it computes
 EA into R14 and moves the result to the destination register, with no memory
-access. `XCHG [mem], reg` / `CMPXCHG [mem], reg` still need read-modify-write
-support.
+access. `XCHG [mem], reg` / `CMPXCHG [mem], reg` / `XADD [mem], reg` are
+handled by the generic memory rewriter (`IC_ALU_MEM`).
 
 #### 5.8 ~~CALL/JMP Indirect Through Memory~~ ✅ DONE
 `JMP [mem]`, `CALL [mem]`, `PUSH [mem]`, `POP [mem]` all implemented via
@@ -419,9 +427,9 @@ a trap to the run loop.
 | CPUID             | ✅ Leaves 0 and 1 (vendor + features)              |
 | RDTSC             | ✅ Host __rdtsc()                                  |
 | HLT               | ✅ Idle until next interrupt                       |
-| INT n             | ✅ Stub (log + halt until §5.12 interrupt delivery)|
-| INT3 / INT1       | ✅ Stub (debug trap → halt)                        |
-| INTO              | ✅ Stub (log + advance)                            |
+| INT n             | ✅ IDT delivery (§5.12)                            |
+| INT3 / INT1       | ✅ IDT delivery (vector 3 / vector 1)              |
+| INTO              | ✅ IDT delivery (vector 4 if OF set)               |
 
 ---
 
@@ -654,7 +662,7 @@ kernel API stubs, with gradual replacement as hardware emulation matures.
 
 ### Phase 4: Performance
 
-#### 5.20 Block Linking (Trace Chaining)
+#### 5.21 Block Linking (Trace Chaining)
 **Status: DONE**
 
 Each trace exit with a statically known target EIP now emits a **linkable
@@ -699,14 +707,13 @@ Link slot layout per trace:
 | `target_eip`| `uint32_t`| Guest EIP this exit targets              |
 | `linked`    | `bool`    | `true` if patched to a real target trace |
 
-#### 5.21 Fastmem Window (4 GB VA Reservation)
-**Priority: MEDIUM** — Currently using a flat 128 MB `VirtualAlloc` slab. The
-design calls for reserving the full 4 GB guest PA space as a contiguous host VA
-region, with only RAM pages committed and MMIO regions left as guard pages. This
-would allow `host_va = FASTMEM_BASE + guest_pa` without any bounds check,
-eliminating the CMP+JAE pair from every memory access.
+#### 5.22 ~~Fastmem Window (4 GB VA Reservation)~~ — Rejected
+Rejected: guard-page / VEH-based MMIO dispatch contradicts the core design
+principle (§2.3 — "No Guard Pages"). The inline CMP R14,R15 + JAE slow_path
+pattern is the correct approach: every memory access is rewritten at JIT time
+with no OS exception handling in the hot path.
 
-#### 5.22 Trace Cache Improvements
+#### 5.23 Trace Cache Improvements
 - Two-level cache: `page_map[guest_page][offset >> 1]` for O(1) direct-mapped
   lookup instead of hash table
 - Trace linking between direct-branch targets
