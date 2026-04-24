@@ -89,11 +89,13 @@ static constexpr uint32_t FORMAT1  = 0x95C;    // buffer 1 format
 } // namespace pvideo
 
 namespace ptimer {
-static constexpr uint32_t INTR     = 0x100;    // PTIMER interrupt (unused stub)
+static constexpr uint32_t INTR     = 0x100;    // PTIMER interrupt status (W1C)
+static constexpr uint32_t INTR_EN  = 0x140;    // PTIMER interrupt enable
 static constexpr uint32_t NUM      = 0x200;    // numerator
 static constexpr uint32_t DEN      = 0x210;    // denominator
 static constexpr uint32_t TIME_0   = 0x400;    // low 32 bits of ns counter (computed)
 static constexpr uint32_t TIME_1   = 0x410;    // high 24 bits of ns counter (computed)
+static constexpr uint32_t ALARM_0  = 0x420;    // alarm low 32 bits
 } // namespace ptimer
 
 namespace pfb {
@@ -193,6 +195,13 @@ struct Nv2aState {
 
     void tick_timer() {
         ptimer_ns += NS_PER_TICK;
+        // Check PTIMER alarm: if alarm is set and time >= alarm, set INTR bit 0.
+        uint32_t alarm_lo = ptimer_regs[ptimer::ALARM_0 / 4];
+        if (alarm_lo != 0) {
+            uint32_t time_lo = (uint32_t)(ptimer_ns & 0xFFFFFFE0u);
+            if (time_lo >= alarm_lo)
+                ptimer_regs[ptimer::INTR / 4] |= 1;
+        }
         if (++vblank_counter >= VBLANK_PERIOD) {
             vblank_counter = 0;
             if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1)
@@ -424,6 +433,7 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // --- PTIMER (0x009000) ---
     if (off >= 0x009000 && off < 0x00A000) {
         uint32_t r = off - 0x009000;
+        if (r == ptimer::INTR) { nv->ptimer_regs[r / 4] &= ~val; return; }
         if (r / 4 < Nv2aState::PTIMER_COUNT) nv->ptimer_regs[r / 4] = val;
         return;
     }

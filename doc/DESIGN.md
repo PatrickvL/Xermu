@@ -284,6 +284,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pvideo.asm`   | NV2A PVIDEO: overlay buffer regs, scale, format (15) | ✅ ALL PASS   |
 | `tests/pbus.asm`     | NV2A PBUS: interrupt W1C, FBIO_RAM, debug (7)     | ✅ ALL PASS   |
 | `tests/pramdac.asm`  | NV2A PCRTC+PRAMDAC: START, RASTER, PLLs, TV (10)  | ✅ ALL PASS   |
+| `tests/ptimer_alarm.asm` | NV2A PTIMER: alarm fire, W1C, NUM/DEN (8)     | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
