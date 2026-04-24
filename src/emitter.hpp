@@ -209,11 +209,17 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
     assert(op.type == ZYDIS_OPERAND_TYPE_MEMORY);
     const auto& m = op.mem;
 
-    // We do not handle segment overrides (FS:, GS:) here.
-    if (m.segment != ZYDIS_REGISTER_NONE &&
-        m.segment != ZYDIS_REGISTER_DS   &&
-        m.segment != ZYDIS_REGISTER_SS)
-        return false;
+    // Determine segment base offset (FS/GS add ctx field; DS/SS/NONE = 0)
+    int seg_ctx_offset = -1; // -1 = no segment base adjustment needed
+    if (m.segment == ZYDIS_REGISTER_FS) {
+        seg_ctx_offset = (int)offsetof(GuestContext, fs_base); // 108
+    } else if (m.segment == ZYDIS_REGISTER_GS) {
+        seg_ctx_offset = (int)offsetof(GuestContext, gs_base); // 112
+    } else if (m.segment != ZYDIS_REGISTER_NONE &&
+               m.segment != ZYDIS_REGISTER_DS   &&
+               m.segment != ZYDIS_REGISTER_SS) {
+        return false; // CS/ES not supported
+    }
 
     bool has_base  = (m.base  != ZYDIS_REGISTER_NONE &&
                       m.base  != ZYDIS_REGISTER_EIP);
@@ -228,7 +234,7 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
     if (!has_base && !has_index) {
         // MOV R14D, imm32
         e.emit8(0x41); e.emit8(uint8_t(0xB8u + R14_REG)); e.emit32((uint32_t)disp);
-        return true;
+        goto apply_segment;
     }
 
     // --- Base only (no index) ---
@@ -241,19 +247,19 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
             if (base_enc == 5) {
                 e.emit8(REX_R14); e.emit8(0x8D);
                 e.emit8(uint8_t(0x40u | (R14_REG << 3) | 5u)); e.emit8(0);
-                return true;
+                goto apply_segment;
             }
             // ESP special: rm=100 requires SIB
             if (base_enc == 4) {
                 e.emit8(REX_R14); e.emit8(0x8D);
                 e.emit8(uint8_t((R14_REG << 3) | 4u)); // mod=00 rm=4
                 e.emit8(0x24); // SIB: scale=0 index=4(none) base=4(ESP)
-                return true;
+                goto apply_segment;
             }
             // Simple: MOV R14D, base_reg  (mod=11)
             e.emit8(REX_R14); e.emit8(0x8B);
             e.emit8(uint8_t(0xC0u | (R14_REG << 3) | base_enc));
-            return true;
+            goto apply_segment;
         }
 
         bool d8   = (disp >= -128 && disp <= 127);
@@ -269,48 +275,62 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         }
         if (d8) e.emit8((uint8_t)(int8_t)disp);
         else    e.emit32((uint32_t)disp);
-        return true;
+        goto apply_segment;
     }
 
     // --- Has index (and possibly base) ---
-    uint8_t index_enc;
-    if (!reg32_enc(m.index, index_enc)) return false;
-    if (index_enc == 4) return false; // ESP cannot be index
+    {
+        uint8_t index_enc;
+        if (!reg32_enc(m.index, index_enc)) return false;
+        if (index_enc == 4) return false; // ESP cannot be index
 
-    uint8_t scale_enc;
-    switch (m.scale) {
-        case 2:  scale_enc = 1; break;
-        case 4:  scale_enc = 2; break;
-        case 8:  scale_enc = 3; break;
-        default: scale_enc = 0; break;
-    }
+        uint8_t scale_enc;
+        switch (m.scale) {
+            case 2:  scale_enc = 1; break;
+            case 4:  scale_enc = 2; break;
+            case 8:  scale_enc = 3; break;
+            default: scale_enc = 0; break;
+        }
 
-    if (!has_base) {
-        // [index*scale + disp32]: SIB base=101 (no base), mod=00
-        uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | 5u);
+        if (!has_base) {
+            // [index*scale + disp32]: SIB base=101 (no base), mod=00
+            uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | 5u);
+            e.emit8(REX_R14); e.emit8(0x8D);
+            e.emit8(uint8_t((R14_REG << 3) | 4u)); // mod=00 rm=4
+            e.emit8(sib);
+            e.emit32((uint32_t)(has_disp ? disp : 0));
+            goto apply_segment;
+        }
+
+        uint8_t base_enc;
+        if (!reg32_enc(m.base, base_enc)) return false;
+
+        uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | base_enc);
+
+        uint8_t mod;
+        if (!has_disp || disp == 0)
+            mod = (base_enc == 5) ? 1 : 0; // EBP needs mod=01 even with 0
+        else
+            mod = (disp >= -128 && disp <= 127) ? 1 : 2;
+
         e.emit8(REX_R14); e.emit8(0x8D);
-        e.emit8(uint8_t((R14_REG << 3) | 4u)); // mod=00 rm=4
+        e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u)); // rm=4 → SIB
         e.emit8(sib);
-        e.emit32((uint32_t)(has_disp ? disp : 0));
-        return true;
+        if      (mod == 1) e.emit8((uint8_t)(int8_t)(has_disp ? disp : 0));
+        else if (mod == 2) e.emit32((uint32_t)disp);
     }
 
-    uint8_t base_enc;
-    if (!reg32_enc(m.base, base_enc)) return false;
-
-    uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | base_enc);
-
-    uint8_t mod;
-    if (!has_disp || disp == 0)
-        mod = (base_enc == 5) ? 1 : 0; // EBP needs mod=01 even with 0
-    else
-        mod = (disp >= -128 && disp <= 127) ? 1 : 2;
-
-    e.emit8(REX_R14); e.emit8(0x8D);
-    e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u)); // rm=4 → SIB
-    e.emit8(sib);
-    if      (mod == 1) e.emit8((uint8_t)(int8_t)(has_disp ? disp : 0));
-    else if (mod == 2) e.emit32((uint32_t)disp);
+apply_segment:
+    // If FS/GS segment override, add the segment base from GuestContext.
+    // ADD R14D, DWORD PTR [R13 + seg_ctx_offset]
+    //   REX = 0x45 (REX.R for R14, REX.B for R13)
+    //   opcode = 0x03 (ADD r32, r/m32)
+    //   ModRM: mod=01, reg=R14&7=6, rm=R13&7=5, disp8
+    if (seg_ctx_offset >= 0) {
+        e.emit8(0x45); e.emit8(0x03);
+        e.emit8(uint8_t(0x40u | (6u << 3) | 5u)); // mod=01 reg=6 rm=5
+        e.emit8((uint8_t)seg_ctx_offset);
+    }
     return true;
 }
 

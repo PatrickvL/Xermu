@@ -14,8 +14,8 @@
 ;
 ; FPU/SSE state is saved/restored via FXSAVE/FXRSTOR on entry/exit.
 
-CTX_GUEST_FPU EQU 112
-CTX_HOST_FPU  EQU 624
+CTX_GUEST_FPU EQU 128
+CTX_HOST_FPU  EQU 640
 
 .code
 

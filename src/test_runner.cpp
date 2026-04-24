@@ -98,6 +98,12 @@ int main(int argc, char** argv) {
     memcpy(exec->ram + STACK_TOP, &SENTINEL_EIP, 4);
     exec->ctx.eflags = 0x0000'0202;
 
+    // Segment bases: FS points to a scratch area for tests.
+    // The Xbox kernel uses FS for KPCR; tests can store/load via FS:[offset].
+    static constexpr uint32_t FS_BASE = 0x0007'0000;
+    exec->ctx.fs_base = FS_BASE;
+    exec->ctx.gs_base = 0;
+
     // Register I/O ports.
     exec->register_io(0xE9, nullptr, io_debug_write);
 

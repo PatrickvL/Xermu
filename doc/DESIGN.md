@@ -110,7 +110,7 @@ PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 All instruction classification is driven by a **two-level O(1) dispatch table**:
 
 - **Level 1**: `uint8_t MNEMONIC_CLASS[ZYDIS_MNEMONIC_MAX_VALUE+1]` — maps every
-  Zydis mnemonic enum to a compact `InsnClassId` (0–17). Initialized once by
+  Zydis mnemonic enum to a compact `InsnClassId` (0–18). Initialized once by
   `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
 
 - **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
@@ -138,6 +138,7 @@ Class IDs and their handlers:
 | IC_SSE_MEM    | MOVAPS/ADDPS/MULPS/XORPS/SHUFPS/... (36 SSE1 + 37 MMX; SSE2 gated) | `emit_handler_fpu_mem` (shared) |
 | IC_PUSHFD     | PUSHFD                                   | `emit_handler_pushfd`  |
 | IC_POPFD      | POPFD                                    | `emit_handler_popfd`   |
+| IC_STRING     | MOVSB/W/D, STOSB/W/D, LODSB/W/D, CMPSB/W/D, SCASB/W/D (15 mnemonics) | `emit_handler_string` |
 | IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/LOOPE/LOOPNE/IRETD | (inline in build loop) |
 | IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (stop_reason + RET)    |
 
@@ -190,6 +191,8 @@ and rebuild.
 | `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
 | `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
 | `tests/advanced.asm`  | CMOVcc/SETcc/BT/BSF/BSWAP/SHLD/IMUL (42)        | ✅ ALL PASS   |
+| `tests/string.asm`    | MOVS/STOS/LODS/CMPS/SCAS + REP (36 assertions)  | ✅ ALL PASS   |
+| `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 
 ---
 
@@ -228,7 +231,9 @@ and rebuild.
 - [x] Privileged instruction stop_reason mechanism (replaces UD2 with RET to run loop)
 - [x] I/O port dispatch (IN/OUT emulation with IoPortEntry table)
 - [x] Debug console (port 0xE9 Bochs-style character output)
-- [x] NASM test infrastructure: 6 suites, 271 total assertions, CMake integration
+- [x] String instructions: MOVS/STOS/LODS/CMPS/SCAS with REP/REPE/REPNE (`IC_STRING`)
+- [x] FS/GS segment override support (emit_ea_to_r14 adds segment base from ctx)
+- [x] NASM test infrastructure: 8 suites, 329 total assertions, CMake integration
 
 ---
 
@@ -280,17 +285,23 @@ from the guest stack, then sets host EFLAGS via PUSH RAX + POPFQ.
 **MOVZX/MOVSX register-register** forms now verbatim-copy instead of returning
 failure. The memory-operand path is unchanged.
 
-#### 5.3 String Instructions (REP MOVS/STOS/CMPS/SCAS/LODS)
-**Priority: HIGH** — Used by memcpy/memset/strlen and compiler intrinsics.
-Must be unrolled into a counted dispatch loop at rewrite time so each element
-access goes through the fastmem/MMIO dispatch. See design §2.3 "REP MOVSD"
-example in the preceding discussion.
+#### 5.3 ~~String Instructions (REP MOVS/STOS/CMPS/SCAS/LODS)~~ ✅ DONE
+**Resolved.** 15 string mnemonics (MOVSB/W/D, STOSB/W/D, LODSB/W/D, CMPSB/W/D,
+SCASB/W/D) are handled by `IC_STRING` / `emit_handler_string`. The handler
+captures host EFLAGS (for DF direction bit) via PUSHFQ+POP R14, saves GP regs,
+and calls per-mnemonic C helpers that operate directly on fastmem. REP, REPE,
+and REPNE prefixes are detected via `insn.attributes & ZYDIS_ATTRIB_HAS_REP*`.
+CMPS/SCAS helpers compute arithmetic flags in software; MOVS/STOS/LODS pass
+flags through unchanged. Verified by `tests/string.asm` (36 assertions).
 
-#### 5.4 Segment Register Support (FS/GS Overrides)
-**Priority: HIGH** — The Xbox kernel uses FS for KPCR (Kernel Processor Control
-Region). Currently, `emit_ea_to_r14` rejects FS/GS segment overrides. Fix: add
-a FS/GS base field to `GuestContext`, and emit an ADD of the segment base into
-R14 during EA synthesis when a non-default segment is present.
+#### 5.4 ~~Segment Register Support (FS/GS Overrides)~~ ✅ DONE
+**Resolved.** `emit_ea_to_r14` now handles FS and GS segment overrides.
+`GuestContext` has `fs_base` (offset 108) and `gs_base` (offset 112) fields.
+When a memory operand has an FS or GS segment prefix, `emit_ea_to_r14` computes
+the flat EA as usual, then emits `ADD R14D, [R13 + seg_offset]` to add the
+segment base from the context. Works with all addressing modes (disp-only,
+base, base+disp, base+index*scale+disp). The Xbox kernel uses FS for KPCR.
+Verified by `tests/segment.asm` (22 assertions).
 
 #### 5.5 ~~8-bit and 16-bit Register Operands in Memory Dispatch~~ Partially Done
 **Resolved for MOVZX/MOVSX.** MOVZX/MOVSX r32,[mem8/mem16] now have dedicated
