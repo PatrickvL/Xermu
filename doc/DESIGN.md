@@ -1264,17 +1264,65 @@ The Cubeb stream model maps to the MCPX APU pipeline:
 | GP (Global Processor) | Mix buffer + DSP callback | Global mix, reverb/chorus DSP effects |
 | EP (Encode Processor) | Output stream → host device | Final stereo/5.1 output |
 
+**Mixbin architecture:**
+
+The Xbox APU does **not** mix voices directly to speaker channels.  Instead,
+each voice routes its output to one or more of 32 **mixbins** — numbered
+intermediate accumulation buffers.  The GP DSP program then reads mixbins
+as inputs and writes processed audio to the EP output channels.
+
+Standard mixbin assignments (set by `DirectSound::SetMixBinVolumes`):
+
+| Mixbin | Channel / Purpose |
+|---|---|
+| 0 | Front Left |
+| 1 | Front Right |
+| 2 | Center (5.1 only) |
+| 3 | LFE / Subwoofer (5.1 only) |
+| 4 | Rear Left (surround) |
+| 5 | Rear Right (surround) |
+| 6–19 | Xbox DSP effect sends (reverb, chorus, etc.) |
+| 20–31 | Custom / game-defined |
+
+Each voice descriptor contains a `MixBinVolumes[8]` array specifying
+which mixbins receive output and at what volume (0x0000–0xFFFF linear).
+A typical stereo voice writes to mixbins 0+1; a 3D-positioned voice
+writes to mixbins 0–5 with computed panning coefficients.
+
+**Implementation with Cubeb:**
+
+The Cubeb output stream must be **multi-channel** (not just stereo) to
+preserve the mixbin routing:
+
+1. Query host channel layout via `cubeb_get_preferred_channel_layout()`.
+2. Create output stream with matching channel count (stereo, 5.1, or 7.1).
+3. In the software mixer:
+   - Accumulate each active voice into its target mixbin buffers.
+   - Apply per-voice `MixBinVolumes[]` coefficients during accumulation.
+   - Run a minimal GP stub: sum mixbins 0–5 into the 6-channel output.
+     Mixbins 6–19 (DSP sends) are processed by a software reverb/chorus
+     if enabled, otherwise silently dropped.
+4. Downmix to the host channel count if needed (e.g. 5.1→stereo).
+
+This preserves spatial audio information through the pipeline rather than
+premixing everything to stereo at the VP stage.
+
 Implementation plan:
-1. `cubeb_init()` on xbox_setup(), create a single output stream
-   (48 kHz stereo float32, ~10 ms latency target).
+1. `cubeb_init()` on xbox_setup(), create a multi-channel output stream
+   (48 kHz float32, channel count matching host, ~10 ms latency target).
 2. VP voice activation: when guest writes a voice descriptor with
    `NV_PAPU_VOICE_ON`, add the voice to an internal active-voice list.
    Each voice tracks format (PCM8/PCM16/ADPCM), pitch, volume,
-   and buffer pointer into guest RAM.
+   buffer pointer into guest RAM, and mixbin routing (8 destinations +
+   volumes from the voice descriptor).
 3. GP mixing: the Cubeb data callback (fired from audio thread) iterates
-   active voices, decodes/resamples into a mix buffer, applies 3D
-   panning and volume.  Single lock-free ring buffer for thread safety.
-4. EP output: Cubeb writes the mixed buffer to the host audio device.
+   active voices, decodes/resamples, and accumulates into 32 mixbin
+   buffers weighted by `MixBinVolumes[]`.  Mixbins 0–5 map to output
+   channels; mixbins 6+ feed a software reverb/chorus if present.
+   Single lock-free ring buffer for voice-list thread safety.
+4. EP output: Cubeb writes the final mixed/downmixed buffer to the host
+   audio device.  Downmix matrix applied if host has fewer channels
+   than the active mixbin set (e.g. 5.1→stereo fold-down).
 5. Tick integration: VP voice list scanned each frame (~60 Hz) to
    start/stop voices matching guest state changes.  No per-sample
    emulation of the DSP — software mixing in the Cubeb callback.
