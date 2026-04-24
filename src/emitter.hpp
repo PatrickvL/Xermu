@@ -13,6 +13,8 @@ struct Emitter {
     uint8_t* buf;
     size_t   pos;
     size_t   cap;
+    bool     paging   = false; // true when CR0.PG is set at build time
+    uint32_t fault_eip = 0;    // guest EIP for #PF exit on translate fault
 
     Emitter(uint8_t* b, size_t c) : buf(b), pos(0), cap(c) {}
 
@@ -698,6 +700,74 @@ inline void emit_ccall_arg3_imm(Emitter& e, uint32_t v) {
     // MOV ECX, imm32
     e.emit8(0xB9); e.emit32(v);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// VA→PA translation call emitted inline when paging (CR0.PG) is active.
+//
+// After emit_ea_to_r14() has synthesized the guest VA into R14, this emits
+// a call to translate_va_jit(ctx, VA, is_write) → PA.  If the translation
+// faults (returns ~0u), the trace exits with STOP_PAGE_FAULT.
+//
+// The caller is responsible for saving/restoring GP regs around this if they
+// are live (typically emit_save_all_gp has already been called, or we call
+// it here).
+// ---------------------------------------------------------------------------
+extern "C" uint32_t translate_va_jit(GuestContext*, uint32_t, uint32_t);
+
+// Emit: PUSHFQ → save GP → translate_va_jit(ctx, R14, is_write) →
+//       check fault → MOV R14D,EAX → load GP → POPFQ.
+//
+// Saves/restores both guest flags (RFLAGS) and GP regs around the C call.
+// On fault: writes STOP_PAGE_FAULT + fault_eip to ctx, POPFQs, RETs cleanly.
+// MUST be called BEFORE any emit_save_flags to keep the stack clean on fault.
+inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
+    // Save guest RFLAGS before C call (C ABI clobbers flags)
+    e.emit8(0x9C); // PUSHFQ
+
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);        // arg0 = ctx
+    emit_ccall_arg1_pa(e);         // arg1 = R14D = VA
+    emit_ccall_arg2_imm(e, is_write ? 1 : 0); // arg2 = is_write
+    emit_call_abs(e, reinterpret_cast<void*>(translate_va_jit));
+
+    // Check for fault: EAX == ~0u
+    // CMP EAX, -1  →  83 F8 FF
+    e.emit8(0x83); e.emit8(0xF8); e.emit8(0xFF);
+    // JNE +N (skip fault handler); short jump, patch later
+    e.emit8(0x75);
+    uint8_t* skip = e.cur();
+    e.emit8(0x00); // placeholder
+
+    // Fault path: store STOP_PAGE_FAULT, fault_eip, then exit trace.
+    // MOV DWORD [R13 + 44], STOP_PAGE_FAULT (2)
+    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
+    e.emit8(44);   // stop_reason offset
+    e.emit32(STOP_PAGE_FAULT);
+    // MOV DWORD [R13 + 40], fault_eip
+    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
+    e.emit8(40);   // next_eip offset
+    e.emit32(fault_eip);
+    // Restore GP regs + RFLAGS, then RET (clean stack: only PUSHFQ on it)
+    emit_load_all_gp(e);
+    e.emit8(0x9D); // POPFQ — balance the PUSHFQ
+    e.emit8(0xC3); // RET
+
+    // Patch the JNE skip target
+    *skip = (uint8_t)(e.cur() - skip - 1);
+
+    // Normal path: R14D = EAX (PA)
+    // MOV R14D, EAX  →  41 89 C6
+    e.emit8(0x41); e.emit8(0x89); e.emit8(0xC6);
+    emit_load_all_gp(e);
+    // Restore guest RFLAGS (preserved across C call)
+    e.emit8(0x9D); // POPFQ
+}
+
+// Translate R14 from VA→PA if paging is active. No-op when paging is off.
+// MUST be called BEFORE emit_save_flags to keep the stack clean on fault.
+inline void emit_paging_translate(Emitter& e, bool is_write) {
+    if (e.paging) emit_translate_r14(e, is_write, e.fault_eip);
 }
 
 // ---------------------------------------------------------------------------

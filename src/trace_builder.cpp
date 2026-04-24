@@ -30,14 +30,109 @@ void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
         ctx->mmio->write(pa, value, size_bytes);
 }
 
+// VA→PA page-table walk called from JIT code when paging is enabled.
+// Returns PA on success, ~0u on fault (CR2 set to faulting VA).
+uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
+    auto* ram = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint32_t ram_size = (uint32_t)ctx->ram_size;
+    uint32_t cr3 = ctx->cr3;
+
+    uint32_t pdir_pa = cr3 & 0xFFFFF000u;
+    uint32_t pdi     = (va >> 22) & 0x3FF;
+    uint32_t pti     = (va >> 12) & 0x3FF;
+
+    // Read PDE
+    uint32_t pde_pa = pdir_pa + pdi * 4;
+    if (pde_pa + 4 > ram_size) goto fault;
+    uint32_t pde;
+    memcpy(&pde, ram + pde_pa, 4);
+    if (!(pde & 1)) goto fault;
+
+    // 4 MB page (PS=1)?
+    if (pde & 0x80) {
+        uint32_t pa = (pde & 0xFFC00000u) | (va & 0x003FFFFFu);
+        if (is_write && !(pde & 2)) goto fault;
+        if (!(pde & 0x20) || (is_write && !(pde & 0x40))) {
+            pde |= 0x20;
+            if (is_write) pde |= 0x40;
+            memcpy(ram + pde_pa, &pde, 4);
+        }
+        return pa;
+    }
+
+    // 4 KB page table
+    {
+        uint32_t pt_pa = (pde & 0xFFFFF000u) + pti * 4;
+        if (pt_pa + 4 > ram_size) goto fault;
+        uint32_t pte;
+        memcpy(&pte, ram + pt_pa, 4);
+        if (!(pte & 1)) goto fault;
+        if (is_write && !(pte & 2)) goto fault;
+        uint32_t pa = (pte & 0xFFFFF000u) | (va & 0xFFF);
+        bool need_pde_update = !(pde & 0x20);
+        bool need_pte_update = !(pte & 0x20) || (is_write && !(pte & 0x40));
+        if (need_pde_update) { pde |= 0x20; memcpy(ram + pde_pa, &pde, 4); }
+        if (need_pte_update) {
+            pte |= 0x20;
+            if (is_write) pte |= 0x40;
+            memcpy(ram + pt_pa, &pte, 4);
+        }
+        return pa;
+    }
+
+fault:
+    ctx->cr2 = va;
+    return ~0u;
+}
+
+// Translate a guest address to PA if paging is enabled, otherwise pass through.
+// Used by C helpers that access guest memory by VA.
+static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is_write) {
+    if (ctx->cr0 & 0x80000000u)
+        return translate_va_jit(ctx, addr, is_write ? 1 : 0);
+    return addr;
+}
+
+// Generic guest memory read (handles paging + MMIO).
+static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t size) {
+    uint32_t pa = guest_translate(ctx, addr, false);
+    if (pa < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        switch (size) {
+        case 1: return base[pa];
+        case 2: return *reinterpret_cast<uint16_t*>(base + pa);
+        case 4: return *reinterpret_cast<uint32_t*>(base + pa);
+        }
+    }
+    return ctx->mmio ? ctx->mmio->read(pa, size) : 0xFFFFFFFFu;
+}
+
+// Generic guest memory write (handles paging + MMIO + SMC bump).
+static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, uint32_t size) {
+    uint32_t pa = guest_translate(ctx, addr, true);
+    if (pa < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        switch (size) {
+        case 1: base[pa] = (uint8_t)val;  break;
+        case 2: *reinterpret_cast<uint16_t*>(base + pa) = (uint16_t)val; break;
+        case 4: *reinterpret_cast<uint32_t*>(base + pa) = val;            break;
+        }
+        auto* pv = reinterpret_cast<uint32_t*>(ctx->page_versions);
+        if (pv) pv[pa >> 12]++;
+        return;
+    }
+    if (ctx->mmio) ctx->mmio->write(pa, val, size);
+}
+
 // PUSHFD helper: push EFLAGS onto the guest stack.
 // Called with the captured EFLAGS value in `eflags_val`.
 void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
-    if (esp < ctx->ram_size) {
+    uint32_t pa = guest_translate(ctx, esp, true);
+    if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        *reinterpret_cast<uint32_t*>(base + esp) = eflags_val;
+        *reinterpret_cast<uint32_t*>(base + pa) = eflags_val;
     }
 }
 
@@ -46,16 +141,18 @@ void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
 uint32_t popfd_helper(GuestContext* ctx) {
     uint32_t esp = ctx->gp[GP_ESP];
     ctx->gp[GP_ESP] = esp + 4;
-    if (esp < ctx->ram_size) {
+    uint32_t pa = guest_translate(ctx, esp, false);
+    if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        return *reinterpret_cast<uint32_t*>(base + esp);
+        return *reinterpret_cast<uint32_t*>(base + pa);
     }
     return 0;
 }
 
 // Read a 32-bit value from guest physical memory (or MMIO).
 // Used by JMP/CALL [mem] handlers.
-uint32_t read_guest_mem32(GuestContext* ctx, uint32_t pa) {
+uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
+    uint32_t pa = guest_translate(ctx, addr, false);
     if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return *reinterpret_cast<uint32_t*>(base + pa);
@@ -66,7 +163,8 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t pa) {
 // Write a 32-bit value to guest physical memory (or MMIO).
 // Used by PUSH [mem] and CALL [mem] handlers.
 // Also bumps the SMC page version for the target page.
-void write_guest_mem32(GuestContext* ctx, uint32_t pa, uint32_t val) {
+void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
+    uint32_t pa = guest_translate(ctx, addr, true);
     if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = val;
@@ -169,11 +267,12 @@ void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
 // Returns the byte value to store in AL.
 uint32_t xlatb_helper(GuestContext* ctx) {
     uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
-    if (ea < ctx->ram_size) {
+    uint32_t pa = guest_translate(ctx, ea, false);
+    if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        return base[ea];
+        return base[pa];
     }
-    return ctx->mmio ? ctx->mmio->read(ea, 1) : 0xFF;
+    return ctx->mmio ? ctx->mmio->read(pa, 1) : 0xFF;
 }
 
 // IRETD helper: pop EIP, CS, EFLAGS from guest stack (12 bytes).
@@ -229,18 +328,14 @@ static constexpr uint32_t ARITH_FLAGS_MASK = 0x8D5u; // CF|PF|AF|ZF|SF|OF
 
 uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,
                             uint32_t elem_size, uint32_t rep_mode) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
     uint32_t& esi = ctx->gp[GP_ESI];
     uint32_t& edi = ctx->gp[GP_EDI];
     uint32_t& ecx = ctx->gp[GP_ECX];
 
     auto do_one = [&]() {
-        switch (elem_size) {
-        case 1: *(uint8_t *)(base+edi) = *(uint8_t *)(base+esi); break;
-        case 2: *(uint16_t*)(base+edi) = *(uint16_t*)(base+esi); break;
-        case 4: *(uint32_t*)(base+edi) = *(uint32_t*)(base+esi); break;
-        }
+        uint32_t val = guest_read(ctx, esi, elem_size);
+        guest_write(ctx, edi, val, elem_size);
         esi += dir; edi += dir;
     };
     if (rep_mode == 0) do_one();
@@ -250,18 +345,13 @@ uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,
 
 uint32_t string_stos_helper(GuestContext* ctx, uint32_t eflags,
                             uint32_t elem_size, uint32_t rep_mode) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
     uint32_t eax = ctx->gp[GP_EAX];
     uint32_t& edi = ctx->gp[GP_EDI];
     uint32_t& ecx = ctx->gp[GP_ECX];
 
     auto do_one = [&]() {
-        switch (elem_size) {
-        case 1: *(uint8_t *)(base+edi) = (uint8_t)eax;  break;
-        case 2: *(uint16_t*)(base+edi) = (uint16_t)eax;  break;
-        case 4: *(uint32_t*)(base+edi) = eax;             break;
-        }
+        guest_write(ctx, edi, eax, elem_size);
         edi += dir;
     };
     if (rep_mode == 0) do_one();
@@ -271,17 +361,17 @@ uint32_t string_stos_helper(GuestContext* ctx, uint32_t eflags,
 
 uint32_t string_lods_helper(GuestContext* ctx, uint32_t eflags,
                             uint32_t elem_size, uint32_t rep_mode) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
     uint32_t& eax = ctx->gp[GP_EAX];
     uint32_t& esi = ctx->gp[GP_ESI];
     uint32_t& ecx = ctx->gp[GP_ECX];
 
     auto do_one = [&]() {
+        uint32_t val = guest_read(ctx, esi, elem_size);
         switch (elem_size) {
-        case 1: eax = (eax & 0xFFFFFF00u) | *(uint8_t *)(base+esi); break;
-        case 2: eax = (eax & 0xFFFF0000u) | *(uint16_t*)(base+esi); break;
-        case 4: eax = *(uint32_t*)(base+esi);                        break;
+        case 1: eax = (eax & 0xFFFFFF00u) | (val & 0xFF); break;
+        case 2: eax = (eax & 0xFFFF0000u) | (val & 0xFFFF); break;
+        case 4: eax = val; break;
         }
         esi += dir;
     };
@@ -292,7 +382,6 @@ uint32_t string_lods_helper(GuestContext* ctx, uint32_t eflags,
 
 uint32_t string_cmps_helper(GuestContext* ctx, uint32_t eflags,
                             uint32_t elem_size, uint32_t rep_mode) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
     uint32_t& esi = ctx->gp[GP_ESI];
     uint32_t& edi = ctx->gp[GP_EDI];
@@ -300,12 +389,8 @@ uint32_t string_cmps_helper(GuestContext* ctx, uint32_t eflags,
     uint32_t rf = eflags;
 
     auto do_one = [&]() {
-        uint32_t s = 0, d = 0;
-        switch (elem_size) {
-        case 1: s = *(uint8_t *)(base+esi); d = *(uint8_t *)(base+edi); break;
-        case 2: s = *(uint16_t*)(base+esi); d = *(uint16_t*)(base+edi); break;
-        case 4: s = *(uint32_t*)(base+esi); d = *(uint32_t*)(base+edi); break;
-        }
+        uint32_t s = guest_read(ctx, esi, elem_size);
+        uint32_t d = guest_read(ctx, edi, elem_size);
         rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
         esi += dir; edi += dir;
     };
@@ -324,7 +409,6 @@ uint32_t string_cmps_helper(GuestContext* ctx, uint32_t eflags,
 
 uint32_t string_scas_helper(GuestContext* ctx, uint32_t eflags,
                             uint32_t elem_size, uint32_t rep_mode) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
     uint32_t eax = ctx->gp[GP_EAX];
     uint32_t& edi = ctx->gp[GP_EDI];
@@ -332,11 +416,12 @@ uint32_t string_scas_helper(GuestContext* ctx, uint32_t eflags,
     uint32_t rf = eflags;
 
     auto do_one = [&]() {
-        uint32_t d = 0, s = 0;
+        uint32_t d = guest_read(ctx, edi, elem_size);
+        uint32_t s = 0;
         switch (elem_size) {
-        case 1: s = eax & 0xFFu;     d = *(uint8_t *)(base+edi); break;
-        case 2: s = eax & 0xFFFFu;   d = *(uint16_t*)(base+edi); break;
-        case 4: s = eax;              d = *(uint32_t*)(base+edi); break;
+        case 1: s = eax & 0xFFu;   break;
+        case 2: s = eax & 0xFFFFu; break;
+        case 4: s = eax;           break;
         }
         rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
         edi += dir;
@@ -415,6 +500,7 @@ static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
                                    uint8_t guest_enc, unsigned size_bits,
                                    bool is_load, bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
+    emit_paging_translate(e, /*is_write=*/!is_load);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -444,6 +530,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
                                              uint32_t imm, unsigned size_bits,
                                              bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
+    emit_paging_translate(e, /*is_write=*/true);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -555,6 +642,7 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Memory form: compute EA, bounds check, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    emit_paging_translate(e, /*is_write=*/mem_idx == 0);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -614,6 +702,7 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Memory form — flag-preserving bounds check
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    emit_paging_translate(e, /*is_write=*/mem_idx == 0); // SETcc writes, CMOVcc reads
 
     emit_save_flags(e);                         // PUSHFQ (with alignment fix)
     emit_cmp_r14_r15(e);                        // CMP R14, R15
@@ -694,6 +783,7 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Memory form: compute EA, bounds check, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    emit_paging_translate(e, /*is_write=*/false);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -720,10 +810,10 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
     // PUSH imm8/imm32
     if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         uint32_t imm = (uint32_t)(int32_t)ops[0].imm.value.s;
-        if (save_flags) emit_save_flags(e);
         emit_sub_ctx_esp(e, 4);
         emit_load_esp_to_r14(e);
-
+        emit_paging_translate(e, /*is_write=*/true);
+        if (save_flags) emit_save_flags(e);
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_store_imm32(e, imm);
@@ -749,10 +839,10 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         uint8_t reg_enc = 0;
         if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
 
-        if (save_flags) emit_save_flags(e);
         emit_sub_ctx_esp(e, 4);
         emit_load_esp_to_r14(e);
-
+        emit_paging_translate(e, /*is_write=*/true);
+        if (save_flags) emit_save_flags(e);
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_op(e, reg_enc, 32, false);
@@ -800,9 +890,9 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
         uint8_t reg_enc = 0;
         if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
 
-        if (save_flags) emit_save_flags(e);
         emit_load_esp_to_r14(e);
-
+        emit_paging_translate(e, /*is_write=*/false);
+        if (save_flags) emit_save_flags(e);
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_op(e, reg_enc, 32, true);
@@ -891,9 +981,9 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     e.emit8(gp_offset(GP_ESP));
 
     // Step 2: POP EBP — read dword from [ESP], write to EBP, ESP += 4
-    if (save_flags) emit_save_flags(e);
     emit_load_esp_to_r14(e);
-
+    emit_paging_translate(e, /*is_write=*/false);
+    if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
     emit_fastmem_op(e, GP_EBP, 32, true);
@@ -1055,6 +1145,7 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     unsigned src_bits = ops[1].size; // 8 or 16
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
+    emit_paging_translate(e, /*is_write=*/false);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -1096,6 +1187,7 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     unsigned src_bits = ops[1].size; // 8 or 16
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
+    emit_paging_translate(e, /*is_write=*/false);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -1134,6 +1226,7 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Memory form: compute EA, bounds check, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    emit_paging_translate(e, /*is_write=*/mem_idx == 0);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
@@ -1236,6 +1329,7 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             uint32_t target = pc_after + (uint32_t)(int32_t)op.imm.value.s;
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
+            emit_paging_translate(e, /*is_write=*/true);
             emit_cmp_r14_r15(e);
             uint8_t* oob = emit_jae_fwd(e);
             emit_fastmem_store_imm32(e, pc_after);
@@ -1250,6 +1344,7 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             if (reg32_enc(op.reg.value, enc)) {
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
+                emit_paging_translate(e, /*is_write=*/true);
                 emit_cmp_r14_r15(e);
                 uint8_t* oob = emit_jae_fwd(e);
                 emit_fastmem_store_imm32(e, pc_after);
@@ -1295,6 +1390,7 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     emit_load_esp_to_r14(e);
 
     // Step 3: fastmem check.
+    emit_paging_translate(e, /*is_write=*/false);
     emit_cmp_r14_r15(e);
     uint8_t* slow = emit_jae_fwd(e);
 
@@ -1431,6 +1527,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     if (!emit_buf) { fprintf(stderr, "[trace] code cache full\n"); return nullptr; }
 
     Emitter  e(emit_buf, MAX_TRACE_BYTES);
+    e.paging = (ctx->cr0 & 0x80000000u) != 0;  // CR0.PG at build time
     const uint8_t* pc        = ram + guest_eip;
     uint32_t       guest_pc  = guest_eip;
     const uint32_t page_base = guest_eip & ~0xFFFu;
@@ -1456,6 +1553,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
         }
 
         uint32_t pc_after = guest_pc + insn.length;
+        e.fault_eip = guest_pc; // for paging fault exit stubs
 
         // Look up the instruction's class via O(1) dispatch table
         InsnClassFlags icf = lookup_flags(insn.mnemonic);

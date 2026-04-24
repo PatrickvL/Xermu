@@ -83,6 +83,7 @@ set(TEST_ASM_FILES
     tests/misc.asm
     tests/smc.asm
     tests/interrupt.asm
+    tests/paging.asm
 )
 
 if(NASM_EXECUTABLE)
