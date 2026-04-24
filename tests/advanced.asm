@@ -268,5 +268,72 @@
     or   dl, al                          ; EDX = 0b11 = 3
     ASSERT_EQ edx, 3                     ; 42
 
+; ========================= MUL/DIV [mem] ===================================
+    ; MUL [mem] — unsigned multiply EAX * [mem] → EDX:EAX
+    mov  dword [0x5100], 7
+    mov  eax, 6
+    xor  edx, edx
+    mul  dword [0x5100]                      ; EAX = 42, EDX = 0
+    ASSERT_EQ eax, 42                        ; 43
+    ASSERT_EQ edx, 0                         ; 44
+
+    ; DIV [mem] — unsigned divide EDX:EAX / [mem] → EAX=quotient, EDX=remainder
+    mov  dword [0x5104], 5
+    mov  eax, 17
+    xor  edx, edx
+    div  dword [0x5104]                      ; EAX=3, EDX=2
+    ASSERT_EQ eax, 3                         ; 45
+    ASSERT_EQ edx, 2                         ; 46
+
+    ; IMUL r, [mem] — signed multiply
+    mov  dword [0x5108], 0xFFFFFFFE          ; -2
+    mov  eax, 0
+    mov  ecx, 10
+    imul ecx, [0x5108]                       ; ECX = 10 * (-2) = -20 = 0xFFFFFFEC
+    ASSERT_EQ ecx, 0xFFFFFFEC               ; 47
+
+    ; IMUL r, [mem], imm — three-operand signed multiply
+    mov  dword [0x510C], 7
+    imul ecx, [0x510C], 8                    ; ECX = 7 * 8 = 56
+    ASSERT_EQ ecx, 56                        ; 48
+    mov  eax, 0
+
+; ========================= SETcc [mem] =====================================
+    mov  eax, 5
+    cmp  eax, 5
+    sete byte [0x5110]                       ; ZF=1, so [0x5110] = 1
+    movzx ecx, byte [0x5110]
+    ASSERT_EQ ecx, 1                         ; 49
+
+    cmp  eax, 6
+    sete byte [0x5110]                       ; ZF=0, so [0x5110] = 0
+    movzx ecx, byte [0x5110]
+    ASSERT_EQ ecx, 0                         ; 50
+    mov  eax, 0
+
+; ========================= CMOVcc r, [mem] =================================
+    mov  dword [0x5114], 0xDEAD
+    mov  ecx, 0x1234
+    xor  eax, eax
+    cmp  eax, eax                            ; ZF=1
+    cmovz ecx, [0x5114]                      ; should move (ZF=1)
+    ASSERT_EQ ecx, 0xDEAD                    ; 51
+
+    mov  ecx, 0x1234
+    cmp  eax, 1                              ; ZF=0
+    cmovz ecx, [0x5114]                      ; should NOT move (ZF=0)
+    ASSERT_EQ ecx, 0x1234                    ; 52
+    mov  eax, 0
+
+; ========================= IDIV [mem] ======================================
+    ; IDIV [mem] — signed divide: -17 / 5 = -3 remainder -2
+    mov  dword [0x5118], 5
+    mov  eax, -17                            ; 0xFFFFFFEF
+    mov  edx, -1                             ; sign-extend to EDX:EAX = -17
+    idiv dword [0x5118]                      ; EAX = -3, EDX = -2
+    ASSERT_EQ eax, 0xFFFFFFFD               ; 53 — quotient = -3
+    ASSERT_EQ edx, 0xFFFFFFFE               ; 54 — remainder = -2
+    mov  eax, 0
+
 ; ============================== PASS =======================================
     PASS
