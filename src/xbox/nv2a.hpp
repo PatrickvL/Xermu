@@ -97,6 +97,12 @@ struct Nv2aState {
     MethodHandler method_handler = nullptr;
     void*         method_user    = nullptr;
 
+    // FIFO thread notification — called when DMA_PUT or enable registers
+    // are written so the NV2A processing thread can wake up.
+    using FifoNotify = void(*)(void* user);
+    FifoNotify fifo_notify      = nullptr;
+    void*      fifo_notify_user = nullptr;
+
     void tick_fifo(const uint8_t* ram, uint32_t ram_size_bytes) {
         if (!(pfifo_cache1_dma_push & 1)) return;
         if (!(pfifo_cache1_push0 & 1)) return;
@@ -239,11 +245,11 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off == 0x002140) { nv->pfifo_intr_en = val; return; }
     if (off == 0x002500) { nv->pfifo_caches = val; return; }
     if (off == 0x002504) { nv->pfifo_mode = val; return; }
-    if (off == 0x003200) { nv->pfifo_cache1_push0 = val; return; }
+    if (off == 0x003200) { nv->pfifo_cache1_push0 = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
     if (off == 0x003210) { nv->pfifo_cache1_push1 = val; return; }
-    if (off == 0x003220) { nv->pfifo_cache1_dma_push = val; return; }
-    if (off == 0x003240) { nv->pfifo_cache1_dma_put = val; return; }
-    if (off == 0x003244) { nv->pfifo_cache1_dma_get = val; return; }
+    if (off == 0x003220) { nv->pfifo_cache1_dma_push = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
+    if (off == 0x003240) { nv->pfifo_cache1_dma_put = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
+    if (off == 0x003244) { nv->pfifo_cache1_dma_get = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
     if (off == 0x003250) { nv->pfifo_cache1_pull0 = val; return; }
     if (off == 0x400100) { nv->pgraph_intr &= ~val; return; }
     if (off == 0x400140) { nv->pgraph_intr_en = val; return; }

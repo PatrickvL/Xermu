@@ -9,6 +9,7 @@
 
 #include "xbox/address_map.hpp"
 #include "xbox/nv2a.hpp"
+#include "xbox/nv2a_thread.hpp"
 #include "xbox/pgraph.hpp"
 #include "xbox/apu.hpp"
 #include "xbox/ide.hpp"
