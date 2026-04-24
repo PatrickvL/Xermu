@@ -236,6 +236,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
 | `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC (33)    | ✅ ALL PASS   |
 | `tests/smc.asm`       | Self-modifying code: patch imm/opcode/jmp/alu (11) | ✅ ALL PASS   |
+| `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
 
 ---
 
@@ -445,24 +446,38 @@ Design options:
 The software TLB approach is simpler to implement first; shadow PT can be added
 as an optimization later.
 
-#### 5.12 Interrupt / Exception Delivery
-**Priority: CRITICAL for kernel** — The Xbox kernel depends on:
-- Hardware IRQs (GPU vsync, APU, USB, IDE, timer)
-- Page faults (#PF → cr2 + IDT dispatch)
-- General protection faults (#GP)
-- Breakpoint/debug exceptions (#BP, #DB)
+#### 5.12 ~~Interrupt / Exception Delivery~~ ✅ DONE
+**Resolved.** Full IDT-based interrupt delivery for software interrupts (INT n),
+debug traps (INT3/INT1), and hardware IRQs.
 
-Implementation:
-1. Device threads set `pending_irq_bitmap |= (1 << irq_line)`
-2. Run loop checks at trace boundaries: if `pending && virtual_if`, deliver
-   highest-priority interrupt
-3. `deliver_interrupt()`: push `{EFLAGS, CS, EIP}` onto guest stack, clear
-   virtual IF, look up IDT entry, set `ctx->eip` to ISR entry point
+**Key changes:**
+- **`halted` vs `virtual_if`**: Separated the two concepts. `halted` controls the
+  run loop (`while (!ctx.halted)`); `virtual_if` is the guest IF flag (cleared by
+  CLI, set by STI, cleared by interrupt gates, restored by IRETD). Previously
+  both used `virtual_if`, so CLI halted the executor.
+- **`deliver_interrupt(vector, return_eip, has_error, error_code)`**: Reads the
+  8-byte gate descriptor from guest IDT (`idtr_base + vector*8`), pushes an
+  interrupt frame (EFLAGS, CS, EIP, optional error code) onto the guest stack,
+  clears IF for interrupt gates (type 0xE), and sets `ctx.eip` to the handler.
+  The saved EFLAGS includes the correct IF state (merged from `virtual_if`).
+- **Trampoline EFLAGS save/restore**: `dispatch_trace` now saves host RFLAGS to
+  `ctx->eflags` on trace exit and restores it on trace entry. This ensures flags
+  survive across trace boundaries (critical for IRETD restoring CF/ZF/etc. that
+  the next trace may read). Both MASM and GCC inline-asm trampolines updated.
+- **`emit_save_eflags()`**: New emitter helper; used before STOP_PRIVILEGED traps
+  to snapshot host RFLAGS into `ctx->eflags` so `deliver_interrupt()` pushes the
+  correct guest flags (e.g. CF set by STC before INT).
+- **`iret_helper`**: Now restores `ctx->virtual_if` from the IF bit of the popped
+  EFLAGS, so interrupt enable state is correctly restored on IRETD.
+- **Hardware IRQs**: `pending_irq` bitmap in Executor, checked at trace boundaries.
+  Lowest-numbered pending line is delivered as vector `0x20 + irq` (PIC mapping)
+  when `virtual_if == true`. `raise_irq(n)` sets the bit.
+- **INT handlers**: INT n delivers through IDT (was stub/halt). INT3 → vector 3.
+  INTO → vector 4 if OF set. CLI/STI only toggle `virtual_if` (don't halt).
 
-For exceptions (synchronous): the instruction emitter can detect fault
-conditions (e.g., page-not-present during TLB walk) and emit an inline exception
-delivery sequence, or return to the run loop with an exception code that triggers
-delivery before the next trace.
+Test suite: `tests/interrupt.asm` — 9 assertions covering INT→ISR→IRETD roundtrip,
+chained interrupts, nested interrupts (ISR calls INT), CLI/STI continuation,
+INT3 dispatch, stack integrity, and EFLAGS (CF) preservation across interrupt.
 
 #### 5.13 ~~SMC Write-Side Version Bumping~~ ✅ DONE
 
@@ -502,7 +517,7 @@ scratch — replaced with `emit_fastmem_store_imm32` (imm-to-mem, no clobber).
 
 ### Phase 3: Xbox Hardware
 
-#### 5.14 Xbox Physical Address Map
+#### 5.15 Xbox Physical Address Map
 ```
 Guest PA          Size       Type
 ──────────────────────────────────────────

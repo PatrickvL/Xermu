@@ -56,8 +56,21 @@ dispatch_trace PROC
     mov     esi, DWORD PTR [r13+24]
     mov     edi, DWORD PTR [r13+28]
 
+    ; Restore guest EFLAGS into host RFLAGS.
+    ; R14 still holds host_code, so use the stack.
+    push    r14                             ; save host_code
+    mov     r14d, DWORD PTR [r13+36]        ; R14D = ctx->eflags
+    push    r14
+    popfq                                   ; load guest EFLAGS
+    pop     r14                             ; restore host_code
+
     ; Dispatch into trace (ends with RET back here)
     call    r14
+
+    ; Save guest EFLAGS from host RFLAGS.
+    pushfq
+    pop     r14                             ; R14 = guest EFLAGS
+    mov     DWORD PTR [r13+36], r14d        ; ctx->eflags = R14D
 
     ; Save guest GP registers back to context
     mov     DWORD PTR [r13+0],  eax

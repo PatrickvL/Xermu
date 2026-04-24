@@ -72,9 +72,22 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         "movl 24(%%r13), %%esi\n\t"
         "movl 28(%%r13), %%edi\n\t"
 
+        // Restore guest EFLAGS into host RFLAGS.
+        // R14 still holds host_code, so use the stack.
+        "push %%r14\n\t"                      // save host_code
+        "movl 36(%%r13), %%r14d\n\t"          // R14D = ctx->eflags
+        "push %%r14\n\t"
+        "popfq\n\t"                            // load guest EFLAGS
+        "pop %%r14\n\t"                        // restore host_code
+
         // ---- Dispatch into trace -----------------------------------------
         // The trace ends with RET, which returns here.
         "call *%%r14\n\t"
+
+        // ---- Save guest EFLAGS from host RFLAGS -------------------------
+        "pushfq\n\t"
+        "pop %%r14\n\t"                        // R14 = guest EFLAGS
+        "movl %%r14d, 36(%%r13)\n\t"          // ctx->eflags
 
         // ---- Save guest GP registers back --------------------------------
         "movl %%eax,  0(%%r13)\n\t"
@@ -126,6 +139,7 @@ bool Executor::init(MmioMap* mmio) {
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
+    ctx.halted       = false;
     ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // SMC write-side
 
     // Initialize guest FPU state to clean defaults.
@@ -165,7 +179,7 @@ void Executor::handle_privileged() {
 
     if (ctx.eip >= GUEST_RAM_SIZE) {
         fprintf(stderr, "[exec] privileged EIP=%08X out of range\n", ctx.eip);
-        ctx.virtual_if = false;
+        ctx.halted = true;
         return;
     }
 
@@ -176,13 +190,13 @@ void Executor::handle_privileged() {
     ZyanStatus st = ZydisDecoderDecodeFull(&decoder, pc, avail, &insn, ops);
     if (!ZYAN_SUCCESS(st)) {
         fprintf(stderr, "[exec] decode failed at privileged EIP=%08X\n", ctx.eip);
-        ctx.virtual_if = false;
+        ctx.halted = true;
         return;
     }
 
     switch (insn.mnemonic) {
     case ZYDIS_MNEMONIC_HLT:
-        ctx.virtual_if = false;
+        ctx.halted = true;
         return;
 
     case ZYDIS_MNEMONIC_CLI:
@@ -358,25 +372,27 @@ void Executor::handle_privileged() {
 
     case ZYDIS_MNEMONIC_INT3:
     case ZYDIS_MNEMONIC_INT1:
-        // Debug traps: log and halt for now (no IDT dispatch yet)
-        fprintf(stderr, "[exec] INT3/INT1 trap at EIP=%08X\n", ctx.eip);
-        ctx.virtual_if = false;
+        // Debug traps: deliver through IDT.
+        // INT3 is vector 3, return address = instruction AFTER the INT3.
+        // INT1 is vector 1.
+        deliver_interrupt(insn.mnemonic == ZYDIS_MNEMONIC_INT3 ? 3 : 1,
+                          ctx.eip + insn.length);
         return;
 
     case ZYDIS_MNEMONIC_INT: {
         // Software interrupt: INT imm8
         uint8_t vector = (uint8_t)ops[0].imm.value.u;
-        fprintf(stderr, "[exec] INT 0x%02X at EIP=%08X\n", vector, ctx.eip);
-        // Stub: halt until interrupt delivery is implemented (§5.12)
-        ctx.virtual_if = false;
+        deliver_interrupt(vector, ctx.eip + insn.length);
         return;
     }
 
     case ZYDIS_MNEMONIC_INTO:
-        // INTO: interrupt on overflow — check OF flag
-        // Stub: log and advance (OF=0 → no trap in most test scenarios)
-        fprintf(stderr, "[exec] INTO at EIP=%08X (stub)\n", ctx.eip);
-        ctx.eip += insn.length;
+        // INTO: interrupt on overflow — deliver vector 4 if OF is set.
+        if (ctx.eflags & 0x800u) {
+            deliver_interrupt(4, ctx.eip + insn.length);
+        } else {
+            ctx.eip += insn.length;
+        }
         return;
 
     case ZYDIS_MNEMONIC_OUT: {
@@ -424,7 +440,7 @@ void Executor::handle_privileged() {
     default:
         fprintf(stderr, "[exec] unhandled privileged mnem=%d at EIP=%08X\n",
                 insn.mnemonic, ctx.eip);
-        ctx.virtual_if = false;
+        ctx.halted = true;
         return;
     }
 }
@@ -460,16 +476,104 @@ void Executor::io_write(uint16_t port, uint32_t val, unsigned size) {
 }
 
 // ---------------------------------------------------------------------------
+// Interrupt / exception delivery through the IDT.
+//
+// Reads the gate descriptor from the guest IDT, pushes an interrupt frame
+// (EFLAGS, CS, EIP, and optionally an error code) onto the guest stack,
+// clears IF for interrupt gates, and sets ctx.eip to the handler.
+//
+// Gate descriptor layout (32-bit protected mode, 8 bytes):
+//   [0..1]  offset bits 0-15
+//   [2..3]  segment selector
+//   [4]     reserved (0)
+//   [5]     type & attributes: P(1) DPL(2) 0(1) gate_type(4)
+//           gate_type: 0xE = 32-bit interrupt gate (clears IF)
+//                      0xF = 32-bit trap gate (leaves IF unchanged)
+//   [6..7]  offset bits 16-31
+// ---------------------------------------------------------------------------
+
+void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
+                                  bool has_error, uint32_t error_code) {
+    uint32_t idt_offset = (uint32_t)vector * 8;
+    if (idt_offset + 7 > ctx.idtr_limit) {
+        fprintf(stderr, "[exec] IDT vector %u exceeds limit (%u)\n",
+                vector, ctx.idtr_limit);
+        ctx.halted = true;
+        return;
+    }
+
+    uint32_t desc_pa = ctx.idtr_base + idt_offset;
+    if (desc_pa + 8 > GUEST_RAM_SIZE) {
+        fprintf(stderr, "[exec] IDT descriptor PA %08X out of range\n", desc_pa);
+        ctx.halted = true;
+        return;
+    }
+
+    // Parse gate descriptor.
+    uint16_t offset_lo, selector, offset_hi;
+    uint8_t  type_attr;
+    memcpy(&offset_lo, ram + desc_pa + 0, 2);
+    memcpy(&selector,  ram + desc_pa + 2, 2);
+    memcpy(&type_attr, ram + desc_pa + 5, 1);
+    memcpy(&offset_hi, ram + desc_pa + 6, 2);
+
+    if (!(type_attr & 0x80)) {
+        fprintf(stderr, "[exec] IDT vector %u not present\n", vector);
+        ctx.halted = true;
+        return;
+    }
+
+    uint32_t handler = ((uint32_t)offset_hi << 16) | offset_lo;
+
+    // Push interrupt frame: EFLAGS, CS, EIP (and optionally error code).
+    // Merge virtual_if into the saved EFLAGS so IRETD can restore it.
+    uint32_t saved_eflags = (ctx.eflags & ~0x200u)
+                          | (ctx.virtual_if ? 0x200u : 0u)
+                          | 0x02u;  // bit 1 always set
+    uint32_t esp = ctx.gp[GP_ESP];
+
+    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &saved_eflags, 4);
+    uint32_t cs_val = (uint32_t)selector;
+    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &cs_val, 4);
+    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &return_eip, 4);
+
+    if (has_error) {
+        esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &error_code, 4);
+    }
+
+    ctx.gp[GP_ESP] = esp;
+
+    // Clear IF for interrupt gates (type nibble == 0xE); trap gates (0xF) leave IF.
+    if ((type_attr & 0x0F) == 0x0E) {
+        ctx.virtual_if = false;
+    }
+
+    ctx.eip = handler;
+}
+
+// ---------------------------------------------------------------------------
 // Run loop
 // ---------------------------------------------------------------------------
 
 void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
-    ctx.eip = entry_eip;
+    ctx.eip    = entry_eip;
+    ctx.halted = false;
 
     uint64_t steps = 0;
 
-    while (ctx.virtual_if) {
+    while (!ctx.halted) {
         if (max_steps && steps >= max_steps) break;
+
+        // Deliver pending hardware IRQs at trace boundaries.
+        if (pending_irq && ctx.virtual_if) {
+            // Find lowest-numbered pending IRQ line.
+            unsigned irq = 0;
+            uint32_t bits = pending_irq;
+            while (!(bits & 1)) { bits >>= 1; ++irq; }
+            pending_irq &= ~(1u << irq);
+            // Map IRQ to IDT vector: PIC-style IRQ 0-15 → vectors 0x20-0x2F.
+            deliver_interrupt(uint8_t(0x20 + irq), ctx.eip);
+        }
 
         uint32_t eip = ctx.eip;
 
@@ -515,6 +619,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Check for HALT condition (EIP == 0 or EIP out of RAM used as sentinel).
         if (ctx.eip == 0xFFFF'FFFFu || ctx.eip >= GUEST_RAM_SIZE) {
             fprintf(stderr, "[exec] EIP=%08X out of range — halting\n", ctx.eip);
+            ctx.halted = true;
             break;
         }
     }

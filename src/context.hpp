@@ -41,7 +41,8 @@ struct alignas(16) GuestContext {
     uint32_t  gdtr_base; uint16_t gdtr_limit; uint16_t _p1;
     uint32_t  idtr_base; uint16_t idtr_limit; uint16_t _p2;
     bool      virtual_if;
-    uint8_t   _pad_vif[3];   // alignment padding
+    bool      halted;
+    uint8_t   _pad_vif[2];   // alignment padding
 
     // Segment base addresses (only FS/GS are typically non-zero in protected mode)
     uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
