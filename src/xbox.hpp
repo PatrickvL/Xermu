@@ -328,12 +328,56 @@ struct SmbusState {
     uint8_t address = 0;
     uint8_t command = 0;
     uint8_t data    = 0;
-    // EEPROM data stub: all zeros except serial number area
+    // Xbox EEPROM (256 bytes) at SMBus address 0x54.
+    // Layout: encrypted section (0x00-0x2F), factory section (0x30-0x4F),
+    //         user section (0x50-0xFF).
     uint8_t eeprom[256] = {};
 
     SmbusState() {
-        // Xbox EEPROM: first 0x30 bytes are encrypted config, rest is game data.
-        // Zero is a valid "empty" state for the stub.
+        init_eeprom();
+    }
+
+    void init_eeprom() {
+        memset(eeprom, 0, sizeof(eeprom));
+        // --- Encrypted section (0x00-0x2F) ---
+        // 0x00-0x13: HMAC hash (leave zero — not validated in HLE mode)
+        // 0x14-0x1B: Confounder (8 bytes)
+        // 0x1C-0x2B: HDD key (16 bytes, leave zero)
+        // 0x2C-0x2F: Game region = 1 (NTSC-NA)
+        eeprom[0x2C] = 0x01; // EEPROM_GAME_REGION: 1=NA, 2=Japan, 4=Europe
+
+        // --- Factory section (0x30-0x4F) ---
+        // 0x30-0x33: Checksum2 (leave zero — not validated in HLE mode)
+        // 0x34-0x3F: Serial number (12 ASCII chars)
+        const char* serial = "000000000000";
+        memcpy(eeprom + 0x34, serial, 12);
+        // 0x40-0x45: MAC address (6 bytes — use locally administered address)
+        eeprom[0x40] = 0x00; eeprom[0x41] = 0x50; eeprom[0x42] = 0xF2;
+        eeprom[0x43] = 0x00; eeprom[0x44] = 0x00; eeprom[0x45] = 0x01;
+        // 0x46-0x47: Reserved
+        // 0x48-0x4B: Online key (leave zero)
+        // 0x4C-0x4F: Video standard: 0x00800100 = NTSC-M
+        eeprom[0x4C] = 0x00; eeprom[0x4D] = 0x01;
+        eeprom[0x4E] = 0x80; eeprom[0x4F] = 0x00;
+
+        // --- User section (0x50-0xFF) ---
+        // 0x50-0x53: Checksum3 (leave zero)
+        // 0x54-0x57: Time zone bias (minutes from UTC, little-endian int32)
+        //            0 = UTC
+        // 0x58-0x97: Time zone standard name (64 bytes, leave empty)
+        // 0x98-0xD7: Time zone daylight name (64 bytes, leave empty)
+        // 0xD8-0xDB: Time zone standard date (leave zero)
+        // 0xDC-0xDF: Time zone daylight date (leave zero)
+        // 0xE0-0xE3: Time zone standard bias (0)
+        // 0xE4-0xE7: Time zone daylight bias (0)
+        // 0xE8-0xEB: Language: 1 = English
+        eeprom[0xE8] = 0x01;
+        // 0xEC-0xEF: Video flags: 0x00 (default widescreen off, letterbox off)
+        // 0xF0-0xF3: Audio flags: 0x00 (stereo)
+        // 0xF4-0xF7: Parental control (0 = off)
+        // 0xF8-0xFB: Parental control password (0)
+        // 0xFC-0xFF: DVD region: 1 = Region 1 (North America)
+        eeprom[0xFC] = 0x01;
     }
 };
 
@@ -355,14 +399,42 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
     case 0x00:
         s->status &= ~(uint8_t)val;  // W1C (write-1-to-clear)
         return;
-    case 0x02: // SMBUS_CONTROL — trigger a transaction
+    case 0x02: { // SMBUS_CONTROL — trigger a transaction
         s->control = (uint8_t)val;
-        // Auto-complete: set status bit 4 (SMBUS_STATUS_DONE)
-        s->status |= 0x10;
-        // If reading from EEPROM (address 0xA9 = read from device 0x54):
-        if (s->address == 0xA9 && s->command < sizeof(s->eeprom))
-            s->data = s->eeprom[s->command];
+        s->status |= 0x10;  // auto-complete: SMBUS_STATUS_DONE
+        uint8_t dev_addr = s->address >> 1; // 7-bit device address
+        bool is_read = (s->address & 1) != 0;
+
+        if (dev_addr == 0x54) {
+            // EEPROM (24C02)
+            if (is_read && s->command < sizeof(s->eeprom))
+                s->data = s->eeprom[s->command];
+            else if (!is_read && s->command < sizeof(s->eeprom))
+                s->eeprom[s->command] = s->data; // byte write
+        } else if (dev_addr == 0x10) {
+            // System Management Controller (PIC16LC / SMC)
+            if (is_read) {
+                switch (s->command) {
+                case 0x01: s->data = 0xD0; break; // SMC_VERSION (v1.0 retail)
+                case 0x03: s->data = 0x60; break; // TRAY_STATE (closed, no disc)
+                case 0x09: s->data = 25;   break; // CPU_TEMP (25°C)
+                case 0x0A: s->data = 35;   break; // MB_TEMP (35°C)
+                case 0x0F: s->data = 0x05; break; // SMC_REVISION
+                case 0x11: s->data = 0x40; break; // AVPACK (composite)
+                default:   s->data = 0;    break;
+                }
+            }
+            // Writes to SMC (LED control, fan speed, etc.) are silently accepted
+        } else if (dev_addr == 0x45) {
+            // Conexant CX25871 video encoder — stub: always succeed
+            if (is_read) s->data = 0;
+        } else if (dev_addr == 0x6A) {
+            // Focus FS454 video encoder (1.4+ Xboxes) — stub
+            if (is_read) s->data = 0;
+        }
+        // All other device addresses: auto-complete with data=0
         return;
+    }
     case 0x04: s->address = (uint8_t)val; return;
     case 0x06: s->data = (uint8_t)val;    return;
     case 0x08: s->command = (uint8_t)val;  return;
