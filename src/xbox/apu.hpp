@@ -1,60 +1,139 @@
 #pragma once
 // MCPX APU register stubs — Voice/Global/Encode Processors.
+//
+// Flat register file indexed by MMIO offset / 4, matching the PGRAPH
+// pattern.  Named constants in the papu:: namespace mirror NV_PAPU_*
+// register offsets from the hardware documentation.
 #include "address_map.hpp"
 #include <cstdint>
 #include <cstring>
 
 namespace xbox {
 
+// ========================== NV_PAPU Register Offsets =======================
+// Offsets are relative to APU_BASE (0xFE800000).
+
+namespace papu {
+
+// Front-end (FE) — command processor
+static constexpr uint32_t ISTS        = 0x1000;  // interrupt status (W1C)
+static constexpr uint32_t IEN         = 0x1004;  // interrupt enable
+static constexpr uint32_t FECTL       = 0x1100;  // FE control (method mode)
+static constexpr uint32_t FECV        = 0x1110;  // FE current voice
+static constexpr uint32_t FEAV        = 0x1118;  // FE active voice
+static constexpr uint32_t FESTATE     = 0x1108;  // FE state
+static constexpr uint32_t FESTATUS    = 0x110C;  // FE status
+static constexpr uint32_t FETFORCE0   = 0x1500;  // FE test force 0
+static constexpr uint32_t FETFORCE1   = 0x1504;  // FE test force 1 (SE2FE_IDLE_VOICE)
+
+// Setup engine (SE) — voice/scatter-gather configuration
+static constexpr uint32_t SECTL       = 0x2000;  // SE control (XCNTMODE)
+static constexpr uint32_t XGSCNT      = 0x200C;  // global sample counter
+static constexpr uint32_t VPVADDR     = 0x202C;  // VP voice list base address
+static constexpr uint32_t VPSGEADDR   = 0x2030;  // VP scatter-gather base
+static constexpr uint32_t VPSSLADDR   = 0x2034;  // VP SSL (sample start list)
+static constexpr uint32_t GPSADDR     = 0x2040;  // GP scratch address
+static constexpr uint32_t GPFADDR     = 0x2044;  // GP frame address
+static constexpr uint32_t EPSADDR     = 0x2048;  // EP scratch address
+static constexpr uint32_t EPFADDR     = 0x204C;  // EP frame address
+
+// Voice list descriptors (2D / 3D / multipass)
+static constexpr uint32_t TVL2D       = 0x2054;  // top voice list 2D
+static constexpr uint32_t CVL2D       = 0x2058;  // current voice list 2D
+static constexpr uint32_t NVL2D       = 0x205C;  // num voices 2D
+static constexpr uint32_t TVL3D       = 0x2060;  // top voice list 3D
+static constexpr uint32_t CVL3D       = 0x2064;  // current voice list 3D
+static constexpr uint32_t NVL3D       = 0x2068;  // num voices 3D
+static constexpr uint32_t TVLMP       = 0x206C;  // top voice list multipass
+static constexpr uint32_t CVLMP       = 0x2070;  // current voice list multipass
+static constexpr uint32_t NVLMP       = 0x2074;  // num voices multipass
+
+// SGE limits
+static constexpr uint32_t GPSMAXSGE   = 0x20D4;  // GP scratch max SGE
+static constexpr uint32_t GPFMAXSGE   = 0x20D8;  // GP frame max SGE
+static constexpr uint32_t EPSMAXSGE   = 0x20DC;  // EP scratch max SGE
+static constexpr uint32_t EPFMAXSGE   = 0x20E0;  // EP frame max SGE
+
+// Global Processor (GP) — DSP
+static constexpr uint32_t GPRST       = 0x3000;  // GP reset
+static constexpr uint32_t GPISTS      = 0x3004;  // GP interrupt status (W1C)
+static constexpr uint32_t GPOFBASE0   = 0x3024;  // GP output FIFO base ch0
+static constexpr uint32_t GPOFEND0    = 0x3028;  // GP output FIFO end  ch0
+static constexpr uint32_t GPOFCUR0    = 0x302C;  // GP output FIFO cur  ch0
+static constexpr uint32_t GPOFBASE1   = 0x3034;  // ch1
+static constexpr uint32_t GPOFEND1    = 0x3038;
+static constexpr uint32_t GPOFCUR1    = 0x303C;
+static constexpr uint32_t GPOFBASE2   = 0x3044;  // ch2
+static constexpr uint32_t GPOFEND2    = 0x3048;
+static constexpr uint32_t GPOFCUR2    = 0x304C;
+static constexpr uint32_t GPOFBASE3   = 0x3054;  // ch3
+static constexpr uint32_t GPOFEND3    = 0x3058;
+static constexpr uint32_t GPOFCUR3    = 0x305C;
+static constexpr uint32_t GPIFBASE0   = 0x3064;  // GP input FIFO base ch0
+static constexpr uint32_t GPIFEND0    = 0x3068;
+static constexpr uint32_t GPIFCUR0    = 0x306C;
+static constexpr uint32_t GPIFBASE1   = 0x3074;  // ch1
+static constexpr uint32_t GPIFEND1    = 0x3078;
+static constexpr uint32_t GPIFCUR1    = 0x307C;
+
+// Encode Processor (EP) — DSP
+static constexpr uint32_t EPRST       = 0x4000;  // EP reset
+static constexpr uint32_t EPISTS      = 0x4004;  // EP interrupt status (W1C)
+static constexpr uint32_t EPOFBASE0   = 0x4024;  // EP output FIFO base
+static constexpr uint32_t EPOFEND0    = 0x4028;
+static constexpr uint32_t EPOFCUR0    = 0x402C;
+static constexpr uint32_t EPIFBASE0   = 0x4064;  // EP input FIFO base
+static constexpr uint32_t EPIFEND0    = 0x4068;
+static constexpr uint32_t EPIFCUR0    = 0x406C;
+
+} // namespace papu
+
+// =========================== APU State =====================================
+
 struct ApuState {
-    uint32_t ists       = 0;
-    uint32_t ien        = 0;
-    uint32_t fectl      = 0;
-    uint32_t fecv       = 0;
-    uint32_t festate    = 0;
-    uint32_t festatus   = 0;
-    uint32_t sectl      = 0;
-    uint32_t sestatus   = 0;
-    uint32_t gprst      = 0;
-    uint32_t gpists     = 0;
-    uint32_t gpsaddr    = 0;
-    uint32_t eprst      = 0;
-    uint32_t epists     = 0;
-    uint32_t epsaddr    = 0;
+    // Flat register file covering MMIO offsets 0x0000..0x4FFF.
+    // Indexed by offset / 4.  Most registers are plain read/write;
+    // W1C and FETFORCE1 idle-bit are handled as special cases.
+    static constexpr uint32_t REG_SPACE = 0x5000;            // 20 KB
+    static constexpr uint32_t REG_COUNT = REG_SPACE / 4;     // 5120 slots
+    uint32_t regs[REG_COUNT] = {};
+
+    uint32_t& reg(uint32_t off)       { return regs[off / 4]; }
+    uint32_t  reg(uint32_t off) const { return regs[off / 4]; }
 };
+
+// ========================== MMIO Handlers ==================================
 
 static uint32_t apu_read(uint32_t pa, unsigned /*size*/, void* user) {
     auto* apu = static_cast<ApuState*>(user);
     uint32_t off = pa - APU_BASE;
-    if (off == 0x1000) return apu->ists;
-    if (off == 0x1004) return apu->ien;
-    if (off == 0x1100) return apu->fectl;
-    if (off == 0x1104) return apu->fecv;
-    if (off == 0x1108) return apu->festate;
-    if (off == 0x110C) return apu->festatus;
-    if (off == 0x2000) return apu->sectl;
-    if (off == 0x200C) return apu->sestatus;
-    if (off == 0x3000) return apu->gprst;
-    if (off == 0x3004) return apu->gpists;
-    if (off == 0x3008) return apu->gpsaddr;
-    if (off == 0x4000) return apu->eprst;
-    if (off == 0x4004) return apu->epists;
-    if (off == 0x4008) return apu->epsaddr;
-    return 0;
+    if (off / 4 >= ApuState::REG_COUNT) return 0;
+
+    uint32_t val = apu->reg(off);
+
+    // FETFORCE1: always report SE2FE_IDLE_VOICE (bit 7) — no actual voice
+    // processing, so the voice processor is always idle.
+    if (off == papu::FETFORCE1) val |= (1u << 7);
+
+    return val;
 }
 
 static void apu_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) {
     auto* apu = static_cast<ApuState*>(user);
     uint32_t off = pa - APU_BASE;
-    if (off == 0x1000) { apu->ists &= ~val; return; }
-    if (off == 0x1004) { apu->ien = val; return; }
-    if (off == 0x1100) { apu->fectl = val; return; }
-    if (off == 0x1108) { apu->festate = val; return; }
-    if (off == 0x2000) { apu->sectl = val; return; }
-    if (off == 0x3000) { apu->gprst = val; return; }
-    if (off == 0x3008) { apu->gpsaddr = val; return; }
-    if (off == 0x4000) { apu->eprst = val; return; }
-    if (off == 0x4008) { apu->epsaddr = val; return; }
+    if (off / 4 >= ApuState::REG_COUNT) return;
+
+    switch (off) {
+    // Write-1-to-clear interrupt status registers
+    case papu::ISTS:
+    case papu::GPISTS:
+    case papu::EPISTS:
+        apu->reg(off) &= ~val;
+        return;
+    default:
+        apu->reg(off) = val;
+        return;
+    }
 }
 
 } // namespace xbox
