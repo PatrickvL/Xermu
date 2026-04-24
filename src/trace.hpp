@@ -16,7 +16,8 @@ struct Trace {
 // Capacity must be a power of two.
 struct TraceCache {
     static constexpr size_t CAPACITY = 1u << 16; // 65536 slots
-    static constexpr uint32_t EMPTY  = 0xFFFF'FFFF;
+    static constexpr uint32_t EMPTY   = 0xFFFF'FFFF;
+    static constexpr uint32_t DELETED = 0xFFFF'FFFE; // tombstone
 
     struct Slot {
         uint32_t key  = EMPTY;
@@ -34,7 +35,8 @@ struct TraceCache {
     // Insert (overwrites existing entry for the same eip).
     void insert(Trace* t) {
         uint32_t h = hash(t->guest_eip);
-        while (slots[h].key != EMPTY && slots[h].key != t->guest_eip)
+        while (slots[h].key != EMPTY && slots[h].key != DELETED &&
+               slots[h].key != t->guest_eip)
             h = (h + 1) & (CAPACITY - 1);
         slots[h] = { t->guest_eip, t };
     }
@@ -54,7 +56,7 @@ struct TraceCache {
         while (slots[h].key != EMPTY) {
             if (slots[h].key == eip) {
                 if (slots[h].trace) slots[h].trace->valid = false;
-                slots[h].key   = EMPTY;
+                slots[h].key   = DELETED;
                 slots[h].trace = nullptr;
                 return;
             }
