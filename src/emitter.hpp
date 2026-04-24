@@ -120,6 +120,17 @@ inline void emit_write_next_eip_imm(Emitter& e, uint32_t eip) {
     e.emit8(0x45); e.emit8(0x89); e.emit8(0x75); e.emit8(40); // MOV [R13+40], R14D
 }
 
+// ---------------------------------------------------------------------------
+// Write ctx->stop_reason = imm32   (offset 44)
+//   MOV DWORD [R13 + 44], imm32
+//   REX.B=1: 0x41  opcode: 0xC7  ModRM: 0x45 (mod=01 /0 rm=5)  disp8: 0x2C
+// ---------------------------------------------------------------------------
+
+inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
+    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45); e.emit8(44);
+    e.emit32(reason);
+}
+
 // Write ctx->next_eip from a guest register already in ctx (via its gp index).
 inline void emit_write_next_eip_gpreg(Emitter& e, uint8_t gp_idx) {
     // The value is already in ctx->gp[gp_idx] after emit_save_all_gp.

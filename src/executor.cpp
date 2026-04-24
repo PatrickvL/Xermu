@@ -1,4 +1,5 @@
 #include "executor.hpp"
+#include <Zydis/Zydis.h>
 #include <cstdio>
 #include <cstring>
 #include <cassert>
@@ -145,13 +146,119 @@ void XboxExecutor::load_guest(uint32_t pa, const void* src, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
-// Privileged instruction handler (stub — expand per opcode as needed).
+// Privileged instruction handler — decode and dispatch HLT, IN, OUT, etc.
+// Called from run loop when a trace exits with STOP_PRIVILEGED.
+// ctx.eip == address of the privileged instruction.
 // ---------------------------------------------------------------------------
 
 void XboxExecutor::handle_privileged() {
-    fprintf(stderr, "[exec] privileged insn at EIP=%08X\n", ctx.eip);
-    // Real implementation: decode ctx.eip, handle RDMSR/WRMSR/IN/OUT/etc.
-    ctx.virtual_if = false; // halt on unhandled privileged insn
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LEGACY_32,
+                     ZYDIS_STACK_WIDTH_32);
+
+    ZydisDecodedInstruction insn;
+    ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+
+    if (ctx.eip >= GUEST_RAM_SIZE) {
+        fprintf(stderr, "[exec] privileged EIP=%08X out of range\n", ctx.eip);
+        ctx.virtual_if = false;
+        return;
+    }
+
+    const uint8_t* pc = ram + ctx.eip;
+    ZyanUSize avail = GUEST_RAM_SIZE - ctx.eip;
+    if (avail > 15) avail = 15;
+
+    ZyanStatus st = ZydisDecoderDecodeFull(&decoder, pc, avail, &insn, ops);
+    if (!ZYAN_SUCCESS(st)) {
+        fprintf(stderr, "[exec] decode failed at privileged EIP=%08X\n", ctx.eip);
+        ctx.virtual_if = false;
+        return;
+    }
+
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_HLT:
+        ctx.virtual_if = false;
+        return;
+
+    case ZYDIS_MNEMONIC_OUT: {
+        // OUT imm8, AL:   ops[0]=imm, ops[1]=reg(AL/AX/EAX)
+        // OUT DX, AL:     ops[0]=DX,  ops[1]=reg(AL/AX/EAX)
+        uint16_t port;
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            port = (uint16_t)ops[0].imm.value.u;
+        else
+            port = (uint16_t)(ctx.gp[GP_EDX] & 0xFFFF);
+
+        unsigned size = ops[1].size / 8;
+        uint32_t value = ctx.gp[GP_EAX];
+        if (size == 1) value &= 0xFF;
+        else if (size == 2) value &= 0xFFFF;
+
+        io_write(port, value, size);
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_IN: {
+        // IN AL, imm8:   ops[0]=reg(AL/AX/EAX), ops[1]=imm
+        // IN AL, DX:     ops[0]=reg(AL/AX/EAX), ops[1]=DX
+        uint16_t port;
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            port = (uint16_t)ops[1].imm.value.u;
+        else
+            port = (uint16_t)(ctx.gp[GP_EDX] & 0xFFFF);
+
+        unsigned size = ops[0].size / 8;
+        uint32_t value = io_read(port, size);
+
+        if (size == 1)
+            ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFu) | (value & 0xFF);
+        else if (size == 2)
+            ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFFFu) | (value & 0xFFFF);
+        else
+            ctx.gp[GP_EAX] = value;
+
+        ctx.eip += insn.length;
+        return;
+    }
+
+    default:
+        fprintf(stderr, "[exec] unhandled privileged mnem=%d at EIP=%08X\n",
+                insn.mnemonic, ctx.eip);
+        ctx.virtual_if = false;
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I/O port dispatch
+// ---------------------------------------------------------------------------
+
+void XboxExecutor::register_io(uint16_t port, IoReadFn read, IoWriteFn write,
+                                void* user) {
+    assert(n_io_ports < MAX_IO_PORTS);
+    io_ports[n_io_ports++] = { port, read, write, user };
+}
+
+uint32_t XboxExecutor::io_read(uint16_t port, unsigned size) {
+    for (int i = 0; i < n_io_ports; ++i) {
+        if (io_ports[i].port == port && io_ports[i].read)
+            return io_ports[i].read(port, size, io_ports[i].user);
+    }
+    fprintf(stderr, "[io] unhandled read  port=%04X size=%u\n", port, size);
+    return 0xFFFFFFFF;
+}
+
+void XboxExecutor::io_write(uint16_t port, uint32_t val, unsigned size) {
+    for (int i = 0; i < n_io_ports; ++i) {
+        if (io_ports[i].port == port && io_ports[i].write) {
+            io_ports[i].write(port, val, size, io_ports[i].user);
+            return;
+        }
+    }
+    fprintf(stderr, "[io] unhandled write port=%04X val=%08X size=%u\n",
+            port, val, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,18 +300,24 @@ void XboxExecutor::run(uint32_t entry_eip, uint64_t max_steps) {
         }
 
         // Execute the trace.
-        ctx.eip = eip;          // snapshot before call (epilog writes next_eip)
+        ctx.eip         = eip;
+        ctx.stop_reason = STOP_NONE;
         dispatch_trace(&ctx, t->host_code);
 
         // Advance EIP to what the trace exit stub wrote.
         ctx.eip = ctx.next_eip;
+        ++steps;
+
+        // Privileged instruction stop: decode and handle in the run loop.
+        if (ctx.stop_reason == STOP_PRIVILEGED) {
+            handle_privileged();
+            continue;
+        }
 
         // Check for HALT condition (EIP == 0 or EIP out of RAM used as sentinel).
         if (ctx.eip == 0xFFFF'FFFFu || ctx.eip >= GUEST_RAM_SIZE) {
             fprintf(stderr, "[exec] EIP=%08X out of range — halting\n", ctx.eip);
             break;
         }
-
-        ++steps;
     }
 }

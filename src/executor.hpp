@@ -11,6 +11,20 @@
 // The Xbox had 64 MB retail / 128 MB devkit.
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
+// ---------------------------------------------------------------------------
+// I/O port dispatch — callbacks for IN/OUT handled by the executor.
+// ---------------------------------------------------------------------------
+
+using IoReadFn  = uint32_t(*)(uint16_t port, unsigned size, void* user);
+using IoWriteFn = void(*)(uint16_t port, uint32_t value, unsigned size, void* user);
+
+struct IoPortEntry {
+    uint16_t   port;
+    IoReadFn   read;
+    IoWriteFn  write;
+    void*      user;
+};
+
 struct XboxExecutor {
     GuestContext   ctx {};
     uint8_t*       ram  = nullptr;   // guest physical RAM [0 .. GUEST_RAM_SIZE)
@@ -20,6 +34,11 @@ struct XboxExecutor {
     TraceArena     arena;
     TraceBuilder   builder;
     PageVersions   pv;
+
+    // I/O port dispatch table (small fixed table — only a handful needed).
+    static constexpr int MAX_IO_PORTS = 16;
+    IoPortEntry io_ports[MAX_IO_PORTS] {};
+    int         n_io_ports = 0;
 
     // -----------------------------------------------------------------------
     bool init(MmioMap* mmio = nullptr);
@@ -32,8 +51,14 @@ struct XboxExecutor {
     // traces have been dispatched (0 = unlimited).
     void run(uint32_t entry_eip, uint64_t max_steps = 0);
 
+    // Register an I/O port handler (read and/or write callback).
+    void register_io(uint16_t port, IoReadFn read, IoWriteFn write,
+                     void* user = nullptr);
+    uint32_t io_read(uint16_t port, unsigned size);
+    void     io_write(uint16_t port, uint32_t val, unsigned size);
+
     // -----------------------------------------------------------------------
-    // Privileged-instruction thunks (called from JIT via UD2 trap or directly).
+    // Privileged-instruction thunks (called from run loop on STOP_PRIVILEGED).
     void handle_privileged();
 };
 

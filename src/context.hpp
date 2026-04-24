@@ -3,6 +3,12 @@
 #include <cstddef>
 #include "mmio.hpp"
 
+// Stop-reason codes: written by JIT into ctx->stop_reason, read by run loop.
+enum StopReason : uint32_t {
+    STOP_NONE       = 0,  // normal trace exit
+    STOP_PRIVILEGED = 1,  // trace hit a privileged instruction (HLT/IN/OUT/...)
+};
+
 // Host reserved registers during trace execution:
 //   R12 = fastmem_base   (uint8_t* to guest PA 0)
 //   R13 = GuestContext*
@@ -22,7 +28,7 @@ struct alignas(16) GuestContext {
     uint32_t  eip;           // [32]
     uint32_t  eflags;        // [36]
     uint32_t  next_eip;      // [40]  written by every trace exit stub
-    uint32_t  _pad0;         // [44]
+    uint32_t  stop_reason;   // [44]  StopReason — set by JIT for privileged stops
 
     uint64_t  fastmem_base;  // [48]  host pointer to guest PA 0
     uint32_t  ram_size;      // [56]  bytes of directly-accessible RAM
