@@ -74,6 +74,8 @@ set(TEST_ASM_FILES
     tests/memory.asm
     tests/flow.asm
     tests/fpu.asm
+    tests/sse.asm
+    tests/advanced.asm
 )
 
 if(NASM_EXECUTABLE)

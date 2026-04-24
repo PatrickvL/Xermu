@@ -6,6 +6,15 @@
 #include <initializer_list>
 
 // ---------------------------------------------------------------------------
+// Target CPU feature level.
+// Xbox original = Pentium III (Coppermine): SSE1 + MMX.  No SSE2.
+// Set XBOX_TARGET_SSE to 2 to enable SSE2+ dispatch for other targets.
+// ---------------------------------------------------------------------------
+#ifndef XBOX_TARGET_SSE
+#define XBOX_TARGET_SSE 1
+#endif
+
+// ---------------------------------------------------------------------------
 // Forward declarations for handler context
 // ---------------------------------------------------------------------------
 
@@ -90,6 +99,14 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
                           GuestContext* ctx, bool save_flags);
 
+bool emit_handler_pushfd(Emitter& e, const ZydisDecodedInstruction& insn,
+                         const ZydisDecodedOperand* ops, const uint8_t* raw,
+                         GuestContext* ctx, bool save_flags);
+
+bool emit_handler_popfd(Emitter& e, const ZydisDecodedInstruction& insn,
+                        const ZydisDecodedOperand* ops, const uint8_t* raw,
+                        GuestContext* ctx, bool save_flags);
+
 // ---------------------------------------------------------------------------
 // Dispatch table — Level 1 maps mnemonic → compact index, Level 2 has class
 // ---------------------------------------------------------------------------
@@ -109,6 +126,9 @@ enum InsnClassId : uint8_t {
     IC_MOVZX_MEM,   // MOVZX r32, [m]
     IC_MOVSX_MEM,   // MOVSX r32, [m]
     IC_FPU_MEM,     // x87 instructions with memory operand forms
+    IC_SSE_MEM,     // SSE/MMX instructions with memory operand forms
+    IC_PUSHFD,      // PUSHFD — push EFLAGS onto guest stack
+    IC_POPFD,       // POPFD — pop EFLAGS from guest stack
     IC_TERMINATOR,  // JMP/CALL/RET/Jcc/LOOP — trace exit
     IC_PRIVILEGED,  // HLT/LGDT/CLI/... — trap
     IC_MAX
@@ -129,6 +149,9 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_MOVZX_MEM  */ { emit_handler_movzx_mem, ICF_HAS_DISPATCH },
     /* IC_MOVSX_MEM  */ { emit_handler_movsx_mem, ICF_HAS_DISPATCH },
     /* IC_FPU_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH },
+    /* IC_SSE_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH }, // same logic
+    /* IC_PUSHFD     */ { emit_handler_pushfd,    ICF_HAS_DISPATCH },
+    /* IC_POPFD      */ { emit_handler_popfd,     ICF_HAS_DISPATCH },
     /* IC_TERMINATOR */ { nullptr,                ICF_TERMINATOR },
     /* IC_PRIVILEGED */ { nullptr,                ICF_PRIVILEGED },
 };
@@ -195,6 +218,10 @@ inline void init_mnemonic_table() {
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_MOVZX]  = IC_MOVZX_MEM;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_MOVSX]  = IC_MOVSX_MEM;
 
+    // ---- PUSHFD / POPFD (guest stack, not host RSP) ----
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_PUSHFD]  = IC_PUSHFD;
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_POPFD]   = IC_POPFD;
+
     // ---- x87 FPU (mnemonics that CAN have memory operand forms) ----
     // Register-only forms are handled by the fallback in the handler
     // (clean copy). Memory forms use the generic rewriter.
@@ -212,6 +239,128 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_FLDENV, ZYDIS_MNEMONIC_FNSTENV,
         ZYDIS_MNEMONIC_FNSTSW,
     }) MNEMONIC_CLASS[m] = IC_FPU_MEM;
+
+    // ---- SSE1 (Pentium III / Xbox CPU) ----
+    // Register-only forms are verbatim-copied; memory forms use the
+    // generic rewriter.  Only single-precision (PS/SS) variants exist.
+    for (auto m : {
+        // Data movement
+        ZYDIS_MNEMONIC_MOVAPS,  ZYDIS_MNEMONIC_MOVUPS,
+        ZYDIS_MNEMONIC_MOVSS,
+        ZYDIS_MNEMONIC_MOVLPS,  ZYDIS_MNEMONIC_MOVHPS,
+        ZYDIS_MNEMONIC_MOVNTPS,
+        // Arithmetic (packed single / scalar single)
+        ZYDIS_MNEMONIC_ADDPS,   ZYDIS_MNEMONIC_ADDSS,
+        ZYDIS_MNEMONIC_SUBPS,   ZYDIS_MNEMONIC_SUBSS,
+        ZYDIS_MNEMONIC_MULPS,   ZYDIS_MNEMONIC_MULSS,
+        ZYDIS_MNEMONIC_DIVPS,   ZYDIS_MNEMONIC_DIVSS,
+        ZYDIS_MNEMONIC_SQRTPS,  ZYDIS_MNEMONIC_SQRTSS,
+        ZYDIS_MNEMONIC_RCPPS,   ZYDIS_MNEMONIC_RCPSS,
+        ZYDIS_MNEMONIC_RSQRTPS, ZYDIS_MNEMONIC_RSQRTSS,
+        ZYDIS_MNEMONIC_MAXPS,   ZYDIS_MNEMONIC_MAXSS,
+        ZYDIS_MNEMONIC_MINPS,   ZYDIS_MNEMONIC_MINSS,
+        // Logical
+        ZYDIS_MNEMONIC_ANDPS,   ZYDIS_MNEMONIC_ANDNPS,
+        ZYDIS_MNEMONIC_ORPS,    ZYDIS_MNEMONIC_XORPS,
+        // Compare
+        ZYDIS_MNEMONIC_CMPPS,   ZYDIS_MNEMONIC_CMPSS,
+        ZYDIS_MNEMONIC_COMISS,  ZYDIS_MNEMONIC_UCOMISS,
+        // Conversion (integer ↔ single)
+        ZYDIS_MNEMONIC_CVTSI2SS,  ZYDIS_MNEMONIC_CVTSS2SI,
+        ZYDIS_MNEMONIC_CVTTSS2SI,
+        ZYDIS_MNEMONIC_CVTPI2PS,  ZYDIS_MNEMONIC_CVTPS2PI,
+        ZYDIS_MNEMONIC_CVTTPS2PI,
+        // Shuffle / unpack
+        ZYDIS_MNEMONIC_SHUFPS,
+        ZYDIS_MNEMONIC_UNPCKLPS, ZYDIS_MNEMONIC_UNPCKHPS,
+        // MXCSR
+        ZYDIS_MNEMONIC_LDMXCSR, ZYDIS_MNEMONIC_STMXCSR,
+    }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
+
+    // ---- MMX / SSE1 integer SIMD (Pentium MMX/III) ----
+    // These mnemonics are shared with SSE2 XMM forms (same Zydis enum);
+    // the handler works for both register widths.
+    for (auto m : {
+        ZYDIS_MNEMONIC_MOVD,    ZYDIS_MNEMONIC_MOVQ,
+        // Arithmetic
+        ZYDIS_MNEMONIC_PADDB,   ZYDIS_MNEMONIC_PADDW,
+        ZYDIS_MNEMONIC_PADDD,
+        ZYDIS_MNEMONIC_PSUBB,   ZYDIS_MNEMONIC_PSUBW,
+        ZYDIS_MNEMONIC_PSUBD,
+        ZYDIS_MNEMONIC_PMULLW,  ZYDIS_MNEMONIC_PMULHW,
+        // Logical
+        ZYDIS_MNEMONIC_PAND,    ZYDIS_MNEMONIC_PANDN,
+        ZYDIS_MNEMONIC_POR,     ZYDIS_MNEMONIC_PXOR,
+        // Compare
+        ZYDIS_MNEMONIC_PCMPEQB, ZYDIS_MNEMONIC_PCMPEQW,
+        ZYDIS_MNEMONIC_PCMPEQD, ZYDIS_MNEMONIC_PCMPGTB,
+        ZYDIS_MNEMONIC_PCMPGTW, ZYDIS_MNEMONIC_PCMPGTD,
+        // Shift
+        ZYDIS_MNEMONIC_PSLLW,   ZYDIS_MNEMONIC_PSLLD,
+        ZYDIS_MNEMONIC_PSLLQ,   ZYDIS_MNEMONIC_PSRLW,
+        ZYDIS_MNEMONIC_PSRLD,   ZYDIS_MNEMONIC_PSRLQ,
+        ZYDIS_MNEMONIC_PSRAW,   ZYDIS_MNEMONIC_PSRAD,
+        // Pack / unpack
+        ZYDIS_MNEMONIC_PACKSSWB, ZYDIS_MNEMONIC_PACKSSDW,
+        ZYDIS_MNEMONIC_PACKUSWB,
+        ZYDIS_MNEMONIC_PUNPCKLBW, ZYDIS_MNEMONIC_PUNPCKLWD,
+        ZYDIS_MNEMONIC_PUNPCKLDQ,
+        ZYDIS_MNEMONIC_PUNPCKHBW, ZYDIS_MNEMONIC_PUNPCKHWD,
+        ZYDIS_MNEMONIC_PUNPCKHDQ,
+        // SSE1 extensions to MMX (Pentium III)
+        ZYDIS_MNEMONIC_PMULHUW,
+        ZYDIS_MNEMONIC_PSHUFW,
+        ZYDIS_MNEMONIC_PMINUB,  ZYDIS_MNEMONIC_PMAXUB,
+        ZYDIS_MNEMONIC_PMINSW,  ZYDIS_MNEMONIC_PMAXSW,
+        ZYDIS_MNEMONIC_PAVGB,   ZYDIS_MNEMONIC_PAVGW,
+        ZYDIS_MNEMONIC_PSADBW,
+        ZYDIS_MNEMONIC_MASKMOVQ,
+        ZYDIS_MNEMONIC_MOVNTQ,
+    }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
+
+#if XBOX_TARGET_SSE >= 2
+    // ---- SSE2 (Pentium 4) — NOT present on Xbox Pentium III ----
+    for (auto m : {
+        // Double-precision float data movement
+        ZYDIS_MNEMONIC_MOVAPD,  ZYDIS_MNEMONIC_MOVUPD,
+        ZYDIS_MNEMONIC_MOVSD,
+        ZYDIS_MNEMONIC_MOVLPD,  ZYDIS_MNEMONIC_MOVHPD,
+        ZYDIS_MNEMONIC_MOVNTPD, ZYDIS_MNEMONIC_MOVNTDQ,
+        ZYDIS_MNEMONIC_MOVDQA,  ZYDIS_MNEMONIC_MOVDQU,
+        // Double-precision arithmetic
+        ZYDIS_MNEMONIC_ADDPD,   ZYDIS_MNEMONIC_ADDSD,
+        ZYDIS_MNEMONIC_SUBPD,   ZYDIS_MNEMONIC_SUBSD,
+        ZYDIS_MNEMONIC_MULPD,   ZYDIS_MNEMONIC_MULSD,
+        ZYDIS_MNEMONIC_DIVPD,   ZYDIS_MNEMONIC_DIVSD,
+        ZYDIS_MNEMONIC_SQRTPD,  ZYDIS_MNEMONIC_SQRTSD,
+        ZYDIS_MNEMONIC_MAXPD,   ZYDIS_MNEMONIC_MAXSD,
+        ZYDIS_MNEMONIC_MINPD,   ZYDIS_MNEMONIC_MINSD,
+        // Double-precision logical
+        ZYDIS_MNEMONIC_ANDPD,   ZYDIS_MNEMONIC_ANDNPD,
+        ZYDIS_MNEMONIC_ORPD,    ZYDIS_MNEMONIC_XORPD,
+        // Double-precision compare
+        ZYDIS_MNEMONIC_CMPPD,   ZYDIS_MNEMONIC_CMPSD,
+        ZYDIS_MNEMONIC_COMISD,  ZYDIS_MNEMONIC_UCOMISD,
+        // Conversion (double / packed-integer)
+        ZYDIS_MNEMONIC_CVTPS2PD,  ZYDIS_MNEMONIC_CVTPD2PS,
+        ZYDIS_MNEMONIC_CVTSS2SD,  ZYDIS_MNEMONIC_CVTSD2SS,
+        ZYDIS_MNEMONIC_CVTPS2DQ,  ZYDIS_MNEMONIC_CVTDQ2PS,
+        ZYDIS_MNEMONIC_CVTTPS2DQ, ZYDIS_MNEMONIC_CVTTPD2DQ,
+        ZYDIS_MNEMONIC_CVTPD2DQ,  ZYDIS_MNEMONIC_CVTDQ2PD,
+        ZYDIS_MNEMONIC_CVTSI2SD,  ZYDIS_MNEMONIC_CVTSD2SI,
+        ZYDIS_MNEMONIC_CVTTSD2SI,
+        // Double-precision shuffle / unpack
+        ZYDIS_MNEMONIC_SHUFPD,
+        ZYDIS_MNEMONIC_UNPCKLPD,  ZYDIS_MNEMONIC_UNPCKHPD,
+        // SSE2-only integer SIMD (XMM register forms)
+        ZYDIS_MNEMONIC_PADDQ,   ZYDIS_MNEMONIC_PSUBQ,
+        ZYDIS_MNEMONIC_PMULUDQ,
+        ZYDIS_MNEMONIC_PUNPCKLQDQ, ZYDIS_MNEMONIC_PUNPCKHQDQ,
+        ZYDIS_MNEMONIC_PSHUFD,  ZYDIS_MNEMONIC_PSHUFHW,
+        ZYDIS_MNEMONIC_PSHUFLW,
+        ZYDIS_MNEMONIC_MASKMOVDQU,
+    }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
+#endif // XBOX_TARGET_SSE >= 2
 }
 
 // O(1) lookup: returns the InsnClassFlags for a mnemonic.
