@@ -243,7 +243,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
 | `tests/paging.asm`    | Page table walk, 4KB/4MB pages, INVLPG (9)         | ✅ ALL PASS   |
 | `tests/xbox.asm`      | Xbox address map: RAM mirror, PCI, NV2A, Flash (9) | ✅ ALL PASS   |
-| `tests/hle.asm`       | HLE kernel stubs: thread, memory, handle (4)       | ✅ ALL PASS   |
+| `tests/hle.asm`       | HLE kernel stubs: timing, sync, memory (11)        | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
 | `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
@@ -711,13 +711,18 @@ Implemented in `src/xbe_loader.hpp`:
   - I/O: `NtClose` (stub)
   - Display: `AvSetDisplayMode`, `AvGetSavedDataAddress` (stubs)
   - System: `HalReturnToFirmware` (halts guest), `DbgPrint`, `RtlInitAnsiString`
+  - Timing: `KeQueryPerformanceCounter` (host RDTSC), `KeQueryPerformanceFrequency`
+    (733 MHz), `KeQuerySystemTime` (RDTSC-derived 100 ns units)
+  - Synchronisation: `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`,
+    `RtlLeaveCriticalSection` (single-threaded stubs)
+  - Timers: `KeSetTimer`, `KeSetTimerEx`, `KeCancelTimer`, `KeInitializeDpc` (stubs)
   - Unhandled ordinals: log + return `STATUS_NOT_IMPLEMENTED`
 - **stdcall cleanup**: args are removed from guest stack by relocating the
   return address before the stub's RET instruction.
 
 Test runner `--xbox` mode writes HLE stubs to guest RAM and installs the handler.
-`tests/hle.asm` exercises 4 kernel calls: `KeGetCurrentThread`,
-`MmGetPhysicalAddress`, `NtClose`, `ExAllocatePool`.
+`tests/hle.asm` exercises 11 kernel calls: memory, threading, timing,
+synchronisation, and timer stubs.
 
 #### 5.20 Kernel HLE or LLE
 Two paths:

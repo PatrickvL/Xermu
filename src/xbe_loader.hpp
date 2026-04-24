@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace xbe {
 
@@ -329,6 +332,13 @@ enum KernelOrdinal : uint32_t {
     ORD_ExFreePool                     = 17,
     ORD_HalReturnToFirmware            = 49,
     ORD_KeGetCurrentThread             = 104,
+    ORD_KeInitializeDpc                = 107,
+    ORD_KeQueryPerformanceCounter      = 126,
+    ORD_KeQueryPerformanceFrequency    = 127,
+    ORD_KeQuerySystemTime              = 131,
+    ORD_KeSetTimer                     = 145,
+    ORD_KeSetTimerEx                   = 146,
+    ORD_KeCancelTimer                  = 96,
     ORD_KeTickCount                    = 156,
     ORD_MmAllocateContiguousMemory     = 165,
     ORD_MmAllocateContiguousMemoryEx   = 166,
@@ -339,7 +349,10 @@ enum KernelOrdinal : uint32_t {
     ORD_NtFreeVirtualMemory            = 199,
     ORD_PsCreateSystemThread           = 254,
     ORD_PsTerminateSystemThread        = 258,
+    ORD_RtlEnterCriticalSection        = 264,
+    ORD_RtlLeaveCriticalSection        = 267,
     ORD_RtlInitAnsiString             = 268,
+    ORD_RtlInitializeCriticalSection   = 270,
     ORD_XeLoadSection                  = 327,
 };
 
@@ -464,6 +477,78 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         exec.ctx.gp[GP_EAX] = 0x00060000u;
         return true;
 
+    case ORD_KeCancelTimer:
+        // BOOLEAN KeCancelTimer(PKTIMER Timer)
+        // Return FALSE (timer was not in the queue)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_KeInitializeDpc:
+        // void KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context)
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeQueryPerformanceCounter: {
+        // ULONGLONG KeQueryPerformanceCounter()
+        // Returns 64-bit counter in EDX:EAX.  Use host rdtsc scaled to
+        // approximate the Xbox Pentium III 733 MHz TSC.
+        uint64_t tsc;
+#if defined(_MSC_VER)
+        tsc = __rdtsc();
+#else
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        tsc = ((uint64_t)hi << 32) | lo;
+#endif
+        exec.ctx.gp[GP_EAX] = (uint32_t)tsc;
+        exec.ctx.gp[GP_EDX] = (uint32_t)(tsc >> 32);
+        return true;
+    }
+
+    case ORD_KeQueryPerformanceFrequency: {
+        // ULONGLONG KeQueryPerformanceFrequency()
+        // Xbox Pentium III runs at 733.33 MHz → report that as the frequency.
+        uint64_t freq = 733333333ULL;
+        exec.ctx.gp[GP_EAX] = (uint32_t)freq;
+        exec.ctx.gp[GP_EDX] = (uint32_t)(freq >> 32);
+        return true;
+    }
+
+    case ORD_KeQuerySystemTime: {
+        // void KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
+        // Write a monotonic 100ns-unit timestamp to the caller's buffer.
+        uint32_t ptr = stack_arg(exec, 0);
+        if (ptr + 8 <= GUEST_RAM_SIZE) {
+            // Use the NV2A PTIMER ns counter as our time source (already
+            // advancing in hw_tick_callback). Scale: 1 unit = 100ns.
+            // Fallback: just use host rdtsc / 10 if no NV2A context.
+            uint64_t time_100ns;
+#if defined(_MSC_VER)
+            time_100ns = __rdtsc() / 10;
+#else
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            time_100ns = (((uint64_t)hi << 32) | lo) / 10;
+#endif
+            memcpy(exec.ram + ptr, &time_100ns, 8);
+        }
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_KeSetTimer:
+        // BOOLEAN KeSetTimer(PKTIMER, LARGE_INTEGER DueTime, PKDPC Dpc)
+        exec.ctx.gp[GP_EAX] = 0; // was not already in queue
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeSetTimerEx:
+        // BOOLEAN KeSetTimerEx(PKTIMER, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        return true;
+
     case ORD_KeTickCount:
         // This is actually a variable, not a function. Return a counter.
         exec.ctx.gp[GP_EAX] = 1;
@@ -477,6 +562,22 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     case ORD_PsTerminateSystemThread:
         exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlEnterCriticalSection:
+        // void RtlEnterCriticalSection(PRTL_CRITICAL_SECTION)
+        // Single-threaded stub: always succeeds immediately.
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlLeaveCriticalSection:
+        // void RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlInitializeCriticalSection:
+        // void RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION)
         stdcall_cleanup(exec, 1);
         return true;
 
