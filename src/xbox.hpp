@@ -12,6 +12,8 @@
 //   0xFD00_0000       16 MB      NV2A GPU registers (MMIO)
 //   0xFE80_0000        4 MB      APU / AC97 (MMIO)
 //   0xFEC0_0000        4 KB      I/O APIC (MMIO)
+//   0xFED0_0000        4 KB      USB OHCI #0 (MMIO)
+//   0xFED0_8000        4 KB      USB OHCI #1 (MMIO)
 //   0xFF00_0000        1 MB      BIOS shadow
 //
 //   I/O ports:
@@ -54,6 +56,11 @@ static constexpr uint32_t APU_SIZE          = 0x00400000u;  // 4 MB
 
 static constexpr uint32_t IOAPIC_BASE       = 0xFEC00000u;
 static constexpr uint32_t IOAPIC_SIZE       = 0x00001000u;  // 4 KB
+
+static constexpr uint32_t USB0_BASE         = 0xFED00000u;
+static constexpr uint32_t USB0_SIZE         = 0x00001000u;  // 4 KB
+static constexpr uint32_t USB1_BASE         = 0xFED08000u;
+static constexpr uint32_t USB1_SIZE         = 0x00001000u;  // 4 KB
 
 static constexpr uint32_t BIOS_BASE         = 0xFF000000u;
 static constexpr uint32_t BIOS_SIZE         = 0x00100000u;  // 1 MB
@@ -578,6 +585,128 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
             ch->lba_mid    = 0x00;
             ch->lba_high   = 0x00;
             ch->device     = 0x00;
+        }
+        break;
+    }
+}
+
+// ============================= USB (OHCI) ==================================
+// Two OHCI USB host controllers (PCI Dev 4 and Dev 5).
+// Each has a 4 KB MMIO register space mapped at USB0_BASE / USB1_BASE.
+//
+// The Xbox has 4 gamepad ports.  Ports 1-2 → USB0, ports 3-4 → USB1.
+// For HLE-mode games, input is typically provided via XInput HLE stubs,
+// so the OHCI controller only needs minimal register stubs for kernel
+// bring-up (BIOS/kernel probes revision, resets controller, checks status).
+//
+// OHCI register map (relevant subset):
+//   0x00  HcRevision        — spec revision (0x0110 = OHCI 1.1)
+//   0x04  HcControl         — host controller state (USB operational, etc.)
+//   0x08  HcCommandStatus   — command/status (host controller reset bit 0)
+//   0x0C  HcInterruptStatus — interrupt event bits (W1C)
+//   0x10  HcInterruptEnable — interrupt enable mask
+//   0x14  HcInterruptDisable— write-only: clears enable bits
+//   0x18  HcHCCA            — host controller communication area pointer
+//   0x24  HcControlHeadED   — head of control ED list
+//   0x28  HcControlCurrentED— current control ED
+//   0x2C  HcBulkHeadED      — head of bulk ED list
+//   0x30  HcBulkCurrentED   — current bulk ED
+//   0x34  HcDoneHead        — done queue head
+//   0x38  HcFmInterval      — frame interval (bit-time count)
+//   0x3C  HcFmRemaining     — remaining bit-times in frame
+//   0x40  HcFmNumber        — frame number counter
+//   0x44  HcPeriodicStart   — periodic list start threshold
+//   0x48  HcRhDescriptorA   — root hub descriptor A (NDP = # downstream ports)
+//   0x4C  HcRhDescriptorB   — root hub descriptor B
+//   0x50  HcRhStatus        — root hub status
+//   0x54+ HcRhPortStatus[N] — per-port status (4 bytes each)
+
+struct OhciState {
+    // Register file: 256 bytes covers all standard OHCI registers.
+    uint32_t regs[64] = {};
+
+    // Register offsets (byte offsets, divide by 4 for index).
+    static constexpr uint32_t HC_REVISION         = 0x00;
+    static constexpr uint32_t HC_CONTROL          = 0x04;
+    static constexpr uint32_t HC_COMMAND_STATUS   = 0x08;
+    static constexpr uint32_t HC_INTERRUPT_STATUS = 0x0C;
+    static constexpr uint32_t HC_INTERRUPT_ENABLE = 0x10;
+    static constexpr uint32_t HC_INTERRUPT_DISABLE= 0x14;
+    static constexpr uint32_t HC_FM_INTERVAL      = 0x38;
+    static constexpr uint32_t HC_FM_REMAINING     = 0x3C;
+    static constexpr uint32_t HC_FM_NUMBER        = 0x40;
+    static constexpr uint32_t HC_PERIODIC_START   = 0x44;
+    static constexpr uint32_t HC_RH_DESCRIPTOR_A  = 0x48;
+    static constexpr uint32_t HC_RH_STATUS        = 0x50;
+    static constexpr uint32_t HC_RH_PORT_STATUS0  = 0x54;
+
+    uint32_t num_ports;  // 2 ports per controller
+
+    void init(uint32_t ports = 2) {
+        memset(regs, 0, sizeof(regs));
+        num_ports = ports;
+        regs[HC_REVISION >> 2]        = 0x00000110; // OHCI 1.1
+        regs[HC_CONTROL >> 2]         = 0x00000000; // USBReset state
+        regs[HC_FM_INTERVAL >> 2]     = 0x27782EDF; // default: 11999 bit-times, FSLargestDataPacket
+        regs[HC_RH_DESCRIPTOR_A >> 2] = ports & 0xFF; // NDP = number of downstream ports
+    }
+};
+
+static uint32_t ohci_read(uint32_t pa, unsigned size, void* user) {
+    auto* ohci = static_cast<OhciState*>(user);
+    uint32_t off = pa & 0xFFF;
+    if (off >= sizeof(ohci->regs)) return 0;
+    uint32_t val = ohci->regs[off >> 2];
+
+    // HcFmRemaining: return a decrementing value (approximate)
+    if (off == OhciState::HC_FM_REMAINING)
+        val = 0x2710; // ~10000 bit-times remaining (arbitrary, non-zero)
+
+    return val;
+}
+
+static void ohci_write(uint32_t pa, uint32_t val, unsigned size, void* user) {
+    auto* ohci = static_cast<OhciState*>(user);
+    uint32_t off = pa & 0xFFF;
+    if (off >= sizeof(ohci->regs)) return;
+
+    switch (off) {
+    case OhciState::HC_COMMAND_STATUS:
+        // Bit 0 = HostControllerReset: auto-clears, resets controller.
+        if (val & 1) {
+            uint32_t ports = ohci->num_ports;
+            ohci->init(ports);
+        }
+        // Bits 1-3: ControlListFilled, BulkListFilled, OwnershipChangeRequest — accept
+        ohci->regs[off >> 2] |= (val & ~1u);
+        break;
+
+    case OhciState::HC_INTERRUPT_STATUS:
+        // W1C: clear bits that are written as 1.
+        ohci->regs[off >> 2] &= ~val;
+        break;
+
+    case OhciState::HC_INTERRUPT_DISABLE:
+        // Write-only: clears corresponding bits in InterruptEnable.
+        ohci->regs[OhciState::HC_INTERRUPT_ENABLE >> 2] &= ~val;
+        break;
+
+    case OhciState::HC_RH_STATUS:
+        // Bits 0/1 = LocalPowerStatus/OC — read-only. Bit 16 = SetGlobalPower.
+        // Accept writes to set/clear power bits.
+        ohci->regs[off >> 2] = val;
+        break;
+
+    default:
+        // Port status registers: handle set/clear semantics
+        if (off >= OhciState::HC_RH_PORT_STATUS0 &&
+            off < OhciState::HC_RH_PORT_STATUS0 + ohci->num_ports * 4) {
+            // Bits 16-20 are write-to-set/clear control bits.
+            // Bit 0 (CCS) and bit 1 (PES) are read-only from device presence.
+            // For now: just store the value (no real devices attached).
+            ohci->regs[off >> 2] = val & 0x001F0000u; // accept control bits only
+        } else {
+            ohci->regs[off >> 2] = val;
         }
         break;
     }
@@ -1151,6 +1280,8 @@ struct XboxHardware {
     Nv2aState   nv2a;
     ApuState    apu;
     IdeState    ide;
+    OhciState   usb0;
+    OhciState   usb1;
     IoApicState ioapic;
     FlashState  flash;
     PciState    pci;
@@ -1200,6 +1331,20 @@ inline XboxHardware* xbox_setup(Executor& exec) {
                  apu_read, apu_write, &hw->apu);
     hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,
                  ioapic_read, ioapic_write, &hw->ioapic);
+    // USB OHCI controllers
+    hw->usb0.init(2);  // 2 ports (gamepad slots 1-2)
+    hw->usb1.init(2);  // 2 ports (gamepad slots 3-4)
+    hw->mmio.add(USB0_BASE, USB0_SIZE,
+                 ohci_read, ohci_write, &hw->usb0);
+    hw->mmio.add(USB1_BASE, USB1_SIZE,
+                 ohci_read, ohci_write, &hw->usb1);
+    // Set USB BAR0 in PCI config (memory-mapped, 32-bit)
+    {
+        uint32_t bar0 = USB0_BASE;
+        memcpy(hw->pci.config[0][4][0] + 0x10, &bar0, 4);
+        uint32_t bar1 = USB1_BASE;
+        memcpy(hw->pci.config[0][5][0] + 0x10, &bar1, 4);
+    }
     // BIOS shadow = flash alias
     hw->mmio.add(BIOS_BASE, BIOS_SIZE,
                  flash_read, flash_write, &hw->flash);

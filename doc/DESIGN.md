@@ -1398,7 +1398,7 @@ Remaining devices:
 Remaining devices:
 - SMBus — implemented (see below)
 - IDE controller — implemented (see below)
-- USB (controllers)
+- USB OHCI — implemented (see below)
 - PCI configuration space — implemented
 - MCPX boot ROM
 
@@ -1447,6 +1447,35 @@ I/O ports 0xC000–0xC00F (MCPX), devices on the I²C bus:
 - **Video encoder** stubs: Conexant CX25871 (0x45), Focus FS454 (0x6A).
 - **Protocol**: address + command + data registers, control write triggers
   transaction, status W1C with done bit.
+
+**USB OHCI Controllers** ✅ DONE (stub)
+
+Two OHCI USB host controllers (PCI Bus 0, Dev 4 and Dev 5), each with a
+4 KB MMIO register space:
+
+- **USB0** at `0xFED00000`: gamepad ports 1-2
+- **USB1** at `0xFED08000`: gamepad ports 3-4
+
+OHCI operational registers:
+
+| Register            | Offset | Behaviour                                |
+|---------------------|--------|------------------------------------------|
+| `HcRevision`        | 0x00   | Read-only: 0x0110 (OHCI 1.1)            |
+| `HcControl`         | 0x04   | Host controller functional state          |
+| `HcCommandStatus`   | 0x08   | Bit 0 = reset (auto-clear, re-inits)     |
+| `HcInterruptStatus` | 0x0C   | Interrupt event bits (W1C)                |
+| `HcInterruptEnable` | 0x10   | Enable mask                               |
+| `HcInterruptDisable`| 0x14   | Write-only: clears enable bits            |
+| `HcFmInterval`      | 0x38   | Frame interval (default 0x27782EDF)       |
+| `HcFmRemaining`     | 0x3C   | Remaining bit-times (stub: returns ~10K)  |
+| `HcRhDescriptorA`   | 0x48   | NDP = 2 (2 downstream ports)              |
+| `HcRhPortStatus[N]` | 0x54+  | Per-port status (no devices attached)     |
+
+PCI config: vendor 0x10DE, device 0x01C2, class 0x0C/0x03/0x10.
+BAR0 pre-set to the MMIO base address.
+
+12-assertion test (`tests/usb.asm`): register defaults, reset, W1C,
+enable/disable, PCI vendor/device/BAR readback.
 
 #### 5.19 XBE Loader ✅
 
@@ -1513,7 +1542,7 @@ The executor supports two kernel modes, selectable at launch:
 | SYSENTER MSRs (CS/EIP/ESP) | Easy | ✅ DONE |
 | PE loader for xboxkrnl.exe | Medium | Planned |
 | MCPX/2BL boot chain (or entry shim) | Medium | Can skip ROM, jump to kernel entry |
-| OHCI USB controller stub | Medium | Planned |
+| OHCI USB controller stub | Medium | ✅ DONE |
 | More complete GDT/TSS handling | Easy | Partially done (LGDT, segment bases) |
 | MTRR MSRs | Easy | Stub (write-back default) |
 
