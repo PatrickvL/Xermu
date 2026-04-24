@@ -107,6 +107,10 @@ bool emit_handler_popfd(Emitter& e, const ZydisDecodedInstruction& insn,
                         const ZydisDecodedOperand* ops, const uint8_t* raw,
                         GuestContext* ctx, bool save_flags);
 
+bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
+                         const ZydisDecodedOperand* ops, const uint8_t* raw,
+                         GuestContext* ctx, bool save_flags);
+
 // ---------------------------------------------------------------------------
 // Dispatch table — Level 1 maps mnemonic → compact index, Level 2 has class
 // ---------------------------------------------------------------------------
@@ -129,6 +133,7 @@ enum InsnClassId : uint8_t {
     IC_SSE_MEM,     // SSE/MMX instructions with memory operand forms
     IC_PUSHFD,      // PUSHFD — push EFLAGS onto guest stack
     IC_POPFD,       // POPFD — pop EFLAGS from guest stack
+    IC_STRING,      // MOVS/STOS/LODS/CMPS/SCAS (with optional REP prefix)
     IC_TERMINATOR,  // JMP/CALL/RET/Jcc/LOOP — trace exit
     IC_PRIVILEGED,  // HLT/LGDT/CLI/... — trap
     IC_MAX
@@ -152,6 +157,7 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_SSE_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH }, // same logic
     /* IC_PUSHFD     */ { emit_handler_pushfd,    ICF_HAS_DISPATCH },
     /* IC_POPFD      */ { emit_handler_popfd,     ICF_HAS_DISPATCH },
+    /* IC_STRING     */ { emit_handler_string,    ICF_HAS_DISPATCH },
     /* IC_TERMINATOR */ { nullptr,                ICF_TERMINATOR },
     /* IC_PRIVILEGED */ { nullptr,                ICF_PRIVILEGED },
 };
@@ -221,6 +227,18 @@ inline void init_mnemonic_table() {
     // ---- PUSHFD / POPFD (guest stack, not host RSP) ----
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_PUSHFD]  = IC_PUSHFD;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_POPFD]   = IC_POPFD;
+
+    // ---- String instructions (with optional REP/REPE/REPNE prefix) ----
+    // Note: MOVSD and CMPSD share Zydis mnemonic with SSE2 scalar-double ops.
+    // Safe at XBOX_TARGET_SSE=1 (SSE2 off); if SSE2 is enabled, the handler
+    // disambiguates via operand type.
+    for (auto m : {
+        ZYDIS_MNEMONIC_MOVSB, ZYDIS_MNEMONIC_MOVSW, ZYDIS_MNEMONIC_MOVSD,
+        ZYDIS_MNEMONIC_STOSB, ZYDIS_MNEMONIC_STOSW, ZYDIS_MNEMONIC_STOSD,
+        ZYDIS_MNEMONIC_LODSB, ZYDIS_MNEMONIC_LODSW, ZYDIS_MNEMONIC_LODSD,
+        ZYDIS_MNEMONIC_CMPSB, ZYDIS_MNEMONIC_CMPSW, ZYDIS_MNEMONIC_CMPSD,
+        ZYDIS_MNEMONIC_SCASB, ZYDIS_MNEMONIC_SCASW, ZYDIS_MNEMONIC_SCASD,
+    }) MNEMONIC_CLASS[m] = IC_STRING;
 
     // ---- x87 FPU (mnemonics that CAN have memory operand forms) ----
     // Register-only forms are handled by the fallback in the handler

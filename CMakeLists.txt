@@ -76,6 +76,7 @@ set(TEST_ASM_FILES
     tests/fpu.asm
     tests/sse.asm
     tests/advanced.asm
+    tests/string.asm
 )
 
 if(NASM_EXECUTABLE)
