@@ -713,10 +713,13 @@ principle (§2.3 — "No Guard Pages"). The inline CMP R14,R15 + JAE slow_path
 pattern is the correct approach: every memory access is rewritten at JIT time
 with no OS exception handling in the hot path.
 
-#### 5.23 Trace Cache Improvements
-- Two-level cache: `page_map[guest_page][offset >> 1]` for O(1) direct-mapped
-  lookup instead of hash table
-- Trace linking between direct-branch targets
+#### 5.23 ~~Trace Cache Improvements~~ ✅ DONE
+- Two-level direct-mapped cache: `page_map[(eip>>12) & L1_MASK][(eip & 0xFFF) >> 1]`
+  for O(1) lookup with no hashing, no probing, no tombstones.  L1 = 32768 entries
+  (128 MB coverage, modular-mapped for larger VA spaces).  L2 = 2048 Trace* per
+  page, allocated on demand.  Full `guest_eip` verified on lookup to handle L1
+  aliasing.
+- Trace linking between direct-branch targets — already done in §5.21.
 
 ---
 
