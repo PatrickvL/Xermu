@@ -119,6 +119,35 @@ struct Nv2aState {
         }
     }
 
+    // PFIFO DMA pusher: advance GET toward PUT, consuming commands.
+    // Each tick consumes up to MAX_DWORDS_PER_TICK dwords from the push buffer.
+    // This is a stub — commands are discarded, not interpreted.
+    static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
+
+    void tick_fifo(const uint8_t* /*ram*/, uint32_t /*ram_size_bytes*/) {
+        // DMA pusher must be enabled.
+        if (!(pfifo_cache1_dma_push & 1)) return;
+        // PUSH0 access must be enabled.
+        if (!(pfifo_cache1_push0 & 1)) return;
+        // Nothing to do if GET == PUT.
+        if (pfifo_cache1_dma_get == pfifo_cache1_dma_put) {
+            pfifo_cache1_status = 0x10;  // empty
+            return;
+        }
+        // Consume up to MAX_DWORDS_PER_TICK dwords.
+        pfifo_cache1_status = 0;  // not empty
+        uint32_t get = pfifo_cache1_dma_get;
+        uint32_t put = pfifo_cache1_dma_put;
+        uint32_t consumed = 0;
+        while (get != put && consumed < MAX_DWORDS_PER_TICK) {
+            get += 4;  // skip one dword (4 bytes)
+            consumed++;
+        }
+        pfifo_cache1_dma_get = get;
+        if (get == put)
+            pfifo_cache1_status = 0x10;  // empty
+    }
+
     // PMC_INTR_0: read-only summary of all NV2A interrupt sources.
     // Bit 24 = PCRTC interrupt pending.
     uint32_t pmc_intr_0() const {
@@ -155,6 +184,12 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     if (off == 0x003250) return nv->pfifo_cache1_pull0;   // CACHE1_PULL0
     if (off == 0x003214) return nv->pfifo_cache1_status;  // CACHE1_STATUS
     if (off == 0x002400) return nv->pfifo_runout_status;  // PFIFO_RUNOUT_STATUS
+    if (off == 0x003228) {                                 // CACHE1_DMA_STATE
+        // Bit 0 = busy (1 if GET != PUT and pusher enabled).
+        bool busy = (nv->pfifo_cache1_dma_push & 1) &&
+                    (nv->pfifo_cache1_dma_get != nv->pfifo_cache1_dma_put);
+        return busy ? 1u : 0u;
+    }
 
     // PTIMER (0x009xxx) — timer
     if (off == 0x009200) return nv->ptimer_num;
@@ -814,13 +849,16 @@ struct XboxHardware {
     SmbusState  smbus;
     PicPair     pic;
     PitState    pit;
+    uint8_t*    ram = nullptr;       // pointer to guest RAM (set by xbox_setup)
+    uint32_t    ram_size = 0;        // guest RAM size in bytes
 };
 
-// Tick callback for executor run loop — advances PIT and NV2A PTIMER.
+// Tick callback for executor run loop — advances PIT, NV2A PTIMER, and PFIFO.
 static void hw_tick_callback(void* user) {
     auto* hw = static_cast<XboxHardware*>(user);
     hw->pit.tick();
     hw->nv2a.tick_timer();
+    hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
     // Raise NV2A vblank IRQ on PIC if pending.
     if (hw->nv2a.vblank_irq_pending) {
         hw->nv2a.vblank_irq_pending = false;
@@ -838,6 +876,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
 
     // Initialize Executor first so that exec.ram is allocated.
     exec.init(&hw->mmio);
+
+    // Store RAM pointer for tick_fifo.
+    hw->ram = exec.ram;
+    hw->ram_size = GUEST_RAM_SIZE;
 
     // MMIO regions (must come after init — exec.ram is the user pointer)
     hw->mmio.add(RAM_MIRROR_BASE, RAM_MIRROR_SIZE,
