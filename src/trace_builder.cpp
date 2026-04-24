@@ -525,6 +525,56 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
+// emit_handler_flagmem — SETcc [mem] / CMOVcc r, [mem]
+//
+// These instructions READ EFLAGS *and* access memory.  The fastmem bounds
+// check (CMP R14, R15) clobbers flags, so we must restore them BEFORE the
+// instruction executes:
+//
+//   EA → R14
+//   PUSHFQ                 ; save guest EFLAGS
+//   CMP  R14, R15          ; bounds check (clobbers flags)
+//   JAE  slow
+//   POPFQ                  ; *** restore EFLAGS before SETcc/CMOVcc ***
+//   <rewritten insn>
+//   JMP  done
+// slow:
+//   POPFQ                  ; balance the stack
+//   UD2                    ; MMIO not supported for SETcc/CMOVcc
+// done:
+// ---------------------------------------------------------------------------
+bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
+                          const ZydisDecodedOperand* ops, const uint8_t* raw,
+                          GuestContext* /*ctx*/, bool /*save_flags*/) {
+    int mem_idx = -1;
+    if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
+        // reg-reg form: clean copy (SETcc r8, CMOVcc r,r)
+        e.copy(raw, insn.length);
+        return true;
+    }
+
+    // Memory form — flag-preserving bounds check
+    if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+
+    emit_save_flags(e);                         // PUSHFQ (with alignment fix)
+    emit_cmp_r14_r15(e);                        // CMP R14, R15
+    uint8_t* slow_site = emit_jae_fwd(e);       // JAE slow
+
+    // Fast path: restore flags, then execute instruction
+    emit_restore_flags(e);                      // POPFQ
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    uint8_t* done_site = emit_jmp_fwd(e);       // JMP done
+
+    // Slow path: balance PUSHFQ then UD2
+    Emitter::patch_rel32(slow_site, e.cur());
+    emit_restore_flags(e);                      // POPFQ (balance)
+    e.emit8(0x0F); e.emit8(0x0B);              // UD2
+
+    Emitter::patch_rel32(done_site, e.cur());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // emit_handler_test_mem — TEST r,[m] / [m],r  (read-only)
 // Memory forms use the generic rewriter.
 // ---------------------------------------------------------------------------
