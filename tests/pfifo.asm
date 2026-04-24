@@ -13,6 +13,9 @@
 ;   5.  JUMP command redirects GET
 ;   6.  Total dwords consumed is correct
 ;   7.  Total methods dispatched is correct
+;   8.  CALL/RETURN: subroutine dispatches method, GET resumes after CALL
+;   9.  CALL count incremented
+;  10.  Cumulative methods correct after CALL/RETURN
 ; ===========================================================================
 
 %include "harness.inc"
@@ -31,6 +34,7 @@ CACHE1_DMA_GET    equ NV2A + 0x003244
 FIFO_METHODS      equ NV2A + 0x003F00
 FIFO_DWORDS       equ NV2A + 0x003F04
 FIFO_JUMPS        equ NV2A + 0x003F08
+FIFO_CALLS        equ NV2A + 0x003F0C
 
 ; Push buffer lives at PA 0x60000 (safe area, well within RAM).
 PB_BASE equ 0x00060000
@@ -43,6 +47,8 @@ PB_BASE equ 0x00060000
 %define PB_HDR_INC(method, subchan, count)  ((count) << 18) | ((subchan) << 13) | (method)
 %define PB_HDR_NI(method, subchan, count)   (4 << 29) | ((count) << 18) | ((subchan) << 13) | (method)
 %define PB_JUMP(addr)                       (0x40000000 | (addr))
+%define PB_CALL(addr)                       ((addr) | 2)
+%define PB_RETURN                           0x00020000
 
 ; ===========================================================================
 ; Write push buffer commands into RAM at PB_BASE.
@@ -142,5 +148,57 @@ PB_BASE equ 0x00060000
     ; === 5. Cumulative dwords consumed = 10 + 3 = 13 (1 JUMP hdr + 1 method hdr + 1 data) ===
     mov eax, [FIFO_DWORDS]
     ASSERT_EQ eax, 13
+
+    ; -----------------------------------------------------------------------
+    ; Phase 3: Test CALL/RETURN (single-level subroutine).
+    ;
+    ; Layout:
+    ;   PB_BASE+0x300: CALL (PB_BASE+0x400)   — calls subroutine
+    ;   PB_BASE+0x304: INC method 0x500, count=1, data 0x77777777  — after return
+    ;   PB_BASE+0x30C: <end of main stream>
+    ;
+    ;   PB_BASE+0x400: INC method 0x600, count=1, data 0x88888888  — subroutine body
+    ;   PB_BASE+0x408: RETURN
+    ;   PB_BASE+0x40C: <never reached>
+    ; -----------------------------------------------------------------------
+
+    ; Main stream
+    mov dword [PB_BASE + 0x300], PB_CALL(PB_BASE + 0x400)
+    mov dword [PB_BASE + 0x304], PB_HDR_INC(0x500, 0, 1)
+    mov dword [PB_BASE + 0x308], 0x77777777
+
+    ; Subroutine at PB_BASE+0x400
+    mov dword [PB_BASE + 0x400], PB_HDR_INC(0x600, 0, 1)
+    mov dword [PB_BASE + 0x404], 0x88888888
+    mov dword [PB_BASE + 0x408], PB_RETURN
+
+    ; Program pusher: GET = 0x300, PUT = 0x30C
+    mov dword [CACHE1_DMA_PUT], PB_BASE + 0x30C
+    mov dword [CACHE1_DMA_GET], PB_BASE + 0x300
+
+    ; Spin until GET == PUT (PUT = 0x30C, after the post-return method)
+    mov ecx, 400000
+.spin3:
+    mov eax, [CACHE1_DMA_GET]
+    cmp eax, PB_BASE + 0x30C
+    je .done3
+    dec ecx
+    jnz .spin3
+    mov eax, 0xFD
+    hlt
+.done3:
+
+    ; === 6. CALL count incremented ===
+    mov eax, [FIFO_CALLS]
+    ASSERT_EQ eax, 1
+
+    ; === 7. Cumulative methods = 7 + 2 = 9 (subroutine method + post-return method) ===
+    mov eax, [FIFO_METHODS]
+    ASSERT_EQ eax, 9
+
+    ; === 8. Cumulative dwords = 13 + 6 = 19 ===
+    ; Phase 3: CALL hdr(1) + subr hdr(1) + subr data(1) + RETURN(1) + main hdr(1) + main data(1) = 6
+    mov eax, [FIFO_DWORDS]
+    ASSERT_EQ eax, 19
 
     PASS
