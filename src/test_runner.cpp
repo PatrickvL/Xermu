@@ -1,16 +1,20 @@
 // ---------------------------------------------------------------------------
 // test_runner — loads flat 32-bit binaries and executes them through the JIT.
 //
-// Usage:  test_runner <test.bin> [load_pa_hex]
+// Usage:  test_runner [--xbox] <test.bin> [load_pa_hex]
 //
 // Convention:
 //   Code is loaded at the specified PA (default 0x1000).
 //   Stack is set up at 0x80000 with a sentinel return address.
 //   I/O port 0xE9: debug console output  (OUT DX, AL  where DX=0xE9)
 //   HLT stops execution.  EAX = 0 means PASS, non-zero = fail code.
+//
+//   --xbox: Use the Xbox physical address map with real device stubs
+//           instead of the default catch-all stub MMIO.
 // ---------------------------------------------------------------------------
 
 #include "executor.hpp"
+#include "xbox.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -44,13 +48,25 @@ static void io_debug_write(uint16_t, uint32_t val, unsigned, void*) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: test_runner <test.bin> [load_pa_hex]\n");
+        fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n");
         return 2;
     }
 
-    const char* bin_path = argv[1];
+    // Parse optional --xbox flag.
+    bool xbox_mode = false;
+    int argi = 1;
+    if (argc > 1 && strcmp(argv[1], "--xbox") == 0) {
+        xbox_mode = true;
+        argi++;
+    }
+    if (argi >= argc) {
+        fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n");
+        return 2;
+    }
+
+    const char* bin_path = argv[argi];
     uint32_t load_pa = 0x1000;
-    if (argc >= 3) load_pa = (uint32_t)strtoul(argv[2], nullptr, 16);
+    if (argi + 1 < argc) load_pa = (uint32_t)strtoul(argv[argi + 1], nullptr, 16);
 
     // Read binary file.
     FILE* f = fopen(bin_path, "rb");
@@ -79,14 +95,19 @@ int main(int argc, char** argv) {
            bin_path, file_size, load_pa);
 
     // Set up executor.
-    MmioMap mmio;
-    mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
-             stub_mmio_read, stub_mmio_write);
-
     auto exec = std::make_unique<Executor>();
-    if (!exec->init(&mmio)) {
-        fprintf(stderr, "Executor init failed\n");
-        return 2;
+    xbox::XboxHardware* hw = nullptr;
+    MmioMap stub_mmio;
+
+    if (xbox_mode) {
+        hw = xbox::xbox_setup(*exec);
+    } else {
+        stub_mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
+                      stub_mmio_read, stub_mmio_write);
+        if (!exec->init(&stub_mmio)) {
+            fprintf(stderr, "Executor init failed\n");
+            return 2;
+        }
     }
 
     exec->load_guest(load_pa, buf.get(), file_size);
@@ -104,8 +125,9 @@ int main(int argc, char** argv) {
     exec->ctx.fs_base = FS_BASE;
     exec->ctx.gs_base = 0;
 
-    // Register I/O ports.
-    exec->register_io(0xE9, nullptr, io_debug_write);
+    // Register I/O ports (in non-xbox mode; xbox_setup already registers them).
+    if (!xbox_mode)
+        exec->register_io(0xE9, nullptr, io_debug_write);
 
     // Run.
     exec->run(load_pa, /*max_steps=*/10'000'000);
@@ -117,5 +139,6 @@ int main(int argc, char** argv) {
            result == 0 ? "PASS" : "FAIL", result, exec->ctx.eip);
 
     exec->destroy();
+    delete hw;
     return result == 0 ? 0 : 1;
 }

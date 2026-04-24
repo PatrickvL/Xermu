@@ -1,0 +1,418 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// xbox.hpp — Xbox physical address map + device stubs.
+//
+// Sets up the MmioMap and I/O port handlers for the original Xbox hardware:
+//
+//   Guest PA          Size       Device
+//   ─────────────────────────────────────────────────
+//   0x0000_0000       64 MB      Main RAM
+//   0x0C00_0000      128 MB      RAM mirror (NV2A tiling alias)
+//   0xF000_0000        1 MB      Flash ROM (MCPX + BIOS)
+//   0xFD00_0000       16 MB      NV2A GPU registers (MMIO)
+//   0xFE80_0000        4 MB      APU / AC97 (MMIO)
+//   0xFEC0_0000        4 KB      I/O APIC (MMIO)
+//   0xFF00_0000        1 MB      BIOS shadow
+//
+//   I/O ports:
+//   0x0020–0x0021     PIC (master 8259A)
+//   0x00A0–0x00A1     PIC (slave 8259A)
+//   0x0040–0x0043     PIT (8254 timer)
+//   0x0061            System control port B
+//   0x0CF8            PCI config address
+//   0x0CFC–0x0CFF     PCI config data
+//   0xC000–0xC00F     SMBus (MCPX)
+//   0xE9              Debug console (bochs-style)
+// ---------------------------------------------------------------------------
+
+#include "executor.hpp"
+#include <cstdio>
+#include <cstring>
+
+// ============================= Address Map =================================
+
+namespace xbox {
+
+static constexpr uint32_t RAM_SIZE_RETAIL   = 64u * 1024u * 1024u;   // 64 MB
+static constexpr uint32_t RAM_SIZE_DEVKIT   = 128u * 1024u * 1024u;  // 128 MB
+
+static constexpr uint32_t RAM_MIRROR_BASE   = 0x0C000000u;
+static constexpr uint32_t RAM_MIRROR_SIZE   = 0x08000000u;  // 128 MB
+
+static constexpr uint32_t FLASH_BASE        = 0xF0000000u;
+static constexpr uint32_t FLASH_SIZE        = 0x00100000u;  // 1 MB
+
+static constexpr uint32_t NV2A_BASE         = 0xFD000000u;
+static constexpr uint32_t NV2A_SIZE         = 0x01000000u;  // 16 MB
+
+static constexpr uint32_t APU_BASE          = 0xFE800000u;
+static constexpr uint32_t APU_SIZE          = 0x00400000u;  // 4 MB
+
+static constexpr uint32_t IOAPIC_BASE       = 0xFEC00000u;
+static constexpr uint32_t IOAPIC_SIZE       = 0x00001000u;  // 4 KB
+
+static constexpr uint32_t BIOS_BASE         = 0xFF000000u;
+static constexpr uint32_t BIOS_SIZE         = 0x00100000u;  // 1 MB
+
+// ============================= NV2A GPU ====================================
+
+struct Nv2aState {
+    uint32_t pmc_boot_0 = 0x02A000A1;  // NV2A chip ID (NV20 derivative)
+    uint32_t pmc_enable = 0;
+    uint32_t pfb_cfg0   = 0x03070103;  // 64 MB RAM
+    uint32_t pbus_0     = 0;
+    uint32_t ptimer_num = 1;
+    uint32_t ptimer_den = 1;
+    uint32_t pcrtc_start = 0;
+    uint32_t pvideo_intr = 0;
+};
+
+static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
+    auto* nv = static_cast<Nv2aState*>(user);
+    uint32_t off = pa - NV2A_BASE;
+
+    // PMC (0x000xxx) — master control
+    if (off == 0x000000) return nv->pmc_boot_0;    // PMC_BOOT_0
+    if (off == 0x000200) return nv->pmc_enable;     // PMC_ENABLE
+
+    // PBUS (0x001xxx) — bus control
+    if (off == 0x001200) return nv->pbus_0;         // PBUS_PCI_NV_0
+    if (off == 0x001214) return 0;                  // PBUS interrupt status
+
+    // PFIFO (0x002xxx) — FIFO engine
+    if (off == 0x002100) return 0;                  // PFIFO_INTR_0
+    if (off == 0x002140) return 0;                  // PFIFO_INTR_EN_0
+    if (off == 0x002500) return 0;                  // PFIFO_CACHES
+
+    // PTIMER (0x009xxx) — timer
+    if (off == 0x009200) return nv->ptimer_num;
+    if (off == 0x009210) return nv->ptimer_den;
+    if (off == 0x009400) return 0;                  // PTIMER_TIME_0 (low)
+    if (off == 0x009410) return 0;                  // PTIMER_TIME_1 (high)
+    if (off == 0x009100) return 0;                  // PTIMER_INTR_0
+
+    // PFB (0x100xxx) — framebuffer control
+    if (off == 0x100200) return nv->pfb_cfg0;       // PFB_CFG0
+    if (off == 0x100204) return 0;                  // PFB_CFG1
+
+    // PCRTC (0x600xxx) — CRTC
+    if (off == 0x600100) return 0;                  // PCRTC_INTR_0
+    if (off == 0x600800) return nv->pcrtc_start;    // PCRTC_START
+
+    // PVIDEO (0x008xxx) — video overlay
+    if (off == 0x008100) return nv->pvideo_intr;
+
+    // Default: bus float
+    return 0;
+}
+
+static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) {
+    auto* nv = static_cast<Nv2aState*>(user);
+    uint32_t off = pa - NV2A_BASE;
+
+    if (off == 0x000200) { nv->pmc_enable = val; return; }
+    if (off == 0x001200) { nv->pbus_0 = val;     return; }
+    if (off == 0x009200) { nv->ptimer_num = val;  return; }
+    if (off == 0x009210) { nv->ptimer_den = val;  return; }
+    if (off == 0x600800) { nv->pcrtc_start = val; return; }
+    if (off == 0x600100) { nv->pvideo_intr &= ~val; return; } // W1C
+    if (off == 0x008100) { nv->pvideo_intr &= ~val; return; } // W1C
+
+    // Silently drop unhandled writes.
+}
+
+// ============================= APU =========================================
+
+static uint32_t apu_read(uint32_t /*pa*/, unsigned /*size*/, void* /*user*/) {
+    return 0;  // stub: all zeros
+}
+static void apu_write(uint32_t, uint32_t, unsigned, void*) {}
+
+// ============================= I/O APIC ====================================
+
+struct IoApicState {
+    uint32_t index = 0;
+    uint32_t regs[24 * 2 + 2] = {}; // ID, VER, ARB, + 24 redirection entries × 2
+
+    IoApicState() {
+        regs[0] = 0;           // IOAPIC_ID
+        regs[1] = 0x00170011;  // IOAPIC_VER: 17h max redir, version 11h
+    }
+};
+
+static uint32_t ioapic_read(uint32_t pa, unsigned /*size*/, void* user) {
+    auto* s = static_cast<IoApicState*>(user);
+    uint32_t off = pa - IOAPIC_BASE;
+    if (off == 0x00) return s->index;           // IOREGSEL
+    if (off == 0x10 && s->index < 64) return s->regs[s->index]; // IOWIN
+    return 0;
+}
+
+static void ioapic_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) {
+    auto* s = static_cast<IoApicState*>(user);
+    uint32_t off = pa - IOAPIC_BASE;
+    if (off == 0x00) { s->index = val & 0xFF; return; }
+    if (off == 0x10 && s->index < 64) { s->regs[s->index] = val; return; }
+}
+
+// ============================= RAM Mirror ==================================
+// NV2A tiling alias: reads/writes at [0x0C000000..0x13FFFFFF] map to main RAM
+// with PA = (access_pa - 0x0C000000) % actual_ram_size.
+
+static uint32_t ram_mirror_read(uint32_t pa, unsigned size, void* user) {
+    auto* ram = static_cast<uint8_t*>(user);
+    uint32_t off = (pa - RAM_MIRROR_BASE) & (RAM_SIZE_RETAIL - 1);
+    uint32_t val = 0;
+    memcpy(&val, ram + off, size);
+    return val;
+}
+
+static void ram_mirror_write(uint32_t pa, uint32_t val, unsigned size, void* user) {
+    auto* ram = static_cast<uint8_t*>(user);
+    uint32_t off = (pa - RAM_MIRROR_BASE) & (RAM_SIZE_RETAIL - 1);
+    memcpy(ram + off, &val, size);
+}
+
+// ============================= Flash ROM ===================================
+// 1 MB flash ROM. Reads return stored bytes or 0xFF (empty). Writes ignored.
+
+struct FlashState {
+    uint8_t data[FLASH_SIZE];
+    FlashState() { memset(data, 0xFF, FLASH_SIZE); }
+};
+
+static uint32_t flash_read(uint32_t pa, unsigned size, void* user) {
+    auto* f = static_cast<FlashState*>(user);
+    // Both FLASH_BASE (0xF0000000) and BIOS_BASE (0xFF000000) map here.
+    // Wrap into 1 MB range.
+    uint32_t off = (pa - FLASH_BASE) & (FLASH_SIZE - 1);
+    uint32_t val = 0;
+    memcpy(&val, f->data + off, size);
+    return val;
+}
+
+static void flash_write(uint32_t, uint32_t, unsigned, void*) {}
+
+// ============================= PCI Config ==================================
+// PCI configuration space via I/O ports 0xCF8 (address) / 0xCFC (data).
+// The Xbox MCPX provides buses 0-1 with a handful of devices.
+
+struct PciState {
+    uint32_t config_address = 0; // written to port 0xCF8
+    // Simple flat config space: [bus][dev][fn][256 bytes]
+    // Only a few devices are populated.
+    static constexpr int MAX_DEVS = 32;
+    uint8_t config[2][MAX_DEVS][8][256] = {}; // [bus][dev][fn][offset]
+
+    void set_id(int bus, int dev, int fn, uint16_t vendor, uint16_t device,
+                uint8_t cls, uint8_t subcls, uint8_t progif, uint8_t rev) {
+        uint8_t* c = config[bus][dev][fn];
+        memcpy(c + 0x00, &vendor, 2);
+        memcpy(c + 0x02, &device, 2);
+        c[0x08] = rev;
+        c[0x09] = progif;
+        c[0x0A] = subcls;
+        c[0x0B] = cls;
+    }
+
+    void init_xbox_devices() {
+        // Bus 0, Dev 0: MCPX Host Bridge
+        set_id(0, 0, 0, 0x10DE, 0x02A5, 0x06, 0x00, 0x00, 0xB1);
+        // Bus 0, Dev 1, Fn 0: MCPX LPC (ISA Bridge)
+        set_id(0, 1, 0, 0x10DE, 0x01B2, 0x06, 0x01, 0x00, 0xB1);
+        // Bus 0, Dev 1, Fn 1: MCPX SMBus controller
+        set_id(0, 1, 1, 0x10DE, 0x01B4, 0x0C, 0x05, 0x00, 0xB1);
+        // Set SMBus I/O base (BAR) at offset 0x14 = 0xC000
+        {
+            uint16_t bar = 0xC001; // I/O space bit set
+            memcpy(config[0][1][1] + 0x14, &bar, 2);
+        }
+        // Bus 0, Dev 2: NV2A (GPU)
+        set_id(0, 2, 0, 0x10DE, 0x02A0, 0x03, 0x00, 0x00, 0xA1);
+        // Bus 0, Dev 3: MCPX Audio (APU)
+        set_id(0, 3, 0, 0x10DE, 0x01B0, 0x04, 0x01, 0x00, 0xB1);
+        // Bus 0, Dev 4: OHCI USB #0
+        set_id(0, 4, 0, 0x10DE, 0x01C2, 0x0C, 0x03, 0x10, 0xB1);
+        // Bus 0, Dev 5: OHCI USB #1
+        set_id(0, 5, 0, 0x10DE, 0x01C2, 0x0C, 0x03, 0x10, 0xB1);
+        // Bus 0, Dev 9: IDE controller
+        set_id(0, 9, 0, 0x10DE, 0x01BC, 0x01, 0x01, 0x8A, 0xB1);
+        // Bus 0, Dev 30: AGP → PCI bridge
+        set_id(0, 30, 0, 0x10DE, 0x01B7, 0x06, 0x04, 0x00, 0xB1);
+        // Bus 1, Dev 0: NV2A GPU (on AGP bus)
+        set_id(1, 0, 0, 0x10DE, 0x02A0, 0x03, 0x00, 0x00, 0xA1);
+    }
+};
+
+static void pci_io_write_cf8(uint16_t /*port*/, uint32_t val, unsigned /*size*/, void* user) {
+    static_cast<PciState*>(user)->config_address = val;
+}
+static uint32_t pci_io_read_cf8(uint16_t /*port*/, unsigned /*size*/, void* user) {
+    return static_cast<PciState*>(user)->config_address;
+}
+
+static uint32_t pci_io_read_cfc(uint16_t port, unsigned size, void* user) {
+    auto* pci = static_cast<PciState*>(user);
+    uint32_t addr = pci->config_address;
+    if (!(addr & 0x80000000u)) return 0xFFFFFFFFu; // enable bit not set
+    int bus = (addr >> 16) & 0xFF;
+    int dev = (addr >> 11) & 0x1F;
+    int fn  = (addr >>  8) & 0x07;
+    int off = (addr & 0xFC) + (port - 0xCFC);
+    if (bus > 1 || dev >= PciState::MAX_DEVS || off + (int)size > 256)
+        return 0xFFFFFFFFu;
+    uint32_t val = 0;
+    memcpy(&val, pci->config[bus][dev][fn] + off, size);
+    return val;
+}
+
+static void pci_io_write_cfc(uint16_t port, uint32_t val, unsigned size, void* user) {
+    auto* pci = static_cast<PciState*>(user);
+    uint32_t addr = pci->config_address;
+    if (!(addr & 0x80000000u)) return;
+    int bus = (addr >> 16) & 0xFF;
+    int dev = (addr >> 11) & 0x1F;
+    int fn  = (addr >>  8) & 0x07;
+    int off = (addr & 0xFC) + (port - 0xCFC);
+    if (bus > 1 || dev >= PciState::MAX_DEVS || off + (int)size > 256) return;
+    memcpy(pci->config[bus][dev][fn] + off, &val, size);
+}
+
+// ============================= SMBus =======================================
+// Minimal SMBus controller stub at I/O ports 0xC000–0xC00F.
+// The Xbox kernel probes SMBus to detect hardware (EEPROM at address 0x54,
+// video encoder, temperature sensor, etc.).
+
+struct SmbusState {
+    uint8_t status  = 0;
+    uint8_t control = 0;
+    uint8_t address = 0;
+    uint8_t command = 0;
+    uint8_t data    = 0;
+    // EEPROM data stub: all zeros except serial number area
+    uint8_t eeprom[256] = {};
+
+    SmbusState() {
+        // Xbox EEPROM: first 0x30 bytes are encrypted config, rest is game data.
+        // Zero is a valid "empty" state for the stub.
+    }
+};
+
+static uint32_t smbus_io_read(uint16_t port, unsigned /*size*/, void* user) {
+    auto* s = static_cast<SmbusState*>(user);
+    switch (port & 0xF) {
+    case 0x00: return s->status;   // SMBUS_STATUS
+    case 0x02: return s->control;  // SMBUS_CONTROL
+    case 0x04: return s->address;  // SMBUS_ADDRESS
+    case 0x06: return s->data;     // SMBUS_DATA
+    case 0x08: return s->command;  // SMBUS_COMMAND
+    default:   return 0;
+    }
+}
+
+static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
+    auto* s = static_cast<SmbusState*>(user);
+    switch (port & 0xF) {
+    case 0x00:
+        s->status &= ~(uint8_t)val;  // W1C (write-1-to-clear)
+        return;
+    case 0x02: // SMBUS_CONTROL — trigger a transaction
+        s->control = (uint8_t)val;
+        // Auto-complete: set status bit 4 (SMBUS_STATUS_DONE)
+        s->status |= 0x10;
+        // If reading from EEPROM (address 0xA9 = read from device 0x54):
+        if (s->address == 0xA9 && s->command < sizeof(s->eeprom))
+            s->data = s->eeprom[s->command];
+        return;
+    case 0x04: s->address = (uint8_t)val; return;
+    case 0x06: s->data = (uint8_t)val;    return;
+    case 0x08: s->command = (uint8_t)val;  return;
+    }
+}
+
+// ============================= PIC (8259A) =================================
+
+static uint32_t pic_io_read(uint16_t /*port*/, unsigned /*size*/, void* /*user*/) {
+    return 0; // stub: no pending interrupts
+}
+static void pic_io_write(uint16_t, uint32_t, unsigned, void*) {
+    // stub: accept initialization commands silently
+}
+
+// ============================= PIT (8254) ==================================
+
+static uint32_t pit_io_read(uint16_t /*port*/, unsigned /*size*/, void* /*user*/) {
+    return 0;
+}
+static void pit_io_write(uint16_t, uint32_t, unsigned, void*) {}
+
+// ============================= System Port B (0x61) ========================
+
+static uint32_t sysctl_read(uint16_t, unsigned, void*) { return 0x20; /* timer 2 output */ }
+static void sysctl_write(uint16_t, uint32_t, unsigned, void*) {}
+
+// ============================= Debug console (0xE9) ========================
+
+static void debug_console_write(uint16_t, uint32_t val, unsigned, void*) {
+    putchar(val & 0xFF);
+    fflush(stdout);
+}
+
+// ============================= Setup =======================================
+// All device state is heap-allocated and owned by XboxHardware.
+
+struct XboxHardware {
+    MmioMap     mmio;
+    Nv2aState   nv2a;
+    IoApicState ioapic;
+    FlashState  flash;
+    PciState    pci;
+    SmbusState  smbus;
+};
+
+// Set up the Xbox MMIO map and I/O ports on an Executor.
+// Returns a heap-allocated XboxHardware whose lifetime must exceed the Executor.
+inline XboxHardware* xbox_setup(Executor& exec) {
+    auto* hw = new XboxHardware();
+
+    // PCI device table
+    hw->pci.init_xbox_devices();
+
+    // Initialize Executor first so that exec.ram is allocated.
+    exec.init(&hw->mmio);
+
+    // MMIO regions (must come after init — exec.ram is the user pointer)
+    hw->mmio.add(RAM_MIRROR_BASE, RAM_MIRROR_SIZE,
+                 ram_mirror_read, ram_mirror_write, exec.ram);
+    hw->mmio.add(FLASH_BASE, FLASH_SIZE,
+                 flash_read, flash_write, &hw->flash);
+    hw->mmio.add(NV2A_BASE, NV2A_SIZE,
+                 nv2a_read, nv2a_write, &hw->nv2a);
+    hw->mmio.add(APU_BASE, APU_SIZE,
+                 apu_read, apu_write, nullptr);
+    hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,
+                 ioapic_read, ioapic_write, &hw->ioapic);
+    // BIOS shadow = flash alias
+    hw->mmio.add(BIOS_BASE, BIOS_SIZE,
+                 flash_read, flash_write, &hw->flash);
+
+    // I/O ports
+    exec.register_io(0x20, pic_io_read, pic_io_write);         // PIC master
+    exec.register_io(0x21, pic_io_read, pic_io_write);
+    exec.register_io(0xA0, pic_io_read, pic_io_write);         // PIC slave
+    exec.register_io(0xA1, pic_io_read, pic_io_write);
+    exec.register_io(0x40, pit_io_read, pit_io_write);         // PIT ch0
+    exec.register_io(0x43, pit_io_read, pit_io_write);         // PIT mode
+    exec.register_io(0x61, sysctl_read, sysctl_write);         // System B
+    exec.register_io(0xE9, nullptr, debug_console_write);       // Debug
+    exec.register_io(0xCF8, pci_io_read_cf8, pci_io_write_cf8, &hw->pci);
+    exec.register_io(0xCFC, pci_io_read_cfc, pci_io_write_cfc, &hw->pci);
+
+    // SMBus (0xC000–0xC00F): register even-numbered ports used by kernel
+    for (uint16_t p = 0xC000; p <= 0xC00E; p += 2)
+        exec.register_io(p, smbus_io_read, smbus_io_write, &hw->smbus);
+
+    return hw;
+}
+
+} // namespace xbox

@@ -36,7 +36,7 @@ struct Executor {
     SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
 
     // I/O port dispatch table (small fixed table — only a handful needed).
-    static constexpr int MAX_IO_PORTS = 16;
+    static constexpr int MAX_IO_PORTS = 32;
     IoPortEntry io_ports[MAX_IO_PORTS] {};
     int         n_io_ports = 0;
 

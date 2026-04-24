@@ -561,42 +561,57 @@ scratch — replaced with `emit_fastmem_store_imm32` (imm-to-mem, no clobber).
 
 ### Phase 3: Xbox Hardware
 
-#### 5.15 Xbox Physical Address Map
+#### 5.15 Xbox Physical Address Map ✅
 ```
 Guest PA          Size       Type
 ──────────────────────────────────────────
 0x00000000       64/128 MB   RAM (retail/devkit)
 0x0C000000       128 MB      RAM mirror (NV2A tiling)
-0xF0000000         8 MB      Flash ROM
+0xF0000000         1 MB      Flash ROM
 0xFD000000        16 MB      NV2A GPU registers (MMIO)
 0xFE800000         4 MB      APU / AC97 (MMIO)
-0xFEC00000         4 MB      I/O APIC (MMIO)
-0xFF000000         1 MB      BIOS shadow (MMIO/ROM)
+0xFEC00000         4 KB      I/O APIC (MMIO)
+0xFF000000         1 MB      BIOS shadow (Flash alias)
 ```
 
-The MMIO dispatch table (`MmioMap`) needs to be populated with handlers for each
-device region. The current stub handler logs and returns `0xDEADBEEF`.
+Implemented in `src/xbox.hpp` with `xbox_setup()` function:
+- **RAM mirror** at 0x0C000000: reads/writes alias main RAM (modulo 64 MB).
+- **Flash ROM** at 0xF0000000: 1 MB read-only, defaults to 0xFF (empty).
+- **BIOS shadow** at 0xFF000000: maps to Flash ROM.
+- **NV2A GPU stub**: register reads return realistic defaults (PMC_BOOT_0 chip
+  ID, PFB_CFG0 memory config, PTIMER, PCRTC, PVIDEO). Writes update state.
+- **APU stub**: all-zero reads, writes silently dropped.
+- **I/O APIC**: index/data register pair with 24 redirection entries.
+- **PCI configuration space**: I/O ports 0xCF8/0xCFC with Xbox device table
+  (Host Bridge, LPC, SMBus, NV2A, APU, USB×2, IDE, AGP bridge).
+- **SMBus**: I/O ports 0xC000–0xC00E, status/control/address/data registers,
+  auto-complete transactions, EEPROM read stub (device 0x54).
+- **PIC/PIT/System Port B**: stub handlers for basic Xbox hardware.
+- **Debug console**: I/O port 0xE9 (bochs-style putchar).
 
-#### 5.15 NV2A GPU
+Test runner supports `--xbox` flag to use the full Xbox address map.
+`MAX_IO_PORTS` increased from 16 to 32.
+
+#### 5.16 NV2A GPU
 **Priority: CRITICAL for games** — 16 MB of MMIO registers at `0xFD000000`.
 Responsible for all graphics. The NV2A is an NV20-class GPU (GeForce 3 derivative).
 This is by far the largest single implementation effort.
 
-#### 5.16 APU (Audio Processing Unit)
+#### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
 
-#### 5.17 Other Devices
+#### 5.18 Other Devices
 - SMBus (EEPROM, temperature sensor, video encoder)
 - IDE controller (HDD, DVD)
 - USB (controllers)
 - PCI configuration space
 - MCPX boot ROM
 
-#### 5.18 XBE Loader
+#### 5.19 XBE Loader
 **Priority: HIGH** — Parse Xbox executable format (.xbe) headers, set up initial
 memory layout, resolve kernel imports. Without this, can't load actual games.
 
-#### 5.19 Kernel HLE or LLE
+#### 5.20 Kernel HLE or LLE
 Two paths:
 - **HLE (High-Level Emulation)**: intercept Xbox kernel API calls at the symbol
   boundary; stub or reimplement each export. Faster to develop, less accurate.
