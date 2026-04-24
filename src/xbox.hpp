@@ -22,6 +22,10 @@
 //   0x0CF8            PCI config address
 //   0x0CFC–0x0CFF     PCI config data
 //   0xC000–0xC00F     SMBus (MCPX)
+//   0x01F0–0x01F7     IDE primary (HDD)
+//   0x0170–0x0177     IDE secondary (DVD)
+//   0x03F6            IDE primary control
+//   0x0376            IDE secondary control
 //   0xE9              Debug console (bochs-style)
 // ---------------------------------------------------------------------------
 
@@ -1232,6 +1236,16 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     // SMBus (0xC000–0xC00F): register even-numbered ports used by kernel
     for (uint16_t p = 0xC000; p <= 0xC00E; p += 2)
         exec.register_io(p, smbus_io_read, smbus_io_write, &hw->smbus);
+
+    // IDE (ATA) — primary channel (HDD): 0x1F0–0x1F7, ctrl 0x3F6
+    for (uint16_t p = 0x1F0; p <= 0x1F7; p++)
+        exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
+    exec.register_io(0x3F6, ide_io_read, ide_io_write, &hw->ide);
+
+    // IDE (ATA) — secondary channel (DVD): 0x170–0x177, ctrl 0x376
+    for (uint16_t p = 0x170; p <= 0x177; p++)
+        exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
+    exec.register_io(0x376, ide_io_read, ide_io_write, &hw->ide);
 
     return hw;
 }

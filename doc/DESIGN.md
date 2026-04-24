@@ -1349,10 +1349,42 @@ Remaining devices:
 
 Remaining devices:
 - SMBus — implemented (see below)
-- IDE controller (HDD, DVD)
+- IDE controller — implemented (see below)
 - USB (controllers)
 - PCI configuration space — implemented
 - MCPX boot ROM
+
+**IDE Controller (ATA)** ✅ DONE (stub)
+
+Dual-channel ATA controller (PCI Bus 0, Dev 9) with standard I/O ports:
+
+- **Primary channel** (HDD): 0x1F0–0x1F7 (task file), 0x3F6 (control/alt status)
+- **Secondary channel** (DVD): 0x170–0x177 (task file), 0x376 (control/alt status)
+
+Task-file registers (R/W): Error, Features, Sector Count, LBA Low/Mid/High,
+Device/Head.  Status register is read-only; Command register is write-only
+(same port 0x1F7/0x177).
+
+**ATA commands handled:**
+
+| Command | Opcode | Behaviour |
+|---|---|---|
+| IDENTIFY DEVICE | 0xEC | Sets DRQ (status = 0x58), fills 512-byte identify buffer |
+| IDENTIFY PACKET DEVICE | 0xA1 | Same (for ATAPI/DVD) |
+| SET FEATURES | 0xEF | Succeeds immediately (status = 0x50) |
+| INITIALIZE DEVICE PARAMETERS | 0x91 | Succeeds immediately |
+| FLUSH CACHE | 0xE7 | Succeeds immediately |
+| Unknown | * | Sets ERR + ABRT (status = 0x51, error = 0x04) |
+
+**Device identity:** Primary master = "XBOX HDD" (~8 GB LBA28), secondary
+master = "XBOX DVD" (ATAPI CD-ROM).  Both report ATA-6, LBA capable.
+
+**Software reset:** Writing SRST (bit 2) to control register resets
+task-file to post-reset defaults (status = 0x50, error = 0x01).
+
+**Test:** `tests/ide.asm` — 14 assertions covering init status, task-file
+R/W, IDENTIFY, SET FEATURES, unknown command error, alternate status,
+and software reset.
 
 **SMBus Controller** ✅ DONE
 
