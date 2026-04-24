@@ -193,6 +193,7 @@ and rebuild.
 | `tests/advanced.asm`  | CMOVcc/SETcc/BT/BSF/BSWAP/SHLD/IMUL (42)        | ✅ ALL PASS   |
 | `tests/string.asm`    | MOVS/STOS/LODS/CMPS/SCAS + REP (36 assertions)  | ✅ ALL PASS   |
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
+| `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
 
 ---
 
@@ -233,7 +234,9 @@ and rebuild.
 - [x] Debug console (port 0xE9 Bochs-style character output)
 - [x] String instructions: MOVS/STOS/LODS/CMPS/SCAS with REP/REPE/REPNE (`IC_STRING`)
 - [x] FS/GS segment override support (emit_ea_to_r14 adds segment base from ctx)
-- [x] NASM test infrastructure: 8 suites, 329 total assertions, CMake integration
+- [x] CALL [mem] / JMP [mem] via C helpers (read_guest_mem32 / call_mem_helper)
+- [x] PUSH [mem] / POP [mem] via C helpers (push_mem_helper / pop_mem_helper)
+- [x] NASM test infrastructure: 9 suites, 349 total assertions, CMake integration
 
 ---
 
@@ -320,15 +323,16 @@ EA into R14 and moves the result to the destination register, with no memory
 access. `XCHG [mem], reg` / `CMPXCHG [mem], reg` still need read-modify-write
 support.
 
-#### 5.8 CALL/JMP Indirect Through Memory
-**Priority: MEDIUM** — `JMP [mem]` is partially handled; `CALL [mem]` (vtable
-dispatch) is not. C++ games hit this constantly.
+#### 5.8 ~~CALL/JMP Indirect Through Memory~~ ✅ DONE
+`JMP [mem]`, `CALL [mem]`, `PUSH [mem]`, `POP [mem]` all implemented via
+C helper functions (`read_guest_mem32`, `write_guest_mem32`, `call_mem_helper`,
+`push_mem_helper`, `pop_mem_helper`). The helpers handle both fastmem and MMIO
+paths transparently. Verified by `tests/indirect.asm` (20 assertions).
 
-#### 5.9 ~~PUSH/POP Immediate~~ ✅ DONE + Memory Forms Still Needed
+#### 5.9 ~~PUSH/POP Immediate~~ ✅ DONE + ~~Memory Forms~~ ✅ DONE
 **PUSH imm8/imm32 resolved.** The `emit_handler_push` detects immediate operands
-and emits SUB ESP,4 + fastmem store of the immediate. Verified by Test 3
-(`PUSH 0x12345678`). Still needed:
-- `PUSH [mem]` / `POP [mem]`
+and emits SUB ESP,4 + fastmem store of the immediate. `PUSH [mem]` and `POP [mem]`
+now handled via C helpers. Still needed:
 - `PUSHA` / `POPA` (used by some Xbox code)
 
 #### 5.10 Privileged Instruction Handling — Partially Done
