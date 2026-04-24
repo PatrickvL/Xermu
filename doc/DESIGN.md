@@ -228,7 +228,23 @@ The bump is correctly skipped for them (they are not stores).
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
 | `pe_loader.hpp`       | Win32 PE loader (xboxkrnl.exe) + export resolver | ✅ Working    |
 | `xbe_loader.hpp`      | Xbox XBE loader: sections, thunks, TLS, HLE     | ✅ Working    |
+| `xbox.hpp`            | Umbrella header — includes all `src/xbox/` files | ✅ Working    |
+| `xbox/address_map.hpp` | Xbox physical address map constants              | ✅ Working    |
+| `xbox/nv2a.hpp`       | NV2A GPU: PMC, PFIFO, PTIMER, PCRTC, PRAMDAC stubs | ✅ Working |
+| `xbox/nv2a_thread.hpp` | NV2A PFIFO dedicated host thread (CV-driven)    | ✅ Working    |
 | `xbox/pgraph.hpp`     | PGRAPH state shadow (NV097 method → state)       | ✅ Working    |
+| `xbox/apu.hpp`        | APU register stubs (VP/GP/EP)                    | ✅ Working    |
+| `xbox/ide.hpp`        | IDE ATA: channels, task file, IDENTIFY           | ✅ Working    |
+| `xbox/usb.hpp`        | USB OHCI controller stubs (2 ports each)         | ✅ Working    |
+| `xbox/ioapic.hpp`     | I/O APIC register stubs                          | ✅ Working    |
+| `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
+| `xbox/flash.hpp`      | Flash ROM + MCPX: BIOS loading, shadow           | ✅ Working    |
+| `xbox/pci.hpp`        | PCI configuration space (type 0, CF8/CFC)        | ✅ Working    |
+| `xbox/smbus.hpp`      | SMBus: EEPROM, SMC, video encoder                | ✅ Working    |
+| `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
+| `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
+| `xbox/misc_io.hpp`    | System control port 0x61, debug console 0xE9     | ✅ Working    |
+| `xbox/setup.hpp`      | XboxHardware struct, tick callback, xbox_setup()  | ✅ Working    |
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (52 assertions)                   | ✅ ALL PASS   |
@@ -322,6 +338,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
 - [x] NASM test infrastructure: 33 suites, CMake integration
+- [x] NV2A PFIFO on dedicated host thread (parallel with guest CPU, CV-driven)
 
 ---
 
@@ -663,12 +680,18 @@ Periodic vblank interrupt (~60 Hz) from the NV2A CRTC:
   interrupt, clear PCRTC_INTR_0 via W1C, send EOI to PIC.
 - **Tick rate**: VBLANK_PERIOD = 16667 ticks (~60 Hz at 1 tick/trace).
 
-**PFIFO (command FIFO engine)** ✅ DONE (DMA pusher + command parser)
+**PFIFO (command FIFO engine)** ✅ DONE (DMA pusher + command parser + dedicated thread)
 
 The DMA pusher reads NV2A push buffer commands from guest RAM and dispatches
-them through a pluggable `MethodHandler` callback.  `tick_fifo()` runs each
-hardware tick (up to 128 dwords/tick) and parses the standard NV2A command
-format:
+them through a pluggable `MethodHandler` callback.  PFIFO runs on a dedicated
+host thread (`src/xbox/nv2a_thread.hpp`), mirroring the real NV2A where the
+PFIFO DMA engine operates independently from the CPU.  The guest CPU's only
+interaction is writing `CACHE1_DMA_PUT`; the thread wakes via a condition
+variable, drains the push buffer until `DMA_GET == DMA_PUT`, and goes back to
+sleep.  This decouples GPU command processing from the CPU tick callback,
+allowing true parallel execution.
+
+Command format:
 
 - **INCREASING** (type 0): `count` data dwords dispatched to consecutive
   methods starting at `method` (method, method+4, method+8, …).
@@ -720,7 +743,7 @@ pusher.  The state shadow tracks:
 - **Primitive**: BEGIN_END mode, draw count, clear count
 
 The state shadow is wired via `Nv2aState::method_handler` so that every
-method dispatched by `tick_fifo()` updates the shadow automatically.
+method dispatched by the PFIFO thread updates the shadow automatically.
 14-assertion C++ unit test (`src/test_pgraph.cpp`) verifies end-to-end:
 push buffer commands → PFIFO parse → PGRAPH state capture.
 
@@ -763,10 +786,10 @@ Guest push buffer (PFIFO DMA)
     │
     ▼
 ┌────────────────────┐
-│  Command Parser     │  Read NV2A method/data pairs from push buffer
-│  (compute shader)   │  → runs on GPU, not CPU
+│  PFIFO Thread       │  Dedicated host thread; wakes on DMA_PUT write.
+│  (host CPU thread)  │  Parses push buffer, dispatches NV097 methods.
 └────────┬───────────┘
-         │
+         │  (future: migrate to GPU compute shader)
          ▼
 ┌────────────────────┐
 │  PGRAPH State       │  Shadow NV2A register state (combiners, textures,
@@ -775,8 +798,8 @@ Guest push buffer (PFIFO DMA)
          │
          ▼
 ┌────────────────────┐
-│  Shader Compiler    │  NV2A vertex shader → SPIR-V vertex shader
-│  (SPIR-V)           │  NV2A register combiners → SPIR-V fragment shader
+│  Shader Interpreter │  NV2A vertex shader → interpreted in SPIR-V VS/CS
+│  (SPIR-V)           │  NV2A register combiners → interpreted in SPIR-V FS
 └────────┬───────────┘
          │
          ▼

@@ -2,6 +2,7 @@
 // Xbox hardware setup — XboxHardware struct, tick callback, xbox_setup().
 #include "address_map.hpp"
 #include "nv2a.hpp"
+#include "nv2a_thread.hpp"
 #include "pgraph.hpp"
 #include "apu.hpp"
 #include "ide.hpp"
@@ -22,6 +23,7 @@ namespace xbox {
 struct XboxHardware {
     MmioMap     mmio;
     Nv2aState    nv2a;
+    Nv2aThread   nv2a_thread;
     PgraphState  pgraph;
     ApuState    apu;
     IdeState    ide;
@@ -41,7 +43,7 @@ static void hw_tick_callback(void* user) {
     auto* hw = static_cast<XboxHardware*>(user);
     hw->pit.tick();
     hw->nv2a.tick_timer();
-    hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
+    // PFIFO is processed by the NV2A thread (nv2a_thread.hpp), not here.
     if (hw->nv2a.vblank_irq_pending) {
         hw->nv2a.vblank_irq_pending = false;
         hw->pic.raise_irq(1);
@@ -68,6 +70,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     hw->nv2a.method_handler = pgraph_method_handler;
     hw->nv2a.method_user    = &hw->pgraph;
     hw->nv2a.pgraph_ptr     = &hw->pgraph;
+
+    // Wire PFIFO notification → NV2A thread.
+    hw->nv2a.fifo_notify      = nv2a_thread_notify;
+    hw->nv2a.fifo_notify_user = &hw->nv2a_thread;
 
     hw->mmio.add(APU_BASE, APU_SIZE,
                  apu_read, apu_write, &hw->apu);
@@ -123,6 +129,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     for (uint16_t p = 0x170; p <= 0x177; p++)
         exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);
     exec.register_io(0x376, ide_io_read, ide_io_write, &hw->ide);
+
+    // Start the NV2A PFIFO processing thread — must be last, after all
+    // hardware wiring is complete.
+    hw->nv2a_thread.start(&hw->nv2a, hw->ram, hw->ram_size);
 
     return hw;
 }
