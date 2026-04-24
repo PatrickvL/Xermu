@@ -1241,6 +1241,30 @@ waiting for DSP status transitions.
 **Test:** `tests/apu.asm` — 12 assertions covering init defaults, R/W,
 and W1C behaviour.
 
+**Audio backend — XAudio2:**
+
+Host audio output uses XAudio2 (Windows 10+ SDK, zero external deps).
+The XAudio2 voice graph maps directly to the MCPX APU pipeline:
+
+| MCPX sub-unit | XAudio2 equivalent | Role |
+|---|---|---|
+| VP (Voice Processor) | Source voices (up to 256) | Per-voice ADPCM decode, pitch shift, volume envelope |
+| GP (Global Processor) | Submix voice | Global mix, reverb/chorus DSP effects |
+| EP (Encode Processor) | Mastering voice | Final stereo/5.1 output to host audio device |
+
+Implementation plan:
+1. Create `IXAudio2` engine + mastering voice on xbox_setup().
+2. VP voice activation: when guest writes a voice descriptor with
+   `NV_PAPU_VOICE_ON`, create an XAudio2 source voice, configure
+   format (PCM8/PCM16/ADPCM) from the voice parameters, point the
+   buffer at `guest_ram + voice_buf_base`.
+3. GP mixing: single submix voice collects all active source voices.
+   Per-voice 3D panning and volume applied via `SetOutputMatrix()`.
+4. EP output: mastering voice → host audio device (WASAPI backend).
+5. Tick integration: VP voice list scanned each frame (~60 Hz) to
+   start/stop XAudio2 source voices matching guest state changes.
+   No per-sample emulation — let XAudio2 do the heavy lifting.
+
 #### 5.18 Other Devices
 
 **8259A PIC (Programmable Interrupt Controller)** ✅ DONE
