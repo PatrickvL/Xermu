@@ -65,10 +65,14 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t pa) {
 
 // Write a 32-bit value to guest physical memory (or MMIO).
 // Used by PUSH [mem] and CALL [mem] handlers.
+// Also bumps the SMC page version for the target page.
 void write_guest_mem32(GuestContext* ctx, uint32_t pa, uint32_t val) {
     if (pa < ctx->ram_size) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = val;
+        // Bump SMC page version
+        auto* pv = reinterpret_cast<uint32_t*>(ctx->page_versions);
+        if (pv) pv[pa >> 12]++;
         return;
     }
     if (ctx->mmio) ctx->mmio->write(pa, val, 4);
@@ -412,6 +416,7 @@ static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
     emit_fastmem_op(e, guest_enc, size_bits, is_load);
+    if (!is_load) emit_smc_page_bump(e);  // SMC: bump page version on store
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
@@ -443,6 +448,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
     if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
     else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
     else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
+    emit_smc_page_bump(e);  // SMC: bump page version on store
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
@@ -552,6 +558,8 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Fast path: rewrite the instruction to use [R12+R14]
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    // SMC: bump page version if memory is the destination (write-back)
+    if (mem_idx == 0) emit_smc_page_bump(e);
     uint8_t* done_site = emit_jmp_fwd(e);
 
     // Slow path: MMIO not supported for ALU-mem — UD2 trap
@@ -602,6 +610,8 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     // Fast path: restore flags, then execute instruction
     emit_restore_flags(e);                      // POPFQ
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    // SMC: SETcc [mem] writes to memory (mem_idx == 0)
+    if (mem_idx == 0) emit_smc_page_bump(e);
     uint8_t* done_site = emit_jmp_fwd(e);       // JMP done
 
     // Slow path: balance PUSHFQ then UD2
@@ -704,6 +714,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_store_imm32(e, imm);
+        emit_smc_page_bump(e);
         uint8_t* done_site = emit_jmp_fwd(e);
 
         Emitter::patch_rel32(slow_site, e.cur());
@@ -732,6 +743,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_op(e, reg_enc, 32, false);
+        emit_smc_page_bump(e);
         uint8_t* done_site = emit_jmp_fwd(e);
 
         Emitter::patch_rel32(slow_site, e.cur());
@@ -1117,6 +1129,8 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) {
         return false;
     }
+    // SMC: bump page version if memory is the destination (FPU store)
+    if (mem_idx == 0) emit_smc_page_bump(e);
     uint8_t* done_site = emit_jmp_fwd(e);
 
     // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
@@ -1209,8 +1223,8 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             uint32_t target = pc_after + (uint32_t)(int32_t)op.imm.value.s;
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
-            e.emit8(0xB9); e.emit32(pc_after); // MOV ECX, retaddr
-            emit_fastmem_op(e, GP_ECX, 32, false);
+            emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
+            emit_smc_page_bump(e);
             emit_epilog_static(e, target);
             return;
         }
@@ -1219,8 +1233,8 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             if (reg32_enc(op.reg.value, enc)) {
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
-                e.emit8(0xB9); e.emit32(pc_after);
-                emit_fastmem_op(e, GP_ECX, 32, false);
+                emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
+                emit_smc_page_bump(e);
                 emit_epilog_dynamic(e, enc);
                 return;
             }

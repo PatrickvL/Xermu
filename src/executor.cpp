@@ -126,6 +126,7 @@ bool Executor::init(MmioMap* mmio) {
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
+    ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // SMC write-side
 
     // Initialize guest FPU state to clean defaults.
     // FCW = 0x037F: all x87 exceptions masked, double precision, round-nearest
