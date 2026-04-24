@@ -1590,6 +1590,21 @@ system binaries into guest RAM:
   to a temp file, loads it, and verifies image base, entry point, section
   content, ordinal resolution, and error handling.
 
+**LLE Boot Entry Shim** ✅ DONE
+
+`test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]` boots from a BIOS dump:
+
+- Loads the BIOS image into `FlashState` (256 KB mirrored or 1 MB direct).
+- Optionally loads a 512-byte MCPX ROM into the hidden ROM region.
+- Initialises Xbox hardware via `xbox_setup()` (PCI, PIC, PIT, SMBus,
+  NV2A, APU, IDE, USB, Flash).
+- Begins execution at the x86 reset vector (`0xFFFFFFF0`) — the flash
+  MMIO handler serves the first instruction from the BIOS image.
+- The JIT runs in 32-bit protected mode; the BIOS is expected to set up
+  its own GDT/IDT and transition to a known state.
+
+All LLE infrastructure gaps are now closed:
+
 - **Remaining gaps for LLE boot:**
 
 | Gap | Difficulty | Status |
@@ -1597,7 +1612,7 @@ system binaries into guest RAM:
 | SYSENTER / SYSEXIT | Easy | ✅ DONE |
 | SYSENTER MSRs (CS/EIP/ESP) | Easy | ✅ DONE |
 | PE loader for xboxkrnl.exe | Medium | ✅ DONE |
-| MCPX/2BL boot chain (or entry shim) | Medium | ROM loading ✅ DONE; boot execution planned |
+| MCPX/2BL boot chain (or entry shim) | Medium | ✅ DONE |
 | OHCI USB controller stub | Medium | ✅ DONE |
 | More complete GDT/TSS handling | Easy | ✅ DONE |
 | MTRR MSRs | Easy | ✅ DONE |

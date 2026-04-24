@@ -2,6 +2,7 @@
 // test_runner — loads flat 32-bit binaries and executes them through the JIT.
 //
 // Usage:  test_runner [--xbox] <test.bin> [load_pa_hex]
+//         test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]
 //
 // Convention:
 //   Code is loaded at the specified PA (default 0x1000).
@@ -11,6 +12,9 @@
 //
 //   --xbox: Use the Xbox physical address map with real device stubs
 //           instead of the default catch-all stub MMIO.
+//   --bios: LLE boot mode — load a BIOS image into flash, initialise Xbox
+//           hardware, and start execution at the x86 reset vector (0xFFFFFFF0).
+//   --mcpx: (optional with --bios) Load a 512-byte MCPX ROM dump.
 // ---------------------------------------------------------------------------
 
 #include "executor.hpp"
@@ -55,17 +59,90 @@ static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n");
+        fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n"
+                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]\n");
         return 2;
     }
 
-    // Parse optional --xbox flag.
+    // Parse flags.
     bool xbox_mode = false;
+    bool bios_mode = false;
+    const char* bios_path = nullptr;
+    const char* mcpx_path = nullptr;
     int argi = 1;
-    if (argc > 1 && strcmp(argv[1], "--xbox") == 0) {
-        xbox_mode = true;
-        argi++;
+
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strcmp(argv[argi], "--xbox") == 0) {
+            xbox_mode = true;
+            argi++;
+        } else if (strcmp(argv[argi], "--bios") == 0) {
+            bios_mode = true;
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--bios requires a BIOS image path\n");
+                return 2;
+            }
+            bios_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--mcpx") == 0) {
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--mcpx requires an MCPX ROM path\n");
+                return 2;
+            }
+            mcpx_path = argv[argi++];
+        } else {
+            break;
+        }
     }
+
+    if (bios_mode) {
+        // ---- LLE boot mode ----
+        printf("[test_runner] LLE boot: loading BIOS '%s'\n", bios_path);
+
+        auto exec = std::make_unique<Executor>();
+        auto* hw = xbox::xbox_setup(*exec);
+
+        // Load BIOS into flash.
+        if (!hw->flash.load_bios(bios_path)) {
+            fprintf(stderr, "Failed to load BIOS image '%s'\n", bios_path);
+            delete hw;
+            return 2;
+        }
+        printf("[test_runner] BIOS loaded into flash\n");
+
+        // Optionally load MCPX ROM.
+        if (mcpx_path) {
+            if (!hw->flash.load_mcpx(mcpx_path)) {
+                fprintf(stderr, "Failed to load MCPX ROM '%s'\n", mcpx_path);
+                delete hw;
+                return 2;
+            }
+            printf("[test_runner] MCPX ROM loaded\n");
+        }
+
+        // x86 reset state: start at the reset vector.
+        // Real hardware starts in 16-bit real mode at CS:IP = F000:FFF0
+        // (physical 0xFFFFFFF0).  Our JIT runs in 32-bit protected mode,
+        // so we set EIP to the physical address directly — the flash MMIO
+        // handler serves the correct bytes.
+        static constexpr uint32_t RESET_VECTOR = 0xFFFFFFF0u;
+        exec->ctx.eflags = 0x0000'0002;  // minimal: reserved bit 1 set
+        exec->ctx.gp[GP_ESP] = 0;        // no stack initially
+
+        printf("[test_runner] Starting execution at reset vector 0x%08X\n",
+               RESET_VECTOR);
+
+        exec->run(RESET_VECTOR, /*max_steps=*/100'000'000);
+
+        printf("[test_runner] Halted: EIP=0x%08X EAX=0x%08X\n",
+               exec->ctx.eip, exec->ctx.gp[GP_EAX]);
+
+        exec->destroy();
+        delete hw;
+        return 0;
+    }
+
+    // ---- Test binary mode ----
     if (argi >= argc) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n");
         return 2;
