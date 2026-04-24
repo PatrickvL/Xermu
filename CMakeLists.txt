@@ -89,6 +89,7 @@ set(TEST_ASM_FILES
     tests/linking.asm
     tests/pic.asm
     tests/pit.asm
+    tests/nv2a_timer.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -119,7 +120,7 @@ if(NASM_EXECUTABLE)
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
-        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit")
+        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit" OR test_name STREQUAL "nv2a_timer")
             add_test(
                 NAME    ${test_name}
                 COMMAND test_runner --xbox ${bin_file}

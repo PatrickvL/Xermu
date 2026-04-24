@@ -247,6 +247,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
 | `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
+| `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 
 ---
 
@@ -304,7 +305,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 19 suites, CMake integration
+- [x] NASM test infrastructure: 20 suites, CMake integration
 
 ---
 
@@ -599,7 +600,9 @@ Implemented in `src/xbox.hpp` with `xbox_setup()` function:
   (Host Bridge, LPC, SMBus, NV2A, APU, USB×2, IDE, AGP bridge).
 - **SMBus**: I/O ports 0xC000–0xC00E, status/control/address/data registers,
   auto-complete transactions, EEPROM read stub (device 0x54).
-- **PIC/PIT/System Port B**: stub handlers for basic Xbox hardware.
+- **PIC**: full 8259A dual PIC (§5.18).
+- **PIT**: full 8254 timer, ch0 → IRQ 0 (§5.18).
+- **System Port B**: stub (timer 2 output bit).
 - **Debug console**: I/O port 0xE9 (bochs-style putchar).
 
 Test runner supports `--xbox` flag to use the full Xbox address map.
@@ -609,6 +612,21 @@ Test runner supports `--xbox` flag to use the full Xbox address map.
 **Priority: CRITICAL for games** — 16 MB of MMIO registers at `0xFD000000`.
 Responsible for all graphics. The NV2A is an NV20-class GPU (GeForce 3 derivative).
 This is by far the largest single implementation effort.
+
+**PTIMER (freerunning counter)** ✅ DONE
+
+`Nv2aState::ptimer_ns` is a 64-bit monotonic nanosecond counter, advanced by
+100 ns per executor tick (via `hw_tick_callback`).  MMIO reads:
+
+| Register           | Offset     | Behaviour                                 |
+|--------------------|-----------|-------------------------------------------|
+| `PTIMER_NUMERATOR` | 0x009200  | Read/write clock multiplier               |
+| `PTIMER_DENOMINATOR`| 0x009210 | Read/write clock divider                  |
+| `PTIMER_TIME_0`    | 0x009400  | Low 32 bits of counter (bits [4:0] = 0)   |
+| `PTIMER_TIME_1`    | 0x009410  | High 29 bits of counter (ns >> 32)        |
+| `PTIMER_INTR_0`    | 0x009100  | Interrupt status (stub: always 0)         |
+
+This prevents Xbox kernel and game busy-wait loops that spin on PTIMER.
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
