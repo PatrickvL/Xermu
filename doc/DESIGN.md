@@ -158,12 +158,22 @@ to the two-byte `FF /0` / `FF /1` forms.
 ### 2.6 Self-Modifying Code Detection
 
 Page-granular version tags (`PageVersions`). Each guest page has a `uint32_t`
-version counter. Before executing a cached trace, the run loop compares the
-trace's recorded page version against the current version. On mismatch: invalidate
-and rebuild.
+version counter. Every inline fastmem store emits a page-version bump sequence
+(`emit_smc_page_bump`) wrapped in PUSHFQ/POPFQ to preserve guest EFLAGS.
+The C-helper slow path (`write_guest_mem32`) also bumps the version.
+Before executing a cached trace, the run loop compares the trace's recorded page
+version against the current version. On mismatch: invalidate and rebuild.
 
-> **Not yet implemented**: bumping page versions on fastmem writes. Currently only
-> the lookup/validate/rebuild cycle is wired; stores don't increment versions.
+The bump sequence (16 bytes per store):
+```
+PUSHFQ                       ; save EFLAGS
+PUSH RAX                     ; save scratch
+MOV RAX, [R13+120]           ; load page_versions pointer
+SHR R14D, 12                 ; page index from PA in R14
+INC DWORD [RAX+R14*4]        ; bump version
+POP RAX                      ; restore
+POPFQ                        ; restore EFLAGS
+```
 
 ---
 
@@ -198,6 +208,7 @@ and rebuild.
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
 | `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
 | `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC (33)    | ✅ ALL PASS   |
+| `tests/smc.asm`       | Self-modifying code: patch imm/opcode/jmp/alu (11) | ✅ ALL PASS   |
 
 ---
 
@@ -253,7 +264,9 @@ and rebuild.
 - [x] ENTER imm16, imm8 stack frame creation via C helper (IC_ENTER)
 - [x] XLATB table lookup [EBX+AL] via C helper (IC_XLATB)
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
-- [x] NASM test infrastructure: 11 suites, 390 total assertions, CMake integration
+- [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
+- [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
+- [x] NASM test infrastructure: 12 suites, 401 total assertions, CMake integration
 
 ---
 
@@ -424,12 +437,19 @@ conditions (e.g., page-not-present during TLB walk) and emit an inline exception
 delivery sequence, or return to the run loop with an exception code that triggers
 delivery before the next trace.
 
-#### 5.13 SMC Write-Side Version Bumping
-**Priority: MEDIUM** — The read-side validation (check page version before trace
-execution) is implemented. The write-side (bump `page_versions[pa >> 12]++` on
-every store) is not. For correctness, every fastmem store must also increment the
-version of the target page. This is a single `INC DWORD PTR [page_versions + ...]`
-per store — emitted inline or done via a thin wrapper.
+#### 5.13 ~~SMC Write-Side Version Bumping~~ ✅ DONE
+**Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a 16-byte
+PUSHFQ/POPFQ-wrapped sequence that loads the `page_versions` pointer from
+`GuestContext` (offset 120), right-shifts R14D (PA) by 12 to get the page index,
+and increments the version counter. The C-helper slow path (`write_guest_mem32`)
+also bumps the version. Nine JIT call sites covered: `emit_fastmem_dispatch`,
+`emit_fastmem_dispatch_store_imm`, `emit_handler_alu_mem`, `emit_handler_flagmem`,
+`emit_handler_push` (imm/reg), `emit_handler_fpu_mem`, `emit_call_exit`
+(direct/register). Additionally fixed a pre-existing bug where CALL direct/register
+clobbered guest ECX by using `MOV ECX, retaddr` as scratch — replaced with
+`emit_fastmem_store_imm32` which writes the immediate directly to memory.
+Verified by `tests/smc.asm` (11 assertions: patch immediate, patch opcode, patch
+JMP target, patch ALU operation, repeated patches).
 
 ---
 

@@ -47,6 +47,11 @@ struct alignas(16) GuestContext {
     uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
     uint32_t  gs_base;        // [112] GS segment base
 
+    // SMC page-version array — pointer to PageVersions::ver[].
+    // Stores bump ver[pa>>12]++ for self-modifying code detection.
+    uint32_t  _pad_pv;        // [116] alignment padding
+    uint64_t  page_versions;  // [120] uint32_t* stored as uint64_t
+
     // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
     alignas(16) uint8_t guest_fpu[512];  // [128] guest x87/MMX/SSE state
@@ -61,6 +66,7 @@ static_assert(offsetof(GuestContext, ram_size)     == 56);
 static_assert(offsetof(GuestContext, mmio)         == 64);
 static_assert(offsetof(GuestContext, fs_base)      == 108);
 static_assert(offsetof(GuestContext, gs_base)      == 112);
+static_assert(offsetof(GuestContext, page_versions) == 120);
 static_assert(offsetof(GuestContext, guest_fpu)    == 128);
 static_assert(offsetof(GuestContext, host_fpu)     == 640);
 
