@@ -1,14 +1,14 @@
-# Xbox Guided Executor — Working Document
+# Guided Executor — Working Document
 
 ## 1. Project Goal
 
-Build a **JIT-based x86-32 CPU emulator** targeting the original Xbox (Pentium III,
-733 MHz, IA-32). The host is also x86-64 (Intel), so guest instructions can execute
-almost natively — only privileged and memory-sensitive instructions need rewriting.
+Build a **JIT-based x86-32 CPU emulator** targeting Pentium III class CPUs (IA-32,
+SSE1 + MMX). The host is also x86-64, so guest instructions can execute almost
+natively — only privileged and memory-sensitive instructions need rewriting.
 This is the "guided executor" model: host registers *are* guest registers, with
 surgical interception points.
 
-The executor provides a **sandbox** for the Xbox kernel: all ring-0 privileges
+The executor provides a **sandbox** for ring-0 guest code: all privileges
 (CR writes, LGDT, CLI/STI, IN/OUT) are emulated in userspace. Guest code cannot
 escape the fastmem window or affect real host hardware.
 
@@ -42,7 +42,7 @@ Guest EIP
          │ orchestrated by
          ▼
 ┌────────────────┐
-│  XboxExecutor   │  Run loop: lookup → validate → build → dispatch → repeat
+|│  Executor        │  Run loop: lookup → validate → build → dispatch → repeat
 │  (executor      │  SMC detection via page-version tags
 │   .hpp/.cpp)    │
 └─────────────────┘
@@ -179,7 +179,7 @@ and rebuild.
 | `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `PageVersions`   | ✅ Working    |
 | `insn_dispatch.hpp`   | Two-level O(1) mnemonic dispatch table          | ✅ Working    |
 | `trace_builder.cpp`   | Decode → classify → emit loop (table-driven)   | ✅ Working    |
-| `executor.hpp`        | `XboxExecutor` struct, `dispatch_trace` decl   | ✅ Working    |
+| `executor.hpp`        | `Executor` struct, `dispatch_trace` decl       | ✅ Working    |
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
@@ -226,7 +226,7 @@ and rebuild.
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
 - [x] Self-tests pass: sum loop, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm, x87 reg ops, x87 mem store
 - [x] SSE1/MMX memory-operand dispatch (36 SSE1 + 37 MMX mnemonics, `IC_SSE_MEM`)
-- [x] SSE2+ mnemonics conditionally compiled (`XBOX_TARGET_SSE` flag)
+- [x] SSE2+ mnemonics conditionally compiled (`TARGET_SSE` flag)
 - [x] PUSHFD/POPFD guest-stack handlers (`IC_PUSHFD`/`IC_POPFD`)
 - [x] LOOP/LOOPE/LOOPNE terminator handling (DEC ECX + conditional exit)
 - [x] MOVZX/MOVSX register-register forms (verbatim copy)
@@ -253,7 +253,7 @@ and rebuild.
 
 ## 5. What's Missing — Prioritized
 
-### Phase 1: Run Real x86-32 Code (No Xbox Hardware)
+### Phase 1: Run Real x86-32 Code (No Hardware Emulation)
 
 These are needed to execute non-trivial x86-32 programs beyond the self-test.
 
@@ -287,8 +287,8 @@ now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 112) and `host_fpu`
 MULPS, SHUFPS, COMISS, CVTSI2SS, LDMXCSR, etc.) and 37 MMX mnemonics (PADDB,
 PSHUFW, MASKMOVQ, etc.) are registered under `IC_SSE_MEM` and share the same
 `emit_handler_fpu_mem` handler (generic rewriter for memory forms, verbatim copy
-for register-only). SSE2+ mnemonics are gated behind `#if XBOX_TARGET_SSE >= 2`
-(default: 1, matching the Xbox Pentium III). Verified by `tests/sse.asm` (48
+for register-only). SSE2+ mnemonics are gated behind `#if TARGET_SSE >= 2`
+(default: 1, matching Pentium III Coppermine). Verified by `tests/sse.asm` (48
 assertions covering all major SSE1 instruction categories).
 
 **PUSHFD/POPFD** now have dedicated JIT handlers (`IC_PUSHFD`/`IC_POPFD`).
@@ -314,7 +314,8 @@ flags through unchanged. Verified by `tests/string.asm` (36 assertions).
 When a memory operand has an FS or GS segment prefix, `emit_ea_to_r14` computes
 the flat EA as usual, then emits `ADD R14D, [R13 + seg_offset]` to add the
 segment base from the context. Works with all addressing modes (disp-only,
-base, base+disp, base+index*scale+disp). The Xbox kernel uses FS for KPCR.
+base, base+disp, base+index*scale+disp). Common in kernels that use FS for
+thread-local state (e.g. Xbox KPCR, Windows KPCR).
 Verified by `tests/segment.asm` (22 assertions).
 
 #### 5.5 ~~8-bit and 16-bit Register Operands in Memory Dispatch~~ ✅ DONE
@@ -359,7 +360,7 @@ a trap to the run loop.
 |-------------------|----------------------------------------------------|
 | RDMSR / WRMSR     | ✅ Stub (advance EIP)                              |
 | MOV CRn, r / r, CRn | ✅ Read/write ctx->cr0/cr2/cr3/cr4              |
-| IN / OUT          | ✅ IoPortEntry dispatch table in XboxExecutor       |
+| IN / OUT          | ✅ IoPortEntry dispatch table in Executor          |
 | LGDT / LIDT       | ✅ Update ctx->gdtr/idtr base/limit                |
 | LLDT / LTR        | Stub needed (not yet encountered)                  |
 | CLI / STI         | ✅ Toggle ctx->virtual_if                          |
@@ -503,7 +504,7 @@ eliminating the CMP+JAE pair from every memory access.
 | 2 | DEC ECX silently becomes REX prefix | Short-form INC/DEC `0x40`–`0x4F` are REX in x64 | `emit_clean_insn()` re-encodes as `FF /0` / `FF /1` |
 | 3 | Host RSP clobbers `ctx->gp[ESP]` | `emit_save_all_gp` saved all 8 regs including ESP | Skip `GP_ESP` in save/load loops |
 | 4 | `ctx->gp[EAX]` = return address, not sum | `emit_ret_exit` loaded `[ESP]` into EAX before saving | Save GP regs first, write retaddr directly to `ctx->next_eip` |
-| 5 | Stack overflow on `XboxExecutor` construction | ~6.5 MB of embedded arrays (TraceCache, PageVersions) | Heap-allocate via `std::make_unique` |
+| 5 | Stack overflow on `Executor` construction | ~6.5 MB of embedded arrays (TraceCache, PageVersions) | Heap-allocate via `std::make_unique` |
 | 6 | MSVC: `#error` on `dispatch_trace` | GCC `__attribute__((naked))` not available on MSVC x64 | MASM `.asm` trampoline for MSVC |
 | 7 | MMIO slow-path calls corrupt args on Windows | JIT emitted SysV ABI (RDI/RSI/RDX/RCX) on Windows | Platform-aware `emit_ccall_arg*` helpers + shadow space |
 | 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | Conditional PUSHFQ/POPFQ wrapping gated by backward flag-liveness analysis |
@@ -512,7 +513,7 @@ eliminating the CMP+JAE pair from every memory access.
 
 ## 7. Sandbox Properties
 
-The executor provides containment of the Xbox kernel essentially for free:
+The executor provides containment of ring-0 guest code essentially for free:
 
 | Escape Vector | Mitigation |
 |---|---|
@@ -535,7 +536,7 @@ kernel believes it controls the machine — all silently intercepted.
 ```
 cmake -B build -A x64
 cmake --build build --config Release
-.\build\Release\xbox_executor.exe
+.\build\Release\guided_executor.exe
 ```
 
 Expected output:

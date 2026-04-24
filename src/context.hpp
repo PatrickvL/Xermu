@@ -43,7 +43,7 @@ struct alignas(16) GuestContext {
     bool      virtual_if;
     uint8_t   _pad_vif[3];   // alignment padding
 
-    // Segment base addresses (only FS/GS are non-zero on Xbox)
+    // Segment base addresses (only FS/GS are typically non-zero in protected mode)
     uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
     uint32_t  gs_base;        // [112] GS segment base
 

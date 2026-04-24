@@ -7,18 +7,18 @@
 
 // ---------------------------------------------------------------------------
 // Target CPU feature level.
-// Xbox original = Pentium III (Coppermine): SSE1 + MMX.  No SSE2.
+// Default = Pentium III Coppermine: SSE1 + MMX.  No SSE2.
 //
-//   XBOX_TARGET_SSE  Minimum CPU           SIMD features included
-//   ──────────────── ────────────────────── ─────────────────────────────
-//   0                Pentium / Pentium MMX  Base MMX only
-//   1 (default)      Pentium III            SSE1 float + SSE1 MMX extensions
-//   2                Pentium 4              SSE2 double + SSE2 integer SIMD
+//   TARGET_SSE  Minimum CPU           SIMD features included
+//   ────────── ────────────────────── ─────────────────────────────
+//   0           Pentium / Pentium MMX  Base MMX only
+//   1 (default) Pentium III            SSE1 float + SSE1 MMX extensions
+//   2           Pentium 4              SSE2 double + SSE2 integer SIMD
 //
 // All integer/FPU/privileged dispatch is unconditional (386+ / 486+ / P5+).
 // ---------------------------------------------------------------------------
-#ifndef XBOX_TARGET_SSE
-#define XBOX_TARGET_SSE 1
+#ifndef TARGET_SSE
+#define TARGET_SSE 1
 #endif
 
 // ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ inline void init_mnemonic_table() {
 
     // ---- String instructions (with optional REP/REPE/REPNE prefix) ----
     // Note: MOVSD and CMPSD share Zydis mnemonic with SSE2 scalar-double ops.
-    // Safe at XBOX_TARGET_SSE=1 (SSE2 off); if SSE2 is enabled, the handler
+    // Safe at TARGET_SSE=1 (SSE2 off); if SSE2 is enabled, the handler
     // disambiguates via operand type.
     for (auto m : {
         ZYDIS_MNEMONIC_MOVSB, ZYDIS_MNEMONIC_MOVSW, ZYDIS_MNEMONIC_MOVSD,
@@ -352,8 +352,8 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_PUNPCKHDQ,
     }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
 
-#if XBOX_TARGET_SSE >= 1
-    // ---- SSE1 (Pentium III / Xbox CPU) ----
+#if TARGET_SSE >= 1
+    // ---- SSE1 (Pentium III) ----
     // Register-only forms are verbatim-copied; memory forms use the
     // generic rewriter.  Only single-precision (PS/SS) variants exist.
     for (auto m : {
@@ -401,10 +401,10 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_MASKMOVQ,
         ZYDIS_MNEMONIC_MOVNTQ,
     }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
-#endif // XBOX_TARGET_SSE >= 1
+#endif // TARGET_SSE >= 1
 
-#if XBOX_TARGET_SSE >= 2
-    // ---- SSE2 (Pentium 4) — NOT present on Xbox Pentium III ----
+#if TARGET_SSE >= 2
+    // ---- SSE2 (Pentium 4) — NOT present on Pentium III ----
     for (auto m : {
         // Double-precision float data movement
         ZYDIS_MNEMONIC_MOVAPD,  ZYDIS_MNEMONIC_MOVUPD,
@@ -445,7 +445,7 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_PSHUFLW,
         ZYDIS_MNEMONIC_MASKMOVDQU,
     }) MNEMONIC_CLASS[m] = IC_SSE_MEM;
-#endif // XBOX_TARGET_SSE >= 2
+#endif // TARGET_SSE >= 2
 }
 
 // O(1) lookup: returns the InsnClassFlags for a mnemonic.

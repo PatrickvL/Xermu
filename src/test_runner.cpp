@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
              stub_mmio_read, stub_mmio_write);
 
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!exec->init(&mmio)) {
         fprintf(stderr, "Executor init failed\n");
         return 2;
