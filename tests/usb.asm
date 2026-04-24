@@ -36,7 +36,7 @@ ORG 0x1000
     ASSERT_EQ eax, 2
 
 ; === 4. USB0 HcFmInterval ===
-    mov eax, [0xFED00038]       ; HcFmInterval
+    mov eax, [0xFED00034]       ; HcFmInterval (offset 0x34 per OHCI spec)
     ASSERT_EQ eax, 0x27782EDF
 
 ; === 5. USB1 HcRevision ===
