@@ -164,6 +164,24 @@ inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
     e.emit32(reason);
 }
 
+// ---------------------------------------------------------------------------
+// Save host EFLAGS → ctx->eflags (offset 36).
+// Used before privileged-instruction traps so that deliver_interrupt() can
+// push the correct EFLAGS (including flags set by the last guest instruction).
+//   PUSHFQ            ; capture RFLAGS
+//   POP R14           ; R14 = RFLAGS (R14 is EA scratch, freely clobberable)
+//   MOV [R13+36], R14D
+// ---------------------------------------------------------------------------
+
+inline void emit_save_eflags(Emitter& e) {
+    e.emit8(0x9C);                              // PUSHFQ
+    e.emit8(0x41); e.emit8(0x5E);               // POP R14
+    // MOV DWORD [R13+36], R14D — REX=0x45 (R14.R + R13.B)
+    e.emit8(0x45); e.emit8(0x89);
+    e.emit8(uint8_t(0x40u | (6u << 3) | 5u));   // mod=01 reg=6(R14) rm=5(R13)
+    e.emit8(36);                                // disp8 = offsetof(eflags)
+}
+
 // Write ctx->next_eip from a guest register already in ctx (via its gp index).
 // Precondition: emit_save_all_gp has stored the live value into ctx->gp[gp_idx].
 //

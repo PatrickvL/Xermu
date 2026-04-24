@@ -178,6 +178,7 @@ uint32_t xlatb_helper(GuestContext* ctx) {
 
 // IRETD helper: pop EIP, CS, EFLAGS from guest stack (12 bytes).
 // Sets ctx->next_eip and ctx->eflags.  CS is ignored (flat model).
+// Also restores virtual_if from the IF bit of the popped EFLAGS.
 void iret_helper(GuestContext* ctx) {
     uint32_t esp = ctx->gp[GP_ESP];
     uint32_t new_eip    = read_guest_mem32(ctx, esp); esp += 4;
@@ -187,6 +188,8 @@ void iret_helper(GuestContext* ctx) {
     ctx->next_eip   = new_eip;
     // Preserve only safe flags (mask out VM, IOPL, VIF, VIP, RF):
     ctx->eflags = (new_eflags & 0x003F7FD5u) | 0x02u; // bit 1 always set
+    // Restore interrupt enable from the IF bit.
+    ctx->virtual_if = (new_eflags & 0x200u) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1561,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
         // ---- Privileged ----
         if (icf & ICF_PRIVILEGED) {
             emit_save_all_gp(e);
+            emit_save_eflags(e);
             emit_write_next_eip_imm(e, guest_pc);
             emit_set_stop_reason(e, STOP_PRIVILEGED);
             e.emit8(0xC3); // RET — run loop calls handle_privileged()
@@ -1578,6 +1582,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             }
             if (has_cr_dr) {
                 emit_save_all_gp(e);
+                emit_save_eflags(e);
                 emit_write_next_eip_imm(e, guest_pc);
                 emit_set_stop_reason(e, STOP_PRIVILEGED);
                 e.emit8(0xC3);

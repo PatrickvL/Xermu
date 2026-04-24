@@ -82,6 +82,7 @@ set(TEST_ASM_FILES
     tests/privileged.asm
     tests/misc.asm
     tests/smc.asm
+    tests/interrupt.asm
 )
 
 if(NASM_EXECUTABLE)
