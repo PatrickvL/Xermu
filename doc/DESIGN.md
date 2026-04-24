@@ -283,6 +283,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pci.asm`      | PCI config: BARs, IRQs, bridge, non-existent dev (18) | ✅ ALL PASS   |
 | `tests/pvideo.asm`   | NV2A PVIDEO: overlay buffer regs, scale, format (15) | ✅ ALL PASS   |
 | `tests/pbus.asm`     | NV2A PBUS: interrupt W1C, FBIO_RAM, debug (7)     | ✅ ALL PASS   |
+| `tests/pramdac.asm`  | NV2A PCRTC+PRAMDAC: START, RASTER, PLLs, TV (10)  | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---

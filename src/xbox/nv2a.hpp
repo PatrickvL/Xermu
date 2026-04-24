@@ -111,6 +111,8 @@ namespace pcrtc {
 static constexpr uint32_t INTR     = 0x100;    // vblank interrupt status (W1C)
 static constexpr uint32_t INTR_EN  = 0x140;    // vblank interrupt enable
 static constexpr uint32_t START    = 0x800;    // framebuffer start address
+static constexpr uint32_t CONFIG   = 0x804;    // display config (bpp, width)
+static constexpr uint32_t RASTER   = 0x808;    // current raster line (read-only)
 } // namespace pcrtc
 
 namespace pramdac {
@@ -119,7 +121,12 @@ static constexpr uint32_t MPLL      = 0x504;   // memory PLL
 static constexpr uint32_t VPLL      = 0x508;   // video PLL
 static constexpr uint32_t PLL_TEST  = 0x514;   // PLL test register
 static constexpr uint32_t FP_DEBUG0 = 0x600;   // flat-panel debug 0
+static constexpr uint32_t GENERAL_CTRL = 0x600; // general control
 static constexpr uint32_t FP_TMDS   = 0x8C0;   // TMDS control
+static constexpr uint32_t TV_SETUP  = 0x700;   // TV encoder setup
+static constexpr uint32_t TV_VTOTAL = 0x720;   // TV vertical total lines
+static constexpr uint32_t TV_VSKEW  = 0x724;   // TV vertical skew
+static constexpr uint32_t TV_VSYNC_D = 0x728;  // TV vsync delay
 } // namespace pramdac
 
 // ========================== NV2A State =====================================
@@ -353,6 +360,12 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     // --- PCRTC (0x600000) ---
     if (off >= 0x600000 && off < 0x601000) {
         uint32_t r = off - 0x600000;
+        // RASTER: current scanline (computed from vblank_counter).
+        // NTSC: 525 lines total, 480 visible. Map counter to scanline.
+        if (r == pcrtc::RASTER) {
+            uint32_t line = (nv->vblank_counter * 525u) / Nv2aState::VBLANK_PERIOD;
+            return line;
+        }
         if (r / 4 < Nv2aState::PCRTC_COUNT) return nv->pcrtc_regs[r / 4];
         return 0;
     }
