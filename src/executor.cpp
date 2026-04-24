@@ -339,9 +339,21 @@ void Executor::handle_privileged() {
               val = ((uint64_t)hi << 32) | lo; }
 #endif
             break;
+        // MTRR MSRs
+        case 0xFE:  val = ctx.mtrr_def_type; break; // IA32_MTRR_DEF_TYPE
+        case 0x2FF: val = 0x0000000000000508ULL; break; // IA32_MTRRCAP (8 VR, FIX, no WC)
+        case 0x250: val = ctx.mtrr_fix64k; break;       // IA32_MTRR_FIX64K_00000
+        case 0x258: val = ctx.mtrr_fix16k[0]; break;    // IA32_MTRR_FIX16K_80000
+        case 0x259: val = ctx.mtrr_fix16k[1]; break;    // IA32_MTRR_FIX16K_A0000
         default:
-            // Stub: return 0, log for debugging
-            fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
+            if (msr >= 0x200 && msr <= 0x20F) {
+                int idx = (msr - 0x200) / 2;
+                val = (msr & 1) ? ctx.mtrr_physmask[idx] : ctx.mtrr_physbase[idx];
+            } else if (msr >= 0x268 && msr <= 0x26F) {
+                val = ctx.mtrr_fix4k[msr - 0x268];
+            } else {
+                fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
+            }
             break;
         }
         ctx.gp[GP_EAX] = (uint32_t)val;
@@ -357,10 +369,22 @@ void Executor::handle_privileged() {
         case 0x174: ctx.sysenter_cs  = (uint32_t)val; break;
         case 0x175: ctx.sysenter_esp = (uint32_t)val; break;
         case 0x176: ctx.sysenter_eip = (uint32_t)val; break;
+        // MTRR MSRs
+        case 0xFE:  ctx.mtrr_def_type = val; break;      // IA32_MTRR_DEF_TYPE
+        case 0x250: ctx.mtrr_fix64k = val; break;         // IA32_MTRR_FIX64K_00000
+        case 0x258: ctx.mtrr_fix16k[0] = val; break;      // IA32_MTRR_FIX16K_80000
+        case 0x259: ctx.mtrr_fix16k[1] = val; break;      // IA32_MTRR_FIX16K_A0000
         default:
-            // Stub: log and ignore (MTRR, misc MSRs)
-            fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
-                    (unsigned long long)val);
+            if (msr >= 0x200 && msr <= 0x20F) {
+                int idx = (msr - 0x200) / 2;
+                if (msr & 1) ctx.mtrr_physmask[idx] = val;
+                else         ctx.mtrr_physbase[idx] = val;
+            } else if (msr >= 0x268 && msr <= 0x26F) {
+                ctx.mtrr_fix4k[msr - 0x268] = val;
+            } else {
+                fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
+                        (unsigned long long)val);
+            }
             break;
         }
         ctx.eip += insn.length;

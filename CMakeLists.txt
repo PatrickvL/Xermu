@@ -97,6 +97,7 @@ set(TEST_ASM_FILES
     tests/apu.asm
     tests/ide.asm
     tests/usb.asm
+    tests/mtrr.asm
 )
 
 if(NASM_EXECUTABLE)
