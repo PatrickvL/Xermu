@@ -431,6 +431,138 @@ void Executor::handle_privileged() {
         return;
     }
 
+    case ZYDIS_MNEMONIC_LLDT: {
+        // LLDT r/m16 — load LDT register selector
+        uint16_t sel = 0;
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (guest_reg_enc(ops[0].reg.value, enc))
+                sel = (uint16_t)ctx.gp[enc];
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 2 <= GUEST_RAM_SIZE)
+                sel = *reinterpret_cast<uint16_t*>(ram + ea);
+        }
+        ctx.ldtr_sel = sel;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_LTR: {
+        // LTR r/m16 — load task register selector
+        uint16_t sel = 0;
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (guest_reg_enc(ops[0].reg.value, enc))
+                sel = (uint16_t)ctx.gp[enc];
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 2 <= GUEST_RAM_SIZE)
+                sel = *reinterpret_cast<uint16_t*>(ram + ea);
+        }
+        ctx.tr_sel = sel;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_SLDT: {
+        // SLDT r/m16 — store LDT register selector
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (guest_reg_enc(ops[0].reg.value, enc))
+                ctx.gp[enc] = ctx.ldtr_sel;
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 2 <= GUEST_RAM_SIZE)
+                *reinterpret_cast<uint16_t*>(ram + ea) = ctx.ldtr_sel;
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_STR: {
+        // STR r/m16 — store task register selector
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (guest_reg_enc(ops[0].reg.value, enc))
+                ctx.gp[enc] = ctx.tr_sel;
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 2 <= GUEST_RAM_SIZE)
+                *reinterpret_cast<uint16_t*>(ram + ea) = ctx.tr_sel;
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_SGDT: {
+        // SGDT [mem] — store GDT base+limit to 6-byte memory operand
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 6 <= GUEST_RAM_SIZE) {
+                *reinterpret_cast<uint16_t*>(ram + ea)     = ctx.gdtr_limit;
+                *reinterpret_cast<uint32_t*>(ram + ea + 2) = ctx.gdtr_base;
+            }
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_SIDT: {
+        // SIDT [mem] — store IDT base+limit to 6-byte memory operand
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 6 <= GUEST_RAM_SIZE) {
+                *reinterpret_cast<uint16_t*>(ram + ea)     = ctx.idtr_limit;
+                *reinterpret_cast<uint32_t*>(ram + ea + 2) = ctx.idtr_base;
+            }
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
     case ZYDIS_MNEMONIC_MOV: {
         // MOV CRn, r32  or  MOV r32, CRn
         // ops[0] = destination, ops[1] = source
