@@ -205,6 +205,16 @@ void pop_esp_helper(GuestContext* ctx) {
     ctx->gp[GP_ESP] = val;
 }
 
+// MOV ESP, [mem] helper: read 32-bit value from PA, store to ctx->gp[GP_ESP].
+void mov_esp_from_mem(GuestContext* ctx, uint32_t pa) {
+    ctx->gp[GP_ESP] = read_guest_mem32(ctx, pa);
+}
+
+// MOV [mem], ESP helper: write ctx->gp[GP_ESP] to PA.
+void mov_esp_to_mem(GuestContext* ctx, uint32_t pa) {
+    write_guest_mem32(ctx, pa, ctx->gp[GP_ESP]);
+}
+
 // PUSH [mem] helper: reads 32-bit value from `pa`, pushes onto guest stack.
 void push_mem_helper(GuestContext* ctx, uint32_t pa) {
     uint32_t val = read_guest_mem32(ctx, pa);
@@ -599,6 +609,12 @@ bool emit_handler_lea(Emitter& e, const ZydisDecodedInstruction& insn,
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
 
+    // Special case: LEA ESP, [...] → store R14D to ctx->gp[GP_ESP]
+    if (dst_enc == GP_ESP) {
+        emit_store_r14_to_esp(e);
+        return true;
+    }
+
     // MOV dst_reg, R14D:  REX=0x44 (REX.R for R14), 0x89, ModRM=0xC0|dst
     e.emit8(0x44); e.emit8(0x89);
     e.emit8(uint8_t(0xC0u | (6u << 3) | dst_enc)); // mod=11 reg=R14&7=6 rm=dst
@@ -622,7 +638,39 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           GuestContext* /*ctx*/, bool save_flags) {
     int mem_idx = -1;
     if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
-        // reg-reg MOV: verbatim copy
+        // reg-reg MOV: check for ESP involvement.
+        // Guest ESP is NOT in a host register, so verbatim copy would read/write
+        // host RSP.  Handle ESP cases via ctx->gp[GP_ESP] through R14.
+        bool dst_esp = (insn.operand_count_visible >= 1 &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        ops[0].reg.value == ZYDIS_REGISTER_ESP);
+        bool src_esp = (insn.operand_count_visible >= 2 &&
+                        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        ops[1].reg.value == ZYDIS_REGISTER_ESP);
+        if (dst_esp && !src_esp) {
+            // MOV ESP, r32 → store source register to ctx->gp[GP_ESP]
+            uint8_t src_enc = 0;
+            if (!reg32_enc(ops[1].reg.value, src_enc)) return false;
+            // MOV [R13+16], src_reg:  REX.B=0x41, 0x89, mod=01 reg=src rm=5(R13), disp8=16
+            e.emit8(0x41); e.emit8(0x89);
+            e.emit8(uint8_t(0x40u | (src_enc << 3) | 5u));
+            e.emit8(gp_offset(GP_ESP));
+            return true;
+        }
+        if (src_esp && !dst_esp) {
+            // MOV r32, ESP → load ctx->gp[GP_ESP] into destination register
+            uint8_t dst_enc = 0;
+            if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
+            // MOV dst_reg, [R13+16]:  REX.B=0x41, 0x8B, mod=01 reg=dst rm=5(R13), disp8=16
+            e.emit8(0x41); e.emit8(0x8B);
+            e.emit8(uint8_t(0x40u | (dst_enc << 3) | 5u));
+            e.emit8(gp_offset(GP_ESP));
+            return true;
+        }
+        if (dst_esp && src_esp) {
+            return true; // MOV ESP, ESP → no-op
+        }
+        // No ESP involvement: verbatim copy
         e.copy(raw, insn.length);
         return true;
     }
@@ -641,8 +689,152 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (ops[other_idx].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     uint8_t guest_enc = 0;
     if (!guest_reg_enc(ops[other_idx].reg.value, guest_enc)) return false;
+
+    // ESP special case: guest ESP is not in a host register.
+    // MOV ESP, [mem] → load from guest memory, store to ctx->gp[GP_ESP].
+    // MOV [mem], ESP → read ctx->gp[GP_ESP], store to guest memory.
+    if (guest_enc == GP_ESP) {
+        if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+        emit_paging_translate(e, /*is_write=*/!is_load);
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        if (is_load) {
+            // MOV ESP, [mem]: read from PA, store to ctx->gp[GP_ESP]
+            emit_call_abs(e, reinterpret_cast<void*>(mov_esp_from_mem));
+        } else {
+            // MOV [mem], ESP: read ctx->gp[GP_ESP], write to PA
+            emit_call_abs(e, reinterpret_cast<void*>(mov_esp_to_mem));
+        }
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
+
     return emit_fastmem_dispatch(e, ops[mem_idx], guest_enc,
                                   insn.operand_width, is_load, save_flags);
+}
+
+// ---------------------------------------------------------------------------
+// emit_alu_esp_reg — Handle any reg-reg / reg-imm ALU instruction where one
+// operand is ESP.  Since guest ESP is not in a host register, we load it from
+// ctx into R14D, re-encode the instruction with R14D substituted for ESP,
+// then store R14D back to ctx->gp[GP_ESP] if ESP was the destination.
+//
+// Covers: ADD/SUB/AND/OR/XOR/CMP/TEST ESP,imm; ADD/SUB ESP,r32; XCHG ESP,r32;
+//         INC ESP; DEC ESP; NOT ESP; NEG ESP; etc.
+//
+// Strategy: scan the raw instruction bytes, find the ModRM byte, and replace
+// the ESP encoding (4) with R14 encoding (6) + REX.B or REX.R.  R14 is our
+// scratch register and no other JIT code uses it inside a trace body.
+// ---------------------------------------------------------------------------
+static bool emit_alu_esp_reg(Emitter& e,
+                              const ZydisDecodedInstruction& insn,
+                              const ZydisDecodedOperand* ops,
+                              const uint8_t* raw) {
+    // Determine if ESP is the destination (written) so we know to store back.
+    bool esp_is_dst = false;
+    for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[i].reg.value == ZYDIS_REGISTER_ESP &&
+            (ops[i].actions & ZYDIS_OPERAND_ACTION_WRITE))
+            esp_is_dst = true;
+    }
+
+    // Load guest ESP from ctx into R14D.
+    emit_load_esp_to_r14(e);
+
+    // Re-encode the instruction replacing ESP (encoding 4) with R14 (encoding 6).
+    // For mod=11 instructions, the raw layout is:
+    //   [prefixes...] [opcode bytes...] [ModRM] [SIB?] [disp?] [imm?]
+    // We need to find the ModRM byte and patch it.
+    // Also need to add REX bits for the R14 extended register.
+
+    // Use Zydis raw info to locate the ModRM byte.
+    // The ModRM byte offset is after prefixes + opcodes.
+    // For short-form INC/DEC (0x40-0x47, 0x48-0x4F in 32-bit), there is no
+    // ModRM — the register is in the opcode itself.
+
+    if (insn.mnemonic == ZYDIS_MNEMONIC_INC &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[0].reg.value == ZYDIS_REGISTER_ESP) {
+        // INC R14D: REX.B=0x41, 0xFF, ModRM=C0|0<<3|6 = 0xC6
+        e.emit8(0x41); e.emit8(0xFF); e.emit8(0xC6);
+        emit_store_r14_to_esp(e);
+        return true;
+    }
+    if (insn.mnemonic == ZYDIS_MNEMONIC_DEC &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[0].reg.value == ZYDIS_REGISTER_ESP) {
+        // DEC R14D: REX.B=0x41, 0xFF, ModRM=C0|1<<3|6 = 0xCE
+        e.emit8(0x41); e.emit8(0xFF); e.emit8(0xCE);
+        emit_store_r14_to_esp(e);
+        return true;
+    }
+
+    // For instructions with a ModRM byte (mod=11), we re-encode with R14.
+    if (!insn.raw.modrm.offset) return false; // no ModRM → unsupported
+
+    uint8_t modrm = raw[insn.raw.modrm.offset];
+    uint8_t mod = (modrm >> 6) & 3;
+    uint8_t reg = (modrm >> 3) & 7;
+    uint8_t rm  = modrm & 7;
+
+    if (mod != 3) return false; // not reg-reg form — shouldn't happen here
+
+    // Determine which field(s) have ESP (encoding 4) and need R14 (encoding 6).
+    uint8_t rex = 0x40; // base REX prefix (may not be needed if no extended regs)
+    uint8_t new_reg = reg;
+    uint8_t new_rm = rm;
+
+    if (rm == 4) {
+        new_rm = 6;     // R14 & 7
+        rex |= 0x01;    // REX.B for extended rm
+    }
+    if (reg == 4) {
+        new_reg = 6;    // R14 & 7
+        rex |= 0x04;    // REX.R for extended reg
+    }
+
+    uint8_t new_modrm = uint8_t((3u << 6) | (new_reg << 3) | new_rm);
+
+    // Re-emit the instruction: prefixes, REX, opcode(s), ModRM, immediates.
+    // The raw bytes before modrm_off contain legacy prefixes + opcode byte(s).
+    // REX must come after legacy prefixes but before the opcode.
+    int modrm_off = (int)insn.raw.modrm.offset;
+
+    // Determine where the opcode starts.  The opcode map tells us:
+    //   DEFAULT: 1 opcode byte right before ModRM
+    //   0F:      2 bytes (0x0F + opcode) right before ModRM
+    //   0F38/3A: 3 bytes (0x0F + 0x38/0x3A + opcode) right before ModRM
+    int opc_len = 1; // default
+    if (insn.opcode_map == ZYDIS_OPCODE_MAP_0F)   opc_len = 2;
+    if (insn.opcode_map == ZYDIS_OPCODE_MAP_0F38)  opc_len = 3;
+    if (insn.opcode_map == ZYDIS_OPCODE_MAP_0F3A)  opc_len = 3;
+    int opc_start = modrm_off - opc_len;
+
+    // 1. Copy legacy prefix bytes (everything before the opcode).
+    for (int i = 0; i < opc_start; ++i) {
+        uint8_t b = raw[i];
+        if (b >= 0x40 && b <= 0x4F) continue; // skip 32-bit REX-range bytes
+        e.emit8(b);
+    }
+    // 2. Emit REX (only if we need extended registers)
+    if (rex != 0x40) e.emit8(rex);
+    // 3. Emit opcode byte(s)
+    for (int i = opc_start; i < modrm_off; ++i)
+        e.emit8(raw[i]);
+    // 4. Emit the patched ModRM byte
+    e.emit8(new_modrm);
+    // 5. Copy everything after ModRM (SIB, displacement, immediates)
+    for (int i = modrm_off + 1; i < (int)insn.length; ++i)
+        e.emit8(raw[i]);
+
+    if (esp_is_dst)
+        emit_store_r14_to_esp(e);
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +847,21 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           GuestContext* /*ctx*/, bool save_flags) {
     int mem_idx = -1;
     if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
-        // No mem operand → clean copy (handles INC/DEC re-encoding too)
+        // No mem operand → clean copy, unless ESP is involved.
+        // Guest ESP is not in a host register; intercept ESP operands.
+        bool has_esp = false;
+        for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                ops[i].reg.value == ZYDIS_REGISTER_ESP) {
+                has_esp = true;
+                break;
+            }
+        }
+        if (has_esp) {
+            // Load guest ESP into R14, execute instruction with R14
+            // substituted for ESP, then store R14 back if ESP was written.
+            return emit_alu_esp_reg(e, insn, ops, raw);
+        }
         return emit_clean_insn(e, insn, ops, raw);
     }
 

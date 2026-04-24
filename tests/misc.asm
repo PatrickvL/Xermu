@@ -440,5 +440,74 @@
     pop  ebx                         ; restore EBX
     pop  eax                         ; restore EAX
 
+; ========================= ESP Addressing / ALU =============================
+; Tests for SUB/ADD ESP, MOV ESP, LEA ESP, and [ESP+disp] memory access.
+; These exercise the JIT's handling of guest ESP (which is NOT in host RSP).
+
+    ; Set up ESP to a known area for testing
+    push eax                         ; save regs on current stack
+    push ebx
+    push ecx
+    push ebp
+
+    mov  ebp, 0x71000               ; fresh stack area
+    xchg esp, ebp                    ; ESP = 0x71000, EBP = old ESP
+
+    ; --- SUB ESP, imm ---
+    sub  esp, 16                     ; ESP should become 0x70FF0
+    push 0xDEAD0001                  ; should go to [0x70FEC]
+    ASSERT_EQ_MEM 0x70FEC, 0xDEAD0001 ; 40: SUB ESP, imm worked
+
+    ; --- ADD ESP, imm ---
+    add  esp, 20                     ; ESP = 0x70FEC + 20 = 0x71000
+    push 0xDEAD0002                  ; should go to [0x70FFC]
+    ASSERT_EQ_MEM 0x70FFC, 0xDEAD0002 ; 41: ADD ESP, imm worked
+
+    ; --- MOV r32, ESP / MOV ESP, r32 ---
+    mov  eax, esp                    ; EAX = current ESP = 0x70FFC
+    ; Verify EAX got the correct ESP value by comparing against known
+    sub  eax, 0x70FFC               ; should be 0
+    ASSERT_EQ eax, 0                 ; 42: MOV r32, ESP correct
+
+    mov  esp, 0x71100               ; set ESP to new value
+    push 0xDEAD0003                  ; should go to [0x710FC]
+    ASSERT_EQ_MEM 0x710FC, 0xDEAD0003 ; 43: MOV ESP, imm (via MOV r/m32, imm32) worked
+    ; (note: MOV ESP, imm32 goes through clean_insn; we'll test MOV ESP, reg below)
+
+    mov  ecx, 0x71200
+    mov  esp, ecx                    ; ESP = 0x71200
+    push 0xDEAD0004                  ; should go to [0x711FC]
+    ASSERT_EQ_MEM 0x711FC, 0xDEAD0004 ; 44: MOV ESP, reg worked
+
+    ; --- [ESP+disp] addressing ---
+    mov  esp, 0x71300
+    mov  dword [esp], 0x11111111     ; write to [0x71300]
+    ASSERT_EQ_MEM 0x71300, 0x11111111 ; 45: [ESP] write correct
+    mov  dword [esp+4], 0x22222222   ; write to [0x71304]
+    ASSERT_EQ_MEM 0x71304, 0x22222222 ; 46: [ESP+disp8] write correct
+    mov  dword [esp+256], 0x33333333 ; write to [0x71400]
+    ASSERT_EQ_MEM 0x71400, 0x33333333 ; 47: [ESP+disp32] write correct
+    mov  eax, [esp+4]               ; read from [0x71304]
+    ASSERT_EQ eax, 0x22222222        ; 48: [ESP+disp] read correct
+
+    ; --- AND ESP, imm (stack alignment) ---
+    mov  esp, 0x71317               ; misaligned
+    and  esp, 0xFFFFFFF0             ; align to 16 → 0x71310
+    push 0xDEAD0005                  ; should go to [0x7130C]
+    ASSERT_EQ_MEM 0x7130C, 0xDEAD0005 ; 49: AND ESP, imm worked
+
+    ; --- LEA ESP, [reg+disp] ---
+    mov  eax, 0x71400
+    lea  esp, [eax+0x100]            ; ESP = 0x71500
+    push 0xDEAD0006                  ; should go to [0x714FC]
+    ASSERT_EQ_MEM 0x714FC, 0xDEAD0006 ; 50: LEA ESP, [reg+disp] worked
+
+    ; Restore original ESP
+    mov  esp, ebp
+    pop  ebp
+    pop  ecx
+    pop  ebx
+    pop  eax
+
 ; ========================= All done =======================================
     PASS
