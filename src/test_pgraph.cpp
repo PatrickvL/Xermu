@@ -202,6 +202,42 @@ int main() {
     uint32_t tex1_off = 0x00400000;
     memcpy(ram + pos, &tex1_off, 4); pos += 4;
 
+    // === Command 22: SET_BLEND_FUNC_SFACTOR = 0x0302 (SRC_ALPHA) ===
+    uint32_t hdr22 = pb_inc(SET_BLEND_FUNC_SFACTOR, 0, 1);
+    memcpy(ram + pos, &hdr22, 4); pos += 4;
+    uint32_t sfactor = 0x0302;
+    memcpy(ram + pos, &sfactor, 4); pos += 4;
+
+    // === Command 23: SET_BLEND_FUNC_DFACTOR = 0x0303 (ONE_MINUS_SRC_ALPHA) ===
+    uint32_t hdr23 = pb_inc(SET_BLEND_FUNC_DFACTOR, 0, 1);
+    memcpy(ram + pos, &hdr23, 4); pos += 4;
+    uint32_t dfactor = 0x0303;
+    memcpy(ram + pos, &dfactor, 4); pos += 4;
+
+    // === Command 24: SET_BLEND_EQUATION = 0x8006 (FUNC_ADD) ===
+    uint32_t hdr24 = pb_inc(SET_BLEND_EQUATION, 0, 1);
+    memcpy(ram + pos, &hdr24, 4); pos += 4;
+    uint32_t blend_eq = 0x8006;
+    memcpy(ram + pos, &blend_eq, 4); pos += 4;
+
+    // === Command 25: SET_BLEND_COLOR = 0x80402010 ===
+    uint32_t hdr25 = pb_inc(SET_BLEND_COLOR, 0, 1);
+    memcpy(ram + pos, &hdr25, 4); pos += 4;
+    uint32_t blend_col = 0x80402010;
+    memcpy(ram + pos, &blend_col, 4); pos += 4;
+
+    // === Command 26: SET_STENCIL_TEST_ENABLE = 1 ===
+    uint32_t hdr26 = pb_inc(SET_STENCIL_TEST_ENABLE, 0, 1);
+    memcpy(ram + pos, &hdr26, 4); pos += 4;
+    uint32_t stencil_en = 1;
+    memcpy(ram + pos, &stencil_en, 4); pos += 4;
+
+    // === Command 27: SET_STENCIL_FUNC_REF = 0x80 ===
+    uint32_t hdr27 = pb_inc(SET_STENCIL_FUNC_REF, 0, 1);
+    memcpy(ram + pos, &hdr27, 4); pos += 4;
+    uint32_t stencil_ref = 0x80;
+    memcpy(ram + pos, &stencil_ref, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -266,6 +302,16 @@ int main() {
     CHECK(pgraph.reg(SET_TEXTURE_FILTER + 0*64)      == 0x04012000, "tex0_filter");
     CHECK(pgraph.reg(SET_TEXTURE_IMAGE_RECT + 0*64)  == 0x02000100, "tex0_image_rect");
     CHECK(pgraph.reg(SET_TEXTURE_OFFSET + 1*64)      == 0x00400000, "tex1_offset");
+
+    // Blend state
+    CHECK(pgraph.reg(SET_BLEND_FUNC_SFACTOR) == 0x0302, "blend_sfactor == SRC_ALPHA");
+    CHECK(pgraph.reg(SET_BLEND_FUNC_DFACTOR) == 0x0303, "blend_dfactor == ONE_MINUS_SRC_ALPHA");
+    CHECK(pgraph.reg(SET_BLEND_EQUATION)     == 0x8006, "blend_equation == FUNC_ADD");
+    CHECK(pgraph.reg(SET_BLEND_COLOR)        == 0x80402010, "blend_color");
+
+    // Stencil state
+    CHECK(pgraph.reg(SET_STENCIL_TEST_ENABLE) == 1, "stencil_test_enable");
+    CHECK(pgraph.reg(SET_STENCIL_FUNC_REF)    == 0x80, "stencil_func_ref == 0x80");
 
     free(ram);
 
