@@ -246,6 +246,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/hle.asm`       | HLE kernel stubs: thread, memory, handle (4)       | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
+| `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
 
 ---
 
@@ -303,7 +304,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 18 suites, CMake integration
+- [x] NASM test infrastructure: 19 suites, CMake integration
 
 ---
 
@@ -630,6 +631,24 @@ initialization and operation:
   to assert lines.  Test-only I/O port 0xEB triggers IRQs for testing.
 
 Remaining devices:
+
+**8254 PIT (Programmable Interval Timer)** ✅ DONE
+
+3-channel 8254 PIT (ports 0x40-0x43), channel 0 wired to IRQ 0 on the PIC:
+
+- **Mode/command register** (port 0x43): channel select, access mode
+  (lobyte/hibyte/both), operating mode, BCD/binary.
+- **Operating modes**: mode 0 (one-shot interrupt on terminal count),
+  mode 2 (rate generator / periodic), mode 3 (square wave).
+- **Counter latch**: OCW latch command for reading counter mid-count.
+- **Tick callback**: `pit_tick_callback` wired to executor's `tick_fn`,
+  called once per trace dispatch.  Decrements ch0 counter; fires IRQ 0
+  on the PIC when counter reaches zero.
+- **Backward-edge linking suppressed**: `try_link_trace` skips backward
+  edges (`target_eip ≤ source_eip`) so loops always return to the run
+  loop for device ticks and IRQ delivery.
+
+Remaining devices:
 - SMBus (EEPROM, temperature sensor, video encoder) — stub
 - IDE controller (HDD, DVD)
 - USB (controllers)
@@ -702,10 +721,15 @@ RET                ; return to dispatch_trace trampoline
 and the target guest EIP.
 
 **Linking** happens eagerly in the run loop.  After a trace `t` is found or
-built, `try_link_trace(t)` patches every unlinked exit whose target trace is
-already in the cache (forward linking).  The previously executed trace
-`prev_trace` is also re-checked, handling the common backward-edge case (a loop
-branch back to its head).
+built, `try_link_trace(t)` patches every unlinked **forward** exit whose target
+trace is already in the cache.  The previously executed trace `prev_trace` is
+also re-checked.
+
+**Backward edges** (`target_eip ≤ source trace's guest_eip`) are intentionally
+**not linked**.  This guarantees that loops return to the run loop on every
+iteration, enabling device ticks (PIT timer) and IRQ delivery at trace
+boundaries.  A future downcount mechanism could allow backward linking while
+still ensuring periodic run-loop re-entry.
 
 When linked, the JMP bypasses the entire save / trampoline / run-loop / lookup
 path — guest registers stay live in host registers, and execution continues

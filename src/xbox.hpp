@@ -475,11 +475,139 @@ static uint8_t pic_irq_ack(void* user) {
 }
 
 // ============================= PIT (8254) ==================================
+// Programmable Interval Timer — 3 channels, only channel 0 is wired to IRQ 0.
+// Channel 2 gates the PC speaker / system port B.
 
-static uint32_t pit_io_read(uint16_t /*port*/, unsigned /*size*/, void* /*user*/) {
+struct PitChannel {
+    uint16_t reload     = 0;     // programmed count value
+    uint16_t count      = 0;     // current countdown
+    uint8_t  mode       = 0;     // operating mode (0-5)
+    uint8_t  access     = 0;     // 0=latch, 1=lo, 2=hi, 3=lo/hi
+    bool     lo_written = false; // for lo/hi access: lo byte written
+    bool     lo_read    = false; // for lo/hi read: lo byte read (need hi next)
+    bool     enabled    = false;
+    uint16_t latch_val  = 0;
+    bool     latched    = false;
+    bool     output     = false; // output pin state (for mode 3 square wave)
+
+    void load_count(uint16_t val) {
+        reload  = val ? val : 65536; // 0 means 65536
+        count   = reload;
+        enabled = true;
+        output  = false;
+    }
+};
+
+struct PitState {
+    PitChannel ch[3];
+    PicPair*   pic = nullptr;
+
+    // Tick channel 0 by `n` oscillator ticks.  Raises IRQ 0 on the PIC when
+    // the counter expires (modes 0, 2, 3).
+    void tick(uint32_t n = 1) {
+        auto& c = ch[0];
+        if (!c.enabled) return;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (c.count == 0) c.count = c.reload;
+            c.count--;
+            if (c.count == 0) {
+                if (c.mode == 0) {
+                    // Mode 0: one-shot interrupt on terminal count.
+                    c.output  = true;
+                    c.enabled = false;
+                    if (pic) pic->raise_irq(0);
+                } else if (c.mode == 2) {
+                    // Mode 2: rate generator — reload and fire.
+                    c.count = c.reload;
+                    if (pic) pic->raise_irq(0);
+                } else if (c.mode == 3) {
+                    // Mode 3: square wave — toggle output, fire on transition.
+                    c.output = !c.output;
+                    c.count  = c.reload;
+                    if (pic) pic->raise_irq(0);
+                }
+            }
+        }
+    }
+};
+
+static uint32_t pit_io_read(uint16_t port, unsigned /*size*/, void* user) {
+    auto* pit = static_cast<PitState*>(user);
+    int ch = port - 0x40;
+    if (ch < 0 || ch > 2) return 0;
+    auto& c = pit->ch[ch];
+
+    uint16_t val = c.latched ? c.latch_val : c.count;
+
+    if (c.access == 1) return val & 0xFF;         // lo byte only
+    if (c.access == 2) return (val >> 8) & 0xFF;  // hi byte only
+    if (c.access == 3) {
+        if (!c.lo_read) {
+            c.lo_read = true;
+            return val & 0xFF;
+        }
+        c.lo_read = false;
+        c.latched = false;
+        return (val >> 8) & 0xFF;
+    }
     return 0;
 }
-static void pit_io_write(uint16_t, uint32_t, unsigned, void*) {}
+
+static void pit_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
+    auto* pit = static_cast<PitState*>(user);
+
+    if (port == 0x43) {
+        // Mode/command register.
+        int ch_sel  = (val >> 6) & 3;
+        int access  = (val >> 4) & 3;
+        int mode    = (val >> 1) & 7;
+
+        if (ch_sel == 3) {
+            // Read-back command (not implemented — rare).
+            return;
+        }
+        if (access == 0) {
+            // Counter latch command.
+            pit->ch[ch_sel].latch_val = pit->ch[ch_sel].count;
+            pit->ch[ch_sel].latched   = true;
+            return;
+        }
+        pit->ch[ch_sel].access     = (uint8_t)access;
+        pit->ch[ch_sel].mode       = (uint8_t)(mode & 3); // modes 4-7 alias to 0-3
+        pit->ch[ch_sel].lo_written = false;
+        pit->ch[ch_sel].lo_read    = false;
+        pit->ch[ch_sel].enabled    = false;
+        return;
+    }
+
+    // Data register write (port 0x40-0x42).
+    int ch = port - 0x40;
+    if (ch < 0 || ch > 2) return;
+    auto& c = pit->ch[ch];
+
+    if (c.access == 1) {
+        // Lo byte only.
+        c.load_count((c.reload & 0xFF00) | (val & 0xFF));
+    } else if (c.access == 2) {
+        // Hi byte only.
+        c.load_count(uint16_t(((val & 0xFF) << 8) | (c.reload & 0xFF)));
+    } else if (c.access == 3) {
+        // Lo/hi byte pair.
+        if (!c.lo_written) {
+            c.reload = (c.reload & 0xFF00) | (val & 0xFF);
+            c.lo_written = true;
+        } else {
+            c.reload = uint16_t(((val & 0xFF) << 8) | (c.reload & 0xFF));
+            c.lo_written = false;
+            c.load_count(c.reload);
+        }
+    }
+}
+
+// Tick callback for executor run loop.
+static void pit_tick_callback(void* user) {
+    static_cast<PitState*>(user)->tick();
+}
 
 // ============================= System Port B (0x61) ========================
 
@@ -504,6 +632,7 @@ struct XboxHardware {
     PciState    pci;
     SmbusState  smbus;
     PicPair     pic;
+    PitState    pit;
 };
 
 // Set up the Xbox MMIO map and I/O ports on an Executor.
@@ -543,8 +672,19 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.irq_ack   = pic_irq_ack;
     exec.irq_user  = &hw->pic;
 
-    exec.register_io(0x40, pit_io_read, pit_io_write);         // PIT ch0
-    exec.register_io(0x43, pit_io_read, pit_io_write);         // PIT mode
+    exec.register_io(0x40, pit_io_read, pit_io_write, &hw->pit); // PIT ch0
+    exec.register_io(0x41, pit_io_read, pit_io_write, &hw->pit); // PIT ch1
+    exec.register_io(0x42, pit_io_read, pit_io_write, &hw->pit); // PIT ch2
+    exec.register_io(0x43, pit_io_read, pit_io_write, &hw->pit); // PIT mode
+
+    // Wire PIT channel 0 → IRQ 0 on PIC.
+    hw->pit.pic = &hw->pic;
+
+    // Periodic tick: call PIT every trace dispatch.
+    exec.tick_fn     = pit_tick_callback;
+    exec.tick_user   = &hw->pit;
+    exec.tick_period = 1;
+
     exec.register_io(0x61, sysctl_read, sysctl_write);         // System B
     exec.register_io(0xE9, nullptr, debug_console_write);       // Debug
     exec.register_io(0xCF8, pci_io_read_cf8, pci_io_write_cf8, &hw->pci);

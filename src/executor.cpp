@@ -170,10 +170,15 @@ void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
 
 // Try to patch each unlinked exit of `t` to its target trace if present
 // in the trace cache.  Also validates the target's page version.
+// Backward edges (target_eip <= t->guest_eip) are NOT linked — this ensures
+// tight loops return to the run loop for IRQ delivery and device ticks.
 void Executor::try_link_trace(Trace* t) {
     for (int i = 0; i < t->num_links; ++i) {
         auto& lk = t->links[i];
         if (lk.linked) continue;
+
+        // Skip backward edges to guarantee run-loop re-entry for timer ticks.
+        if (lk.target_eip <= t->guest_eip) continue;
 
         Trace* target = tcache.lookup(lk.target_eip);
         if (!target || !target->valid) continue;
@@ -822,6 +827,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         ctx.eip = ctx.next_eip;
         ++steps;
         prev_trace = t;
+
+        // Periodic device tick (e.g. PIT timer).
+        if (tick_period && ++tick_counter >= tick_period) {
+            tick_counter = 0;
+            tick_fn(tick_user);
+        }
 
         // Privileged instruction stop: decode and handle in the run loop.
         if (ctx.stop_reason == STOP_PRIVILEGED) {

@@ -51,6 +51,14 @@ struct Executor {
     IrqAckFn   irq_ack   = nullptr;
     void*      irq_user   = nullptr;
 
+    // Optional periodic tick callback (e.g. PIT timer).
+    // Called every tick_period traces; tick_period=0 disables.
+    using TickFn = void(*)(void*);
+    TickFn   tick_fn      = nullptr;
+    void*    tick_user     = nullptr;
+    uint32_t tick_period   = 0;
+    uint32_t tick_counter  = 0;
+
     // HLE callback: if non-null, INT with this vector calls the handler
     // instead of delivering through IDT. Handler receives ordinal from EAX.
     // Returns true if handled, false to fall through to IDT delivery.
