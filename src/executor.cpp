@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // dispatch_trace — naked asm trampoline (GCC / Clang, x86-64)
@@ -180,6 +183,123 @@ void XboxExecutor::handle_privileged() {
     case ZYDIS_MNEMONIC_HLT:
         ctx.virtual_if = false;
         return;
+
+    case ZYDIS_MNEMONIC_CLI:
+        ctx.virtual_if = false;
+        ctx.eip += insn.length;
+        return;
+
+    case ZYDIS_MNEMONIC_STI:
+        ctx.virtual_if = true;
+        ctx.eip += insn.length;
+        return;
+
+    case ZYDIS_MNEMONIC_CPUID: {
+        uint32_t leaf = ctx.gp[GP_EAX];
+        // Xbox Pentium III (Coppermine): Family 6, Model 8, Stepping 3
+        switch (leaf) {
+        case 0:
+            ctx.gp[GP_EAX] = 2;               // max standard leaf
+            ctx.gp[GP_EBX] = 0x756E6547;       // "Genu"
+            ctx.gp[GP_EDX] = 0x49656E69;       // "ineI"
+            ctx.gp[GP_ECX] = 0x6C65746E;       // "ntel"
+            break;
+        case 1:
+            ctx.gp[GP_EAX] = 0x00000683;       // family=6 model=8 stepping=3
+            ctx.gp[GP_EBX] = 0x00000000;
+            ctx.gp[GP_ECX] = 0x00000000;
+            // EDX: FPU, DE, PSE, TSC, MSR, PAE, MCE, CX8, SEP, MTRR,
+            //       PGE, MCA, CMOV, PAT, PSE-36, MMX, FXSR, SSE
+            ctx.gp[GP_EDX] = 0x0383F9FF;
+            break;
+        default:
+            ctx.gp[GP_EAX] = 0;
+            ctx.gp[GP_EBX] = 0;
+            ctx.gp[GP_ECX] = 0;
+            ctx.gp[GP_EDX] = 0;
+            break;
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_RDTSC: {
+        // Return a monotonic TSC value based on host rdtsc.
+        uint64_t tsc;
+#if defined(_MSC_VER)
+        tsc = __rdtsc();
+#else
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        tsc = ((uint64_t)hi << 32) | lo;
+#endif
+        ctx.gp[GP_EAX] = (uint32_t)tsc;
+        ctx.gp[GP_EDX] = (uint32_t)(tsc >> 32);
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_RDMSR: {
+        // MSR index in ECX, result in EDX:EAX
+        uint32_t msr = ctx.gp[GP_ECX];
+        uint64_t val = 0;
+        // Stub: return 0 for all MSRs, log for debugging
+        fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
+        ctx.gp[GP_EAX] = (uint32_t)val;
+        ctx.gp[GP_EDX] = (uint32_t)(val >> 32);
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_WRMSR: {
+        uint32_t msr = ctx.gp[GP_ECX];
+        uint64_t val = ((uint64_t)ctx.gp[GP_EDX] << 32) | ctx.gp[GP_EAX];
+        // Stub: log and ignore
+        fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
+                (unsigned long long)val);
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_LGDT: {
+        // LGDT [mem] — load GDT base+limit from 6-byte memory operand
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            // Base register handling (simplified)
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 6 <= GUEST_RAM_SIZE) {
+                ctx.gdtr_limit = *reinterpret_cast<uint16_t*>(ram + ea);
+                ctx.gdtr_base  = *reinterpret_cast<uint32_t*>(ram + ea + 2);
+            }
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_LIDT: {
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            if (ea + 6 <= GUEST_RAM_SIZE) {
+                ctx.idtr_limit = *reinterpret_cast<uint16_t*>(ram + ea);
+                ctx.idtr_base  = *reinterpret_cast<uint32_t*>(ram + ea + 2);
+            }
+        }
+        ctx.eip += insn.length;
+        return;
+    }
 
     case ZYDIS_MNEMONIC_OUT: {
         // OUT imm8, AL:   ops[0]=imm, ops[1]=reg(AL/AX/EAX)
