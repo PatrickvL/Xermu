@@ -309,7 +309,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 24 suites, CMake integration
+- [x] NASM test infrastructure: 30 suites, CMake integration
 
 ---
 
@@ -1402,7 +1402,7 @@ Remaining devices:
 - IDE controller — implemented (see below)
 - USB OHCI — implemented (see below)
 - PCI configuration space — implemented
-- MCPX boot ROM
+- MCPX boot ROM — implemented (see below)
 
 **IDE Controller (ATA)** ✅ DONE (stub)
 
@@ -1479,6 +1479,29 @@ BAR0 pre-set to the MMIO base address.
 12-assertion test (`tests/usb.asm`): register defaults, reset, W1C,
 enable/disable, PCI vendor/device/BAR readback.
 
+**Flash ROM / MCPX Boot ROM** ✅ DONE
+
+Implemented in `src/xbox/flash.hpp`:
+
+- **Flash ROM** (1 MB at PA `0xF0000000`, aliased at `0xFF000000`):
+  read-only MMIO region containing the BIOS image.  Initialized to `0xFF`
+  (empty).  `FlashState::load_bios(path)` loads a 256 KB image (mirrored
+  4× to fill 1 MB) or a full 1 MB image from a file.
+- **MCPX hidden ROM** (512 bytes at PA `0xFFFFFE00`): secret boot ROM baked
+  into the MCPX southbridge die.  Contains the x86 reset vector at
+  `0xFFFFFFF0`, which decrypts and jumps to the 2BL in flash.
+  `FlashState::load_mcpx(path)` loads a 512-byte dump.  When loaded, reads
+  in the `0xFFFFFE00–0xFFFFFFFF` range return MCPX data; otherwise they
+  return normal flash content from the top of the 1 MB region.
+- **HLE mode**: neither image is needed; the XBE loader patches the kernel
+  thunk table directly.
+- **LLE mode** (planned): load a real BIOS dump → execution starts at the
+  BIOS entry point, or load an MCPX dump → execution starts at the reset
+  vector `0xFFFFFFF0`.
+
+4-assertion test (`tests/flash.asm`): 32-bit and sub-word reads from both
+the flash base and BIOS shadow regions verify the default `0xFF` fill.
+
 #### 5.19 XBE Loader ✅
 
 Implemented in `src/xbe_loader.hpp`:
@@ -1543,7 +1566,7 @@ The executor supports two kernel modes, selectable at launch:
 | SYSENTER / SYSEXIT | Easy | ✅ DONE |
 | SYSENTER MSRs (CS/EIP/ESP) | Easy | ✅ DONE |
 | PE loader for xboxkrnl.exe | Medium | Planned |
-| MCPX/2BL boot chain (or entry shim) | Medium | Can skip ROM, jump to kernel entry |
+| MCPX/2BL boot chain (or entry shim) | Medium | ROM loading ✅ DONE; boot execution planned |
 | OHCI USB controller stub | Medium | ✅ DONE |
 | More complete GDT/TSS handling | Easy | ✅ DONE |
 | MTRR MSRs | Easy | ✅ DONE |
