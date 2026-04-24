@@ -43,6 +43,12 @@ static void io_debug_write(uint16_t, uint32_t val, unsigned, void*) {
     fflush(stdout);
 }
 
+// Port 0xEB: test IRQ trigger — writing N raises IRQ N on the PIC.
+static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
+    auto* pic = static_cast<xbox::PicPair*>(user);
+    if (val < 16) pic->raise_irq((int)val);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -138,6 +144,9 @@ int main(int argc, char** argv) {
         hle_heap = xbe::XbeHeap();  // reset allocator
         exec->hle_handler = xbe::default_hle_handler;
         exec->hle_user    = &hle_heap;
+
+        // Test-only IRQ trigger port: write N to 0xEB → raise IRQ N on PIC.
+        exec->register_io(0xEB, nullptr, io_irq_trigger_write, &hw->pic);
     }
 
     // Run.

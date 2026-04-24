@@ -43,6 +43,14 @@ struct Executor {
     // Pending hardware IRQ bitmap (set by device callbacks, checked in run loop).
     uint32_t    pending_irq = 0;
 
+    // Optional hardware interrupt controller (e.g. PIC pair).
+    // When set, replaces the simple pending_irq bitmap for IRQ delivery.
+    using IrqCheckFn = bool(*)(void*);    // returns true if IRQ pending
+    using IrqAckFn   = uint8_t(*)(void*); // acknowledge + return IDT vector
+    IrqCheckFn irq_check = nullptr;
+    IrqAckFn   irq_ack   = nullptr;
+    void*      irq_user   = nullptr;
+
     // HLE callback: if non-null, INT with this vector calls the handler
     // instead of delivering through IDT. Handler receives ordinal from EAX.
     // Returns true if handled, false to fall through to IDT delivery.

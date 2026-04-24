@@ -217,7 +217,7 @@ The bump is correctly skipped for them (they are not stores).
 | `context.hpp`         | `GuestContext` struct, register indices         | ✅ Working    |
 | `mmio.hpp`            | MMIO region dispatch table                     | ✅ Working    |
 | `code_cache.hpp`      | 32 MB executable slab allocator                | ✅ Working    |
-| `trace.hpp`           | `Trace` struct, `TraceCache` hash table        | ✅ Working    |
+| `trace.hpp`           | `Trace` struct, two-level `TraceCache`         | ✅ Working    |
 | `emitter.hpp`         | Byte emitter, EA synthesis, fastmem helpers, generic mem rewriter | ✅ Working    |
 | `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `PageVersions`   | ✅ Working    |
 | `insn_dispatch.hpp`   | Two-level O(1) mnemonic dispatch table          | ✅ Working    |
@@ -245,6 +245,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/xbox.asm`      | Xbox address map: RAM mirror, PCI, NV2A, Flash (9) | ✅ ALL PASS   |
 | `tests/hle.asm`       | HLE kernel stubs: thread, memory, handle (4)       | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
+| `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
 
 ---
 
@@ -269,7 +270,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] RET trace exit (stack read → `next_eip`, preserves live EAX)
 - [x] JMP direct/indirect/memory trace exit
 - [x] Conditional branch (all Jcc) trace exit with taken/fallthrough paths
-- [x] Trace cache with open-addressed hash lookup
+- [x] Trace cache with two-level direct-mapped lookup (O(1), no hashing)
 - [x] SMC page-version validation on trace re-entry
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
@@ -302,7 +303,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 17 suites, CMake integration
+- [x] NASM test infrastructure: 18 suites, CMake integration
 
 ---
 
@@ -521,9 +522,12 @@ debug traps (INT3/INT1), and hardware IRQs.
   correct guest flags (e.g. CF set by STC before INT).
 - **`iret_helper`**: Now restores `ctx->virtual_if` from the IF bit of the popped
   EFLAGS, so interrupt enable state is correctly restored on IRETD.
-- **Hardware IRQs**: `pending_irq` bitmap in Executor, checked at trace boundaries.
-  Lowest-numbered pending line is delivered as vector `0x20 + irq` (PIC mapping)
-  when `virtual_if == true`. `raise_irq(n)` sets the bit.
+- **Hardware IRQs**: Optional `IrqCheckFn`/`IrqAckFn` callbacks on Executor.
+  When set (xbox mode), the 8259A PIC pair provides vectoring: device raises
+  IRQ on PIC → PIC evaluates masking/priority → executor calls `irq_ack()` at
+  trace boundary → PIC returns vector and moves IRQ to in-service register →
+  guest sends EOI via OUT 0x20/0xA0.  Legacy `pending_irq` bitmap retained for
+  non-xbox mode (vectors `0x20 + irq`).
 - **INT handlers**: INT n delivers through IDT (was stub/halt). INT3 → vector 3.
   INTO → vector 4 if OF set. CLI/STI only toggle `virtual_if` (don't halt).
 
@@ -609,10 +613,27 @@ This is by far the largest single implementation effort.
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
 
 #### 5.18 Other Devices
-- SMBus (EEPROM, temperature sensor, video encoder)
+
+**8259A PIC (Programmable Interrupt Controller)** ✅ DONE
+
+Dual 8259A PIC (master at 0x20-0x21, slave at 0xA0-0xA1) with full
+initialization and operation:
+
+- **ICW1-4 init sequence**: cascade/single mode, vector base programming,
+  cascade identity, 8086 mode, auto-EOI option.
+- **IRR/ISR/IMR registers**: interrupt request, in-service, and mask registers
+  with proper read-back via OCW3.
+- **OCW2 EOI**: non-specific and specific end-of-interrupt commands.
+- **Cascade**: slave on master IRQ 2; slave provides vector on cascade ack.
+- **Integration**: `PicPair` struct in `xbox.hpp`, wired to executor via
+  `irq_check`/`irq_ack` function pointers.  Devices call `pic.raise_irq(N)`
+  to assert lines.  Test-only I/O port 0xEB triggers IRQs for testing.
+
+Remaining devices:
+- SMBus (EEPROM, temperature sensor, video encoder) — stub
 - IDE controller (HDD, DVD)
 - USB (controllers)
-- PCI configuration space
+- PCI configuration space — implemented
 - MCPX boot ROM
 
 #### 5.19 XBE Loader ✅

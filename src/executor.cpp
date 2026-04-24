@@ -744,14 +744,20 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         if (max_steps && steps >= max_steps) break;
 
         // Deliver pending hardware IRQs at trace boundaries.
-        if (pending_irq && ctx.virtual_if) {
-            // Find lowest-numbered pending IRQ line.
-            unsigned irq = 0;
-            uint32_t bits = pending_irq;
-            while (!(bits & 1)) { bits >>= 1; ++irq; }
-            pending_irq &= ~(1u << irq);
-            // Map IRQ to IDT vector: PIC-style IRQ 0-15 → vectors 0x20-0x2F.
-            deliver_interrupt(uint8_t(0x20 + irq), ctx.eip);
+        bool has_irq = irq_check ? irq_check(irq_user) : (pending_irq != 0);
+        if (has_irq && ctx.virtual_if) {
+            uint8_t vector;
+            if (irq_ack) {
+                vector = irq_ack(irq_user);
+            } else {
+                // Legacy: simple bitmap, vectors 0x20+.
+                unsigned irq = 0;
+                uint32_t bits = pending_irq;
+                while (!(bits & 1)) { bits >>= 1; ++irq; }
+                pending_irq &= ~(1u << irq);
+                vector = uint8_t(0x20 + irq);
+            }
+            deliver_interrupt(vector, ctx.eip);
             prev_trace = nullptr; // chain broken by interrupt
         }
 
