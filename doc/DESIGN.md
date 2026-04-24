@@ -234,7 +234,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/nv2a_thread.hpp` | NV2A PFIFO dedicated host thread (CV-driven)    | ✅ Working    |
 | `xbox/pgraph.hpp`     | PGRAPH state shadow (NV097 method → state)       | ✅ Working    |
 | `xbox/apu.hpp`        | APU register stubs (VP/GP/EP)                    | ✅ Working    |
-| `xbox/ide.hpp`        | IDE ATA: channels, task file, IDENTIFY           | ✅ Working    |
+| `xbox/ide.hpp`        | IDE ATA: PIO sector read/write + IDENTIFY data   | ✅ Working    |
 | `xbox/usb.hpp`        | USB OHCI controller stubs (2 ports each)         | ✅ Working    |
 | `xbox/ioapic.hpp`     | I/O APIC register stubs                          | ✅ Working    |
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
@@ -272,7 +272,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 | `tests/apu.asm`       | APU: VP/GP/EP base + status registers (7)        | ✅ ALL PASS   |
-| `tests/ide.asm`       | IDE ATA: register defaults, IDENTIFY, PCI (10)   | ✅ ALL PASS   |
+| `tests/ide.asm`       | IDE ATA: register defaults, IDENTIFY data, PIO (16) | ✅ ALL PASS   |
 | `tests/usb.asm`       | USB OHCI: register defaults, reset, PCI (12)     | ✅ ALL PASS   |
 | `tests/mtrr.asm`      | MTRR MSRs: variable + fixed range read/write (8) | ✅ ALL PASS   |
 | `tests/gdt_tss.asm`   | GDT/TSS: LLDT/LTR/SLDT/STR/SGDT/SIDT (10)       | ✅ ALL PASS   |
@@ -1487,12 +1487,24 @@ Device/Head.  Status register is read-only; Command register is write-only
 
 | Command | Opcode | Behaviour |
 |---|---|---|
-| IDENTIFY DEVICE | 0xEC | Sets DRQ (status = 0x58), fills 512-byte identify buffer |
+| IDENTIFY DEVICE | 0xEC | Sets DRQ, serves 512-byte identify buffer via data port |
 | IDENTIFY PACKET DEVICE | 0xA1 | Same (for ATAPI/DVD) |
+| READ SECTORS | 0x20 | LBA28 PIO read — loads sector from backing image into data buf |
+| WRITE SECTORS | 0x30 | LBA28 PIO write — receives sector via data port, stores to image |
 | SET FEATURES | 0xEF | Succeeds immediately (status = 0x50) |
 | INITIALIZE DEVICE PARAMETERS | 0x91 | Succeeds immediately |
 | FLUSH CACHE | 0xE7 | Succeeds immediately |
 | Unknown | * | Sets ERR + ABRT (status = 0x51, error = 0x04) |
+
+**PIO data transfer:** 16-bit reads/writes on the data port (0x1F0 / 0x170)
+transfer one word at a time from a 512-byte sector buffer.  IDENTIFY fills
+the buffer from the identify table; READ SECTORS fills it from the backing
+image; WRITE SECTORS collects writes and flushes to the image.  Multi-sector
+transfers advance the LBA automatically.
+
+**Disk backing:** Set `IdeChannel::image_data` / `image_size` to a raw
+sector image (512 bytes per sector).  No image = zero-fill on read, discard
+on write.
 
 **Device identity:** Primary master = "XBOX HDD" (~8 GB LBA28), secondary
 master = "XBOX DVD" (ATAPI CD-ROM).  Both report ATA-6, LBA capable.
@@ -1500,9 +1512,9 @@ master = "XBOX DVD" (ATAPI CD-ROM).  Both report ATA-6, LBA capable.
 **Software reset:** Writing SRST (bit 2) to control register resets
 task-file to post-reset defaults (status = 0x50, error = 0x01).
 
-**Test:** `tests/ide.asm` — 14 assertions covering init status, task-file
-R/W, IDENTIFY, SET FEATURES, unknown command error, alternate status,
-and software reset.
+**Test:** `tests/ide.asm` — 16 assertions covering init status, task-file
+R/W, IDENTIFY with data port transfer (word 0 + full 256-word drain),
+SET FEATURES, unknown command error, alternate status, and software reset.
 
 **SMBus Controller** ✅ DONE
 

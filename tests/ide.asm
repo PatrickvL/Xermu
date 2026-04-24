@@ -1,7 +1,7 @@
 ; ===========================================================================
 ; ide.asm — IDE (ATA) controller tests (--xbox mode).
 ;
-; Tests the dual-channel ATA controller stub:
+; Tests the dual-channel ATA controller:
 ;   Primary (0x1F0–0x1F7, 0x3F6): HDD on master
 ;   Secondary (0x170–0x177, 0x376): DVD on master
 ;
@@ -14,11 +14,13 @@
 ;   7. Primary LBA high write/read
 ;   8. Primary device/head write/read
 ;   9. IDENTIFY DEVICE sets DRQ (status = 0x58)
-;  10. Secondary IDENTIFY PACKET DEVICE sets DRQ
-;  11. SET FEATURES succeeds (status = 0x50)
-;  12. Unknown command → error (status bit 0 set)
-;  13. Alternate status (0x3F6) matches status (0x1F7)
-;  14. Software reset via control register
+;  10. IDENTIFY data port returns identify[0] (word 0 = 0x0040)
+;  11. IDENTIFY drains 256 words, status clears DRQ
+;  12. Secondary IDENTIFY PACKET DEVICE sets DRQ
+;  13. SET FEATURES succeeds (status = 0x50)
+;  14. Unknown command → error (status bit 0 set)
+;  15. Alternate status (0x3F6) matches status (0x1F7)
+;  16. Software reset via control register
 ; ===========================================================================
 
 %include "harness.inc"
@@ -111,7 +113,25 @@ SEC_ALT_STAT  equ 0x376
     movzx eax, al
     ASSERT_EQ eax, 0x58     ; DRDY | DSC | DRQ
 
-; === 10. Secondary IDENTIFY PACKET DEVICE (0xA1) sets DRQ ===
+; === 10. IDENTIFY data port returns word 0 = 0x0040 ===
+    mov dx, PRI_DATA
+    in  ax, dx              ; 16-bit read of first identify word
+    movzx eax, ax
+    ASSERT_EQ eax, 0x0040   ; HDD general config word
+
+; === 11. Drain remaining 255 words, status clears DRQ ===
+    mov ecx, 255
+.drain_id:
+    mov dx, PRI_DATA
+    in  ax, dx              ; discard
+    dec ecx
+    jnz .drain_id
+    mov dx, PRI_STATUS
+    in  al, dx
+    movzx eax, al
+    ASSERT_EQ eax, 0x50     ; DRDY | DSC (no DRQ — transfer complete)
+
+; === 12. Secondary IDENTIFY PACKET DEVICE (0xA1) sets DRQ ===
     mov dx, SEC_COMMAND
     mov al, 0xA1
     out dx, al
@@ -120,7 +140,7 @@ SEC_ALT_STAT  equ 0x376
     movzx eax, al
     ASSERT_EQ eax, 0x58     ; DRDY | DSC | DRQ
 
-; === 11. SET FEATURES (0xEF) succeeds ===
+; === 13. SET FEATURES (0xEF) succeeds ===
     mov dx, PRI_COMMAND
     mov al, 0xEF
     out dx, al
@@ -129,7 +149,7 @@ SEC_ALT_STAT  equ 0x376
     movzx eax, al
     ASSERT_EQ eax, 0x50     ; DRDY | DSC (no DRQ, no ERR)
 
-; === 12. Unknown command → error ===
+; === 14. Unknown command → error ===
     mov dx, PRI_COMMAND
     mov al, 0xFF            ; bogus command
     out dx, al
@@ -138,14 +158,14 @@ SEC_ALT_STAT  equ 0x376
     movzx eax, al
     ASSERT_EQ eax, 0x51     ; DRDY | ERR
 
-; === 13. Alternate status matches status ===
+; === 15. Alternate status matches status ===
     ; After the unknown command, primary status = 0x51.
     mov dx, PRI_ALT_STAT
     in  al, dx
     movzx eax, al
     ASSERT_EQ eax, 0x51
 
-; === 14. Software reset via control register ===
+; === 16. Software reset via control register ===
     mov dx, PRI_CONTROL
     mov al, 0x04            ; SRST bit
     out dx, al
