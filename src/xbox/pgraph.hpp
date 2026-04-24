@@ -127,6 +127,28 @@ struct PgraphState {
     uint32_t clear_count = 0;
     uint32_t total_methods = 0;
 
+    // --- Surface decode helpers ---
+    // SET_SURFACE_FORMAT encoding:
+    //   bits [3:0]   = color format (1=X1R5G5B5, 3=R5G6B5, 5=X8R8G8B8, 8=A8R8G8B8)
+    //   bits [7:4]   = zeta format (1=Z16, 2=Z24S8)
+    //   bits [11:8]  = type (1=pitch, 2=swizzle)
+    //   bits [15:12] = anti-alias mode
+    //   bits [19:16] = width log2  (swizzle mode)
+    //   bits [23:20] = height log2 (swizzle mode)
+
+    uint32_t surface_color_format() const { return reg(nv097::SET_SURFACE_FORMAT) & 0xF; }
+    uint32_t surface_zeta_format()  const { return (reg(nv097::SET_SURFACE_FORMAT) >> 4) & 0xF; }
+    uint32_t surface_type()         const { return (reg(nv097::SET_SURFACE_FORMAT) >> 8) & 0xF; }
+    uint32_t surface_aa_mode()      const { return (reg(nv097::SET_SURFACE_FORMAT) >> 12) & 0xF; }
+    uint32_t surface_width_log2()   const { return (reg(nv097::SET_SURFACE_FORMAT) >> 16) & 0xF; }
+    uint32_t surface_height_log2()  const { return (reg(nv097::SET_SURFACE_FORMAT) >> 20) & 0xF; }
+    uint32_t surface_color_pitch()  const { return reg(nv097::SET_SURFACE_PITCH) & 0xFFFF; }
+    uint32_t surface_zeta_pitch()   const { return reg(nv097::SET_SURFACE_PITCH) >> 16; }
+    uint32_t surface_clip_x()       const { return reg(nv097::SET_SURFACE_CLIP_HORIZONTAL) & 0xFFFF; }
+    uint32_t surface_clip_width()   const { return reg(nv097::SET_SURFACE_CLIP_HORIZONTAL) >> 16; }
+    uint32_t surface_clip_y()       const { return reg(nv097::SET_SURFACE_CLIP_VERTICAL) & 0xFFFF; }
+    uint32_t surface_clip_height()  const { return reg(nv097::SET_SURFACE_CLIP_VERTICAL) >> 16; }
+
     // Process a single GPU method call.
     void handle_method(uint32_t subchannel, uint32_t method, uint32_t data) {
         (void)subchannel;
