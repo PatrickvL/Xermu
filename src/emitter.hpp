@@ -614,6 +614,17 @@ inline void emit_ccall_arg1_pa(Emitter& e) {
 #endif
 }
 
+// arg1 = imm32
+inline void emit_ccall_arg1_imm(Emitter& e, uint32_t v) {
+#ifdef _WIN32
+    // MOV EDX, imm32
+    e.emit8(0xBA); e.emit32(v);
+#else
+    // MOV ESI, imm32
+    e.emit8(0xBE); e.emit32(v);
+#endif
+}
+
 // arg2 = imm32
 inline void emit_ccall_arg2_imm(Emitter& e, uint32_t v) {
 #ifdef _WIN32

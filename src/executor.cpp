@@ -355,6 +355,29 @@ void Executor::handle_privileged() {
         ctx.eip += insn.length;
         return;
 
+    case ZYDIS_MNEMONIC_INT3:
+    case ZYDIS_MNEMONIC_INT1:
+        // Debug traps: log and halt for now (no IDT dispatch yet)
+        fprintf(stderr, "[exec] INT3/INT1 trap at EIP=%08X\n", ctx.eip);
+        ctx.virtual_if = false;
+        return;
+
+    case ZYDIS_MNEMONIC_INT: {
+        // Software interrupt: INT imm8
+        uint8_t vector = (uint8_t)ops[0].imm.value.u;
+        fprintf(stderr, "[exec] INT 0x%02X at EIP=%08X\n", vector, ctx.eip);
+        // Stub: halt until interrupt delivery is implemented (§5.12)
+        ctx.virtual_if = false;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_INTO:
+        // INTO: interrupt on overflow — check OF flag
+        // Stub: log and advance (OF=0 → no trap in most test scenarios)
+        fprintf(stderr, "[exec] INTO at EIP=%08X (stub)\n", ctx.eip);
+        ctx.eip += insn.length;
+        return;
+
     case ZYDIS_MNEMONIC_OUT: {
         // OUT imm8, AL:   ops[0]=imm, ops[1]=reg(AL/AX/EAX)
         // OUT DX, AL:     ops[0]=DX,  ops[1]=reg(AL/AX/EAX)

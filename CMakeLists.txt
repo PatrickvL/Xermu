@@ -80,6 +80,7 @@ set(TEST_ASM_FILES
     tests/segment.asm
     tests/indirect.asm
     tests/privileged.asm
+    tests/misc.asm
 )
 
 if(NASM_EXECUTABLE)

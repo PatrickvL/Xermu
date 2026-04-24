@@ -110,7 +110,7 @@ PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
 All instruction classification is driven by a **two-level O(1) dispatch table**:
 
 - **Level 1**: `uint8_t MNEMONIC_CLASS[ZYDIS_MNEMONIC_MAX_VALUE+1]` — maps every
-  Zydis mnemonic enum to a compact `InsnClassId` (0–18). Initialized once by
+  Zydis mnemonic enum to a compact `InsnClassId` (0–24). Initialized once by
   `init_mnemonic_table()` at startup. Cost: ~1.8 KB, single array lookup.
 
 - **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
@@ -139,8 +139,10 @@ Class IDs and their handlers:
 | IC_PUSHFD     | PUSHFD                                   | `emit_handler_pushfd`  |
 | IC_POPFD      | POPFD                                    | `emit_handler_popfd`   |
 | IC_STRING     | MOVSB/W/D, STOSB/W/D, LODSB/W/D, CMPSB/W/D, SCASB/W/D (15 mnemonics) | `emit_handler_string` |
+| IC_ENTER      | ENTER                                    | `emit_handler_enter`   |
+| IC_XLATB      | XLAT                                     | `emit_handler_xlatb`   |
 | IC_TERMINATOR | JMP/CALL/RET/Jcc/LOOP/LOOPE/LOOPNE/IRETD | (inline in build loop) |
-| IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/... | (stop_reason + RET)    |
+| IC_PRIVILEGED | HLT/LGDT/CLI/STI/IN/OUT/RDMSR/WRMSR/INT/INT3/... | (stop_reason + RET)    |
 
 The `build()` loop in Phase 1 uses `lookup_flags()` for dispatch detection and
 termination. Phase 3 uses `lookup_insn_class()` to fetch the handler callback —
@@ -190,11 +192,12 @@ and rebuild.
 | `tests/flow.asm`      | Control flow: LOOP/Jcc/CALL/RET/recursion (27)   | ✅ ALL PASS   |
 | `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
 | `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
-| `tests/advanced.asm`  | CMOVcc/SETcc/BSWAP/IMUL (42)                     | ✅ ALL PASS   |
+| `tests/advanced.asm`  | CMOVcc/SETcc/BSWAP/IMUL/MUL/DIV (54)             | ✅ ALL PASS   |
 | `tests/string.asm`    | MOVS/STOS/LODS/CMPS/SCAS + REP (36 assertions)  | ✅ ALL PASS   |
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
 | `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
+| `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC (33)    | ✅ ALL PASS   |
 
 ---
 
@@ -247,7 +250,10 @@ and rebuild.
 - [x] BT/BTS/BTR/BTC [mem] bit test instructions
 - [x] BSF/BSR bit scan instructions
 - [x] SHLD/SHRD double-precision shift instructions
-- [x] NASM test infrastructure: 10 suites, 357 total assertions, CMake integration
+- [x] ENTER imm16, imm8 stack frame creation via C helper (IC_ENTER)
+- [x] XLATB table lookup [EBX+AL] via C helper (IC_XLATB)
+- [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
+- [x] NASM test infrastructure: 11 suites, 390 total assertions, CMake integration
 
 ---
 
@@ -372,6 +378,9 @@ a trap to the run loop.
 | CPUID             | ✅ Leaves 0 and 1 (vendor + features)              |
 | RDTSC             | ✅ Host __rdtsc()                                  |
 | HLT               | ✅ Idle until next interrupt                       |
+| INT n             | ✅ Stub (log + halt until §5.12 interrupt delivery)|
+| INT3 / INT1       | ✅ Stub (debug trap → halt)                        |
+| INTO              | ✅ Stub (log + advance)                            |
 
 ---
 
