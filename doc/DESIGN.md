@@ -185,16 +185,16 @@ and rebuild.
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
-| `tests/alu.asm`       | ALU test suite (58 assertions)                   | ✅ ALL PASS   |
-| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE/8-16bit/PUSHAD (58) | ✅ ALL PASS   |
+| `tests/alu.asm`       | ALU test suite (52 assertions)                   | ✅ ALL PASS   |
+| `tests/memory.asm`    | Memory/XCHG/CMPXCHG/XADD/BT/BSF/SHLD (76)       | ✅ ALL PASS   |
 | `tests/flow.asm`      | Control flow: LOOP/Jcc/CALL/RET/recursion (27)   | ✅ ALL PASS   |
 | `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
 | `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
-| `tests/advanced.asm`  | CMOVcc/SETcc/BT/BSF/BSWAP/SHLD/IMUL (42)        | ✅ ALL PASS   |
+| `tests/advanced.asm`  | CMOVcc/SETcc/BSWAP/IMUL (42)                     | ✅ ALL PASS   |
 | `tests/string.asm`    | MOVS/STOS/LODS/CMPS/SCAS + REP (36 assertions)  | ✅ ALL PASS   |
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
-| `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT (11 assertions)   | ✅ ALL PASS   |
+| `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
 
 ---
 
@@ -240,7 +240,14 @@ and rebuild.
 - [x] 8/16-bit register MOV memory forms (AL/CL/DL/BL, AX-DI via guest_reg_enc)
 - [x] PUSHAD/POPAD via C helpers (IC_PUSHAD/IC_POPAD dispatch classes)
 - [x] Privileged insn emulation: CLI/STI/CPUID/RDTSC/RDMSR/WRMSR/LGDT/LIDT
-- [x] NASM test infrastructure: 10 suites, 380 total assertions, CMake integration
+- [x] MOV CRn / MOV r,CRn emulation (CR0/CR2/CR3/CR4 read/write in handle_privileged)
+- [x] INVLPG/WBINVD/INVD/CLTS/LMSW privileged stubs
+- [x] IRETD via C helper (pop EIP/CS/EFLAGS from guest stack)
+- [x] XCHG/CMPXCHG/XADD [mem] via generic rewriter (IC_ALU_MEM)
+- [x] BT/BTS/BTR/BTC [mem] bit test instructions
+- [x] BSF/BSR bit scan instructions
+- [x] SHLD/SHRD double-precision shift instructions
+- [x] NASM test infrastructure: 10 suites, 357 total assertions, CMake integration
 
 ---
 
@@ -342,25 +349,28 @@ paths transparently. Verified by `tests/indirect.asm` (20 assertions).
 (`pushad_helper`/`popad_helper`) that operate directly on `ctx->gp[]` and guest
 stack. Dispatch table classes: `IC_PUSHAD`/`IC_POPAD`.
 
-#### 5.10 Privileged Instruction Handling — Partially Done
-**Priority: MEDIUM** (for kernel boot) — `handle_privileged()` now handles HLT
-(set virtual_if=false), IN/OUT (I/O port dispatch table), and returns to the run
-loop via a `stop_reason` field instead of UD2. Remaining emulation:
+#### 5.10 ~~Privileged Instruction Handling~~ ✅ DONE
+**Priority: MEDIUM** (for kernel boot) — `handle_privileged()` handles all
+common privileged instructions via the `stop_reason` field. The JIT detects
+privileged mnemonics (and MOV CRn which shares ZYDIS_MNEMONIC_MOV) and emits
+a trap to the run loop.
 
-| Instruction       | Emulation needed                                   |
+| Instruction       | Status                                             |
 |-------------------|----------------------------------------------------|
-| RDMSR / WRMSR     | MSR table (APIC_BASE, SYSENTER_*, etc.)            |
-| MOV CRn, r / r, CRn | Update ctx->cr0/cr2/cr3/cr4                     |
-| IN / OUT          | ✅ DONE — IoPortEntry dispatch table in XboxExecutor |
-| LGDT / LIDT       | Update ctx->gdtr/idtr_base/limit                  |
-| LLDT / LTR        | Update ctx->ldtr/tr                                |
-| CLI / STI         | Toggle ctx->virtual_if                             |
-| PUSHF / POPF      | ✅ DONE — Guest-stack handlers (IC_PUSHFD/IC_POPFD) |
-| IRET              | Pop EIP/CS/EFLAGS from guest stack, restore IF     |
-| INVLPG            | Invalidate shadow TLB entry (once paging exists)   |
-| CPUID             | Return Xbox-appropriate CPUID leaves               |
-| RDTSC             | Return scaled/offset TSC value                     |
-| HLT               | Idle until next interrupt                          |
+| RDMSR / WRMSR     | ✅ Stub (advance EIP)                              |
+| MOV CRn, r / r, CRn | ✅ Read/write ctx->cr0/cr2/cr3/cr4              |
+| IN / OUT          | ✅ IoPortEntry dispatch table in XboxExecutor       |
+| LGDT / LIDT       | ✅ Update ctx->gdtr/idtr base/limit                |
+| LLDT / LTR        | Stub needed (not yet encountered)                  |
+| CLI / STI         | ✅ Toggle ctx->virtual_if                          |
+| PUSHF / POPF      | ✅ Guest-stack handlers (IC_PUSHFD/IC_POPFD)       |
+| IRET              | ✅ Pop EIP/CS/EFLAGS via iret_helper               |
+| INVLPG            | ✅ Stub (no paging yet)                            |
+| WBINVD / INVD     | ✅ Stub                                            |
+| CLTS / LMSW       | ✅ Stub                                            |
+| CPUID             | ✅ Leaves 0 and 1 (vendor + features)              |
+| RDTSC             | ✅ Host __rdtsc()                                  |
+| HLT               | ✅ Idle until next interrupt                       |
 
 ---
 

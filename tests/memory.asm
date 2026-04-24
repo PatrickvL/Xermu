@@ -350,5 +350,107 @@
     ASSERT_EQ edi, 0x88888888                ; 58
     mov  eax, 0                              ; reset for next test
 
+; ========================== XCHG reg,[mem] =================================
+    mov  dword [0x5000], 0xAAAAAAAA
+    mov  eax, 0xBBBBBBBB
+    xchg eax, [0x5000]                       ; EAX ← 0xAAAAAAAA, [0x5000] ← 0xBBBBBBBB
+    ASSERT_EQ eax, 0xAAAAAAAA                ; 59
+    mov  ecx, [0x5000]
+    ASSERT_EQ ecx, 0xBBBBBBBB               ; 60
+
+; XCHG reg,reg (no memory, clean copy)
+    mov  eax, 0x11
+    mov  ebx, 0x22
+    xchg eax, ebx
+    ASSERT_EQ eax, 0x22                      ; 61
+    ASSERT_EQ ebx, 0x11                      ; 62
+
+; ========================= CMPXCHG [mem],reg ===============================
+; CMPXCHG [mem], reg: if EAX == [mem], ZF=1, [mem] ← reg; else ZF=0, EAX ← [mem]
+
+    ; Success case: EAX matches
+    mov  dword [0x5010], 0x42
+    mov  eax, 0x42                           ; EAX = expected value
+    mov  ecx, 0x99                           ; ECX = new value
+    cmpxchg [0x5010], ecx
+    jnz  .cmpxchg_fail1
+    mov  edx, [0x5010]
+    ASSERT_EQ edx, 0x99                      ; 63 — [mem] was updated
+    jmp  .cmpxchg_test2
+.cmpxchg_fail1:
+    mov  eax, 63
+    hlt
+
+.cmpxchg_test2:
+    ; Failure case: EAX doesn't match
+    mov  dword [0x5010], 0x77
+    mov  eax, 0xFF                           ; EAX != [mem]
+    mov  ecx, 0xAA
+    cmpxchg [0x5010], ecx
+    jz   .cmpxchg_fail2
+    ASSERT_EQ eax, 0x77                      ; 64 — EAX loaded with [mem] value
+    mov  edx, [0x5010]
+    ASSERT_EQ edx, 0x77                      ; 65 — [mem] unchanged
+    jmp  .cmpxchg_done
+.cmpxchg_fail2:
+    mov  eax, 64
+    hlt
+
+.cmpxchg_done:
+
+; ========================= XADD [mem],reg ==================================
+    mov  dword [0x5020], 10
+    mov  eax, 5
+    xadd [0x5020], eax                       ; [mem] ← 10+5=15, EAX ← old=10
+    ASSERT_EQ eax, 10                        ; 66
+    mov  ecx, [0x5020]
+    ASSERT_EQ ecx, 15                        ; 67
+    mov  eax, 0
+
+; ========================= BT / BTS / BTR / BTC ===========================
+    mov  dword [0x5030], 0x00000001          ; bit 0 set
+    bt   dword [0x5030], 0                   ; CF=1
+    jnc  .bt_fail
+    bt   dword [0x5030], 1                   ; CF=0
+    jc   .bt_fail
+    bts  dword [0x5030], 4                   ; set bit 4 → 0x11
+    mov  ecx, [0x5030]
+    ASSERT_EQ ecx, 0x11                      ; 68
+    btr  dword [0x5030], 0                   ; clear bit 0 → 0x10
+    mov  ecx, [0x5030]
+    ASSERT_EQ ecx, 0x10                      ; 69
+    btc  dword [0x5030], 4                   ; toggle bit 4 → 0x00
+    mov  ecx, [0x5030]
+    ASSERT_EQ ecx, 0x00                      ; 70
+    jmp  .bt_done
+.bt_fail:
+    mov  eax, 68
+    hlt
+.bt_done:
+
+; ========================= BSF / BSR =======================================
+    mov  eax, 0
+    mov  ecx, 0x00000010                     ; bit 4 set
+    bsf  eax, ecx
+    ASSERT_EQ eax, 4                         ; 71 — BSF finds first set bit
+    bsr  eax, ecx
+    ASSERT_EQ eax, 4                         ; 72 — BSR same (only 1 bit set)
+    mov  ecx, 0x80000001                     ; bits 0 and 31
+    bsf  eax, ecx
+    ASSERT_EQ eax, 0                         ; 73 — BSF finds bit 0
+    bsr  eax, ecx
+    ASSERT_EQ eax, 31                        ; 74 — BSR finds bit 31
+    mov  eax, 0
+
+; ========================= SHLD / SHRD =====================================
+    mov  eax, 0x12345678
+    mov  ebx, 0xABCDEF00
+    shld eax, ebx, 8                         ; shift EAX left 8, fill from EBX high bits
+    ASSERT_EQ eax, 0x345678AB                ; 75
+    mov  eax, 0x12345678
+    shrd eax, ebx, 8                         ; shift EAX right 8, fill from EBX low bits
+    ASSERT_EQ eax, 0x00123456                ; 76
+    mov  eax, 0
+
 ; ============================== PASS =======================================
     PASS

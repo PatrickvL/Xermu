@@ -96,5 +96,60 @@
     lidt [0x3108]
     ASSERT_EQ eax, 0                         ; 11 — LIDT didn't crash
 
+; ========================= MOV CRn ========================================
+; MOV CR0, EAX / MOV EAX, CR0 — read/write control registers.
+; We write a value to CR0 then read it back.
+
+    ; Read current CR0 into EAX
+    mov  eax, cr0
+    mov  ebx, eax                            ; save original CR0
+
+    ; Write a known value to CR0 (keep PE, ET bits set to avoid issues)
+    ; Just write back what we read — verifies the round-trip works.
+    mov  cr0, eax
+
+    ; Read back and verify it matches
+    mov  ecx, cr0
+    ASSERT_EQ ecx, ebx                      ; 12 — CR0 round-trip
+
+    ; Test CR3 (page directory base) — write and read back
+    mov  eax, 0x00100000                     ; fake page dir at 1MB
+    mov  cr3, eax
+    mov  ecx, cr3
+    ASSERT_EQ ecx, 0x00100000               ; 13 — CR3 round-trip
+
+    ; Test CR4
+    mov  eax, 0x00000200                     ; OSFXSR bit
+    mov  cr4, eax
+    mov  ecx, cr4
+    ASSERT_EQ ecx, 0x00000200               ; 14 — CR4 round-trip
+    mov  eax, 0
+
+; ========================= INVLPG =========================================
+    invlpg [0x1000]                          ; should not crash
+    ASSERT_EQ eax, 0                         ; 15 — INVLPG didn't crash
+
+; ========================= WBINVD =========================================
+    wbinvd                                   ; should not crash
+    ASSERT_EQ eax, 0                         ; 16 — WBINVD didn't crash
+
+; ========================= IRETD ==========================================
+; Build a fake interrupt frame on the stack: push EFLAGS, CS, EIP of .iret_ok
+; then execute IRET which should pop them and jump to .iret_ok.
+
+    pushfd                                   ; save current EFLAGS
+    pop  ebx                                 ; EBX = current EFLAGS
+
+    push dword ebx                           ; push EFLAGS
+    push dword 0x0008                        ; push CS (flat, value doesn't matter)
+    push dword .iret_ok                      ; push return EIP
+    iretd                                    ; should pop EIP=.iret_ok, CS=8, EFLAGS=ebx
+    ; If IRETD fails, we'll fall through here:
+    mov  eax, 17
+    hlt
+
+.iret_ok:
+    ASSERT_EQ eax, 0                         ; 17 — IRETD jumped correctly
+
 ; ========================= ALL PASSED =====================================
     PASS
