@@ -84,6 +84,7 @@ set(TEST_ASM_FILES
     tests/smc.asm
     tests/interrupt.asm
     tests/paging.asm
+    tests/xbox.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -114,10 +115,17 @@ if(NASM_EXECUTABLE)
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
-        add_test(
-            NAME    ${test_name}
-            COMMAND test_runner ${bin_file}
-        )
+        if(test_name STREQUAL "xbox")
+            add_test(
+                NAME    ${test_name}
+                COMMAND test_runner --xbox ${bin_file}
+            )
+        else()
+            add_test(
+                NAME    ${test_name}
+                COMMAND test_runner ${bin_file}
+            )
+        endif()
     endforeach()
 else()
     message(WARNING "NASM not found — NASM test binaries will not be assembled. "
