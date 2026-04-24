@@ -278,7 +278,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/gdt_tss.asm`   | GDT/TSS: LLDT/LTR/SLDT/STR/SGDT/SIDT (10)       | ✅ ALL PASS   |
 | `tests/flash.asm`     | Flash ROM: BIOS shadow + flash base reads (4)    | ✅ ALL PASS   |
 | `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
-| `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing + JUMP (5)      | ✅ ALL PASS   |
+| `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing, JUMP, CALL/RETURN (8) | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
@@ -698,6 +698,9 @@ Command format:
 - **NON_INCREASING** (type 4): `count` data dwords all dispatched to the
   same `method` (used for FIFO-style registers like vertex data submission).
 - **JUMP** (bit [31:30] = 01): redirects DMA_GET to the target address.
+- **CALL** (bits [1:0] = 10): saves DMA_GET to subroutine return register,
+  jumps to target address. Single-level (no nested calls).
+- **RETURN** (0x00020000): restores DMA_GET from saved return address.
 - **NOP** (all-zero dword): silently skipped.
 
 Each dispatched method calls `method_handler(user, subchannel, method, data)`.
@@ -709,6 +712,7 @@ Diagnostic counters exposed as emulator extension registers:
 | `FIFO_METHODS`       | 0x003F00  | Cumulative methods dispatched    |
 | `FIFO_DWORDS`        | 0x003F04  | Cumulative dwords consumed       |
 | `FIFO_JUMPS`         | 0x003F08  | Cumulative JUMP commands         |
+| `FIFO_CALLS`         | 0x003F0C  | Cumulative CALL commands         |
 
 Standard PFIFO registers:| Register              | Offset     | Behaviour                        |
 |-----------------------|-----------|----------------------------------|

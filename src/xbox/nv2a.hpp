@@ -52,11 +52,13 @@ struct Nv2aState {
 
     // PFIFO DMA pusher call stack (for CALL/RETURN, 1 level on Xbox).
     uint32_t pfifo_dma_call_return = 0;
+    bool     pfifo_subr_active     = false;
 
     // PFIFO command parsing stats (for diagnostics / testing).
     uint32_t fifo_methods_dispatched = 0;
     uint32_t fifo_dwords_consumed    = 0;
     uint32_t fifo_jumps              = 0;
+    uint32_t fifo_calls              = 0;
 
     // Pointer to PGRAPH state shadow (set by xbox_setup, used for diag reads).
     struct PgraphState;  // forward decl — full definition in pgraph.hpp
@@ -136,6 +138,27 @@ struct Nv2aState {
                 continue;
             }
 
+            if ((hdr & 3) == 2) {
+                // CALL: save GET, jump to target. Single-level on Xbox.
+                if (!pfifo_subr_active) {
+                    pfifo_dma_call_return = get;
+                    pfifo_subr_active = true;
+                    get = hdr & 0xFFFFFFFCu;
+                    fifo_calls++;
+                }
+                // If subr_active already set, silently ignore (real HW raises error).
+                continue;
+            }
+
+            if (hdr == 0x00020000u) {
+                // RETURN: restore GET from saved address.
+                if (pfifo_subr_active) {
+                    get = pfifo_dma_call_return;
+                    pfifo_subr_active = false;
+                }
+                continue;
+            }
+
             if (type == 0 || type == 4) {
                 // INCREASING (0) or NON_INCREASING (4).
                 uint32_t method     = (hdr >>  0) & 0x1FFC;  // bits [12:2], in bytes
@@ -156,7 +179,6 @@ struct Nv2aState {
                     fifo_methods_dispatched++;
                 }
             }
-            // Other types (CALL/RETURN) — ignore on Xbox.
         }
 done:
         fifo_dwords_consumed += consumed;
@@ -203,6 +225,7 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     if (off == 0x003F00) return nv->fifo_methods_dispatched;
     if (off == 0x003F04) return nv->fifo_dwords_consumed;
     if (off == 0x003F08) return nv->fifo_jumps;
+    if (off == 0x003F0C) return nv->fifo_calls;
     if (off == 0x009200) return nv->ptimer_num;
     if (off == 0x009210) return nv->ptimer_den;
     if (off == 0x009400) return (uint32_t)(nv->ptimer_ns & 0xFFFFFFE0u);
