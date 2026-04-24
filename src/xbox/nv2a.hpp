@@ -1,7 +1,9 @@
 #pragma once
 // NV2A GPU register stubs — PMC, PFIFO, PTIMER, PCRTC, PGRAPH, PRAMDAC.
+// PFIFO DMA pusher parses NV2A push buffer commands from guest RAM.
 #include "address_map.hpp"
 #include <cstdint>
+#include <cstring>
 
 namespace xbox {
 
@@ -48,6 +50,14 @@ struct Nv2aState {
     uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;
 
+    // PFIFO DMA pusher call stack (for CALL/RETURN, 1 level on Xbox).
+    uint32_t pfifo_dma_call_return = 0;
+
+    // PFIFO command parsing stats (for diagnostics / testing).
+    uint32_t fifo_methods_dispatched = 0;
+    uint32_t fifo_dwords_consumed    = 0;
+    uint32_t fifo_jumps              = 0;
+
     // PCRTC vblank
     uint32_t vblank_counter = 0;
     static constexpr uint32_t VBLANK_PERIOD = 16667;
@@ -66,7 +76,24 @@ struct Nv2aState {
 
     static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
 
-    void tick_fifo(const uint8_t* /*ram*/, uint32_t /*ram_size_bytes*/) {
+    // ---------------------------------------------------------------
+    // NV2A push buffer command types (bits [31:29] of command header).
+    // ---------------------------------------------------------------
+    // Type 0b000: INCREASING — data dwords go to method, method+4, method+8, ...
+    // Type 0b100: NON_INCREASING — all data dwords go to the same method
+    // Bit [31:30] = 01: JUMP to address in bits [28:2] << 2
+    // All-zero dword = NOP (skip).
+    // ---------------------------------------------------------------
+
+    // GPU method handler — called for each (subchannel, method, data) tuple.
+    // Override this for actual GPU command processing (PGRAPH state shadow).
+    // Default: no-op (discard).
+    using MethodHandler = void(*)(void* user, uint32_t subchannel,
+                                  uint32_t method, uint32_t data);
+    MethodHandler method_handler = nullptr;
+    void*         method_user    = nullptr;
+
+    void tick_fifo(const uint8_t* ram, uint32_t ram_size_bytes) {
         if (!(pfifo_cache1_dma_push & 1)) return;
         if (!(pfifo_cache1_push0 & 1)) return;
         if (pfifo_cache1_dma_get == pfifo_cache1_dma_put) {
@@ -77,10 +104,52 @@ struct Nv2aState {
         uint32_t get = pfifo_cache1_dma_get;
         uint32_t put = pfifo_cache1_dma_put;
         uint32_t consumed = 0;
+
         while (get != put && consumed < MAX_DWORDS_PER_TICK) {
+            // Bounds check — DMA addresses must be within RAM.
+            if (get + 4 > ram_size_bytes) break;
+
+            uint32_t hdr;
+            memcpy(&hdr, ram + get, 4);
             get += 4;
             consumed++;
+
+            // NOP: all-zero dword.
+            if (hdr == 0) continue;
+
+            uint32_t type = (hdr >> 29) & 0x7;
+
+            if ((hdr & 0xC0000000u) == 0x40000000u) {
+                // JUMP: target address = bits [28:2] << 2 (i.e. bits [28:0] with low 2 bits masked)
+                get = hdr & 0x1FFFFFFCu;
+                fifo_jumps++;
+                continue;
+            }
+
+            if (type == 0 || type == 4) {
+                // INCREASING (0) or NON_INCREASING (4).
+                uint32_t method     = (hdr >>  0) & 0x1FFC;  // bits [12:2], in bytes
+                uint32_t subchannel = (hdr >> 13) & 0x7;
+                uint32_t count      = (hdr >> 18) & 0x7FF;
+
+                for (uint32_t i = 0; i < count && consumed < MAX_DWORDS_PER_TICK; ++i) {
+                    if (get + 4 > ram_size_bytes) goto done;
+
+                    uint32_t data;
+                    memcpy(&data, ram + get, 4);
+                    get += 4;
+                    consumed++;
+
+                    uint32_t m = (type == 0) ? (method + i * 4) : method;
+                    if (method_handler)
+                        method_handler(method_user, subchannel, m, data);
+                    fifo_methods_dispatched++;
+                }
+            }
+            // Other types (CALL/RETURN) — ignore on Xbox.
         }
+done:
+        fifo_dwords_consumed += consumed;
         pfifo_cache1_dma_get = get;
         if (get == put)
             pfifo_cache1_status = 0x10;
@@ -120,6 +189,10 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
                     (nv->pfifo_cache1_dma_get != nv->pfifo_cache1_dma_put);
         return busy ? 1u : 0u;
     }
+    // PFIFO command parser stats (emulator extensions, offset 0x003F00).
+    if (off == 0x003F00) return nv->fifo_methods_dispatched;
+    if (off == 0x003F04) return nv->fifo_dwords_consumed;
+    if (off == 0x003F08) return nv->fifo_jumps;
     if (off == 0x009200) return nv->ptimer_num;
     if (off == 0x009210) return nv->ptimer_den;
     if (off == 0x009400) return (uint32_t)(nv->ptimer_ns & 0xFFFFFFE0u);

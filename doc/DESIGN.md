@@ -261,6 +261,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/gdt_tss.asm`   | GDT/TSS: LLDT/LTR/SLDT/STR/SGDT/SIDT (10)       | ✅ ALL PASS   |
 | `tests/flash.asm`     | Flash ROM: BIOS shadow + flash base reads (4)    | ✅ ALL PASS   |
 | `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
+| `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing + JUMP (5)      | ✅ ALL PASS   |
 
 ---
 
@@ -318,7 +319,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 30 suites, CMake integration
+- [x] NASM test infrastructure: 32 suites, CMake integration
 
 ---
 
@@ -660,15 +661,31 @@ Periodic vblank interrupt (~60 Hz) from the NV2A CRTC:
   interrupt, clear PCRTC_INTR_0 via W1C, send EOI to PIC.
 - **Tick rate**: VBLANK_PERIOD = 16667 ticks (~60 Hz at 1 tick/trace).
 
-**PFIFO (command FIFO engine)** ✅ DONE (stub + DMA pusher)
+**PFIFO (command FIFO engine)** ✅ DONE (DMA pusher + command parser)
 
-Register stubs that let games initialize the GPU command submission path
-without hanging.  The DMA pusher advances `DMA_GET` toward `DMA_PUT` on each
-tick (up to 128 dwords/tick), so games that submit push buffer commands don't
-stall waiting for the GPU to consume them.  Commands are discarded (not
-interpreted) — actual rendering will be handled by the Vulkan backend (§5.16a).
+The DMA pusher reads NV2A push buffer commands from guest RAM and dispatches
+them through a pluggable `MethodHandler` callback.  `tick_fifo()` runs each
+hardware tick (up to 128 dwords/tick) and parses the standard NV2A command
+format:
 
-| Register              | Offset     | Behaviour                        |
+- **INCREASING** (type 0): `count` data dwords dispatched to consecutive
+  methods starting at `method` (method, method+4, method+8, …).
+- **NON_INCREASING** (type 4): `count` data dwords all dispatched to the
+  same `method` (used for FIFO-style registers like vertex data submission).
+- **JUMP** (bit [31:30] = 01): redirects DMA_GET to the target address.
+- **NOP** (all-zero dword): silently skipped.
+
+Each dispatched method calls `method_handler(user, subchannel, method, data)`.
+When no handler is installed (default), methods are counted but discarded.
+Diagnostic counters exposed as emulator extension registers:
+
+| Extension Register    | Offset     | Description                      |
+|-----------------------|-----------|----------------------------------|
+| `FIFO_METHODS`       | 0x003F00  | Cumulative methods dispatched    |
+| `FIFO_DWORDS`        | 0x003F04  | Cumulative dwords consumed       |
+| `FIFO_JUMPS`         | 0x003F08  | Cumulative JUMP commands         |
+
+Standard PFIFO registers:| Register              | Offset     | Behaviour                        |
 |-----------------------|-----------|----------------------------------|
 | `PFIFO_INTR_0`       | 0x002100  | Interrupt status (W1C)           |
 | `PFIFO_INTR_EN_0`    | 0x002140  | Interrupt enable                 |
