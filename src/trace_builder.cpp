@@ -53,6 +53,168 @@ uint32_t popfd_helper(GuestContext* ctx) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// String instruction helpers (MOVS/STOS/LODS/CMPS/SCAS).
+//
+// Called from JIT code with all GP regs saved to ctx.
+//   arg0  ctx        — GuestContext*
+//   arg1  eflags     — captured host EFLAGS (DF bit controls direction)
+//   arg2  elem_size  — 1, 2, or 4
+//   arg3  rep_mode   — 0 = no prefix, 1 = REP/REPE, 2 = REPNE
+//
+// Returns the EFLAGS to restore.  MOVS/STOS/LODS return the input value
+// unchanged; CMPS/SCAS return updated arithmetic flags.
+// ---------------------------------------------------------------------------
+
+static uint32_t compute_sub_flags(uint32_t a, uint32_t b, uint32_t elem_size) {
+    uint32_t mask = (elem_size == 1) ? 0xFFu
+                  : (elem_size == 2) ? 0xFFFFu
+                  :                    0xFFFFFFFFu;
+    a &= mask; b &= mask;
+    uint32_t result = (a - b) & mask;
+    uint32_t flags = 0;
+    if (a < b)                    flags |= (1u << 0);  // CF
+    { uint8_t p = (uint8_t)result;
+      p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+      if (!(p & 1))              flags |= (1u << 2); } // PF
+    if ((a ^ b ^ result) & 0x10) flags |= (1u << 4);  // AF
+    if (result == 0)             flags |= (1u << 6);  // ZF
+    uint32_t sb = (elem_size == 1) ? 7 : (elem_size == 2) ? 15 : 31;
+    if ((result >> sb) & 1)      flags |= (1u << 7);  // SF
+    uint32_t sa = (a >> sb) & 1, sbb = (b >> sb) & 1, sr = (result >> sb) & 1;
+    if (sa != sbb && sa != sr)   flags |= (1u << 11); // OF
+    return flags;
+}
+
+static constexpr uint32_t ARITH_FLAGS_MASK = 0x8D5u; // CF|PF|AF|ZF|SF|OF
+
+uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,
+                            uint32_t elem_size, uint32_t rep_mode) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
+    uint32_t& esi = ctx->gp[GP_ESI];
+    uint32_t& edi = ctx->gp[GP_EDI];
+    uint32_t& ecx = ctx->gp[GP_ECX];
+
+    auto do_one = [&]() {
+        switch (elem_size) {
+        case 1: *(uint8_t *)(base+edi) = *(uint8_t *)(base+esi); break;
+        case 2: *(uint16_t*)(base+edi) = *(uint16_t*)(base+esi); break;
+        case 4: *(uint32_t*)(base+edi) = *(uint32_t*)(base+esi); break;
+        }
+        esi += dir; edi += dir;
+    };
+    if (rep_mode == 0) do_one();
+    else while (ecx > 0) { do_one(); ecx--; }
+    return eflags;
+}
+
+uint32_t string_stos_helper(GuestContext* ctx, uint32_t eflags,
+                            uint32_t elem_size, uint32_t rep_mode) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
+    uint32_t eax = ctx->gp[GP_EAX];
+    uint32_t& edi = ctx->gp[GP_EDI];
+    uint32_t& ecx = ctx->gp[GP_ECX];
+
+    auto do_one = [&]() {
+        switch (elem_size) {
+        case 1: *(uint8_t *)(base+edi) = (uint8_t)eax;  break;
+        case 2: *(uint16_t*)(base+edi) = (uint16_t)eax;  break;
+        case 4: *(uint32_t*)(base+edi) = eax;             break;
+        }
+        edi += dir;
+    };
+    if (rep_mode == 0) do_one();
+    else while (ecx > 0) { do_one(); ecx--; }
+    return eflags;
+}
+
+uint32_t string_lods_helper(GuestContext* ctx, uint32_t eflags,
+                            uint32_t elem_size, uint32_t rep_mode) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
+    uint32_t& eax = ctx->gp[GP_EAX];
+    uint32_t& esi = ctx->gp[GP_ESI];
+    uint32_t& ecx = ctx->gp[GP_ECX];
+
+    auto do_one = [&]() {
+        switch (elem_size) {
+        case 1: eax = (eax & 0xFFFFFF00u) | *(uint8_t *)(base+esi); break;
+        case 2: eax = (eax & 0xFFFF0000u) | *(uint16_t*)(base+esi); break;
+        case 4: eax = *(uint32_t*)(base+esi);                        break;
+        }
+        esi += dir;
+    };
+    if (rep_mode == 0) do_one();
+    else while (ecx > 0) { do_one(); ecx--; }
+    return eflags;
+}
+
+uint32_t string_cmps_helper(GuestContext* ctx, uint32_t eflags,
+                            uint32_t elem_size, uint32_t rep_mode) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
+    uint32_t& esi = ctx->gp[GP_ESI];
+    uint32_t& edi = ctx->gp[GP_EDI];
+    uint32_t& ecx = ctx->gp[GP_ECX];
+    uint32_t rf = eflags;
+
+    auto do_one = [&]() {
+        uint32_t s = 0, d = 0;
+        switch (elem_size) {
+        case 1: s = *(uint8_t *)(base+esi); d = *(uint8_t *)(base+edi); break;
+        case 2: s = *(uint16_t*)(base+esi); d = *(uint16_t*)(base+edi); break;
+        case 4: s = *(uint32_t*)(base+esi); d = *(uint32_t*)(base+edi); break;
+        }
+        rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
+        esi += dir; edi += dir;
+    };
+
+    if (rep_mode == 0) {
+        do_one();
+    } else {
+        while (ecx > 0) {
+            do_one(); ecx--;
+            if (rep_mode == 1 && !(rf & (1u<<6))) break; // REPE: stop if ZF=0
+            if (rep_mode == 2 &&  (rf & (1u<<6))) break; // REPNE: stop if ZF=1
+        }
+    }
+    return rf;
+}
+
+uint32_t string_scas_helper(GuestContext* ctx, uint32_t eflags,
+                            uint32_t elem_size, uint32_t rep_mode) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
+    uint32_t eax = ctx->gp[GP_EAX];
+    uint32_t& edi = ctx->gp[GP_EDI];
+    uint32_t& ecx = ctx->gp[GP_ECX];
+    uint32_t rf = eflags;
+
+    auto do_one = [&]() {
+        uint32_t d = 0, s = 0;
+        switch (elem_size) {
+        case 1: s = eax & 0xFFu;     d = *(uint8_t *)(base+edi); break;
+        case 2: s = eax & 0xFFFFu;   d = *(uint16_t*)(base+edi); break;
+        case 4: s = eax;              d = *(uint32_t*)(base+edi); break;
+        }
+        rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
+        edi += dir;
+    };
+
+    if (rep_mode == 0) {
+        do_one();
+    } else {
+        while (ecx > 0) {
+            do_one(); ecx--;
+            if (rep_mode == 1 && !(rf & (1u<<6))) break; // REPE: stop if ZF=0
+            if (rep_mode == 2 &&  (rf & (1u<<6))) break; // REPNE: stop if ZF=1
+        }
+    }
+    return rf;
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -480,6 +642,73 @@ bool emit_handler_popfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     e.emit8(0x50);                      // PUSH RAX
     e.emit8(0x9D);                      // POPFQ  — sets host EFLAGS
     emit_load_all_gp(e);               // MOVs don't touch flags
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_string — MOVS/STOS/LODS/CMPS/SCAS (± REP/REPE/REPNE).
+//
+// 1. Capture host EFLAGS → R14 (for DF direction bit).
+// 2. Save GP, call the appropriate C helper(ctx, eflags, elem_size, rep_mode).
+// 3. CMPS/SCAS: helper returns new EFLAGS in EAX → save to R14.
+//    MOVS/STOS/LODS: helper returns input EFLAGS unchanged → R14 is still good.
+// 4. Load GP (ESI/EDI/ECX updated by helper), PUSH R14 + POPFQ to set flags.
+// ---------------------------------------------------------------------------
+bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
+                         const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                         GuestContext* /*ctx*/, bool /*save_flags*/) {
+    uint32_t elem_size;
+    const void* helper;
+
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_MOVSB: elem_size = 1; helper = (const void*)string_movs_helper; break;
+    case ZYDIS_MNEMONIC_MOVSW: elem_size = 2; helper = (const void*)string_movs_helper; break;
+    case ZYDIS_MNEMONIC_MOVSD: elem_size = 4; helper = (const void*)string_movs_helper; break;
+    case ZYDIS_MNEMONIC_STOSB: elem_size = 1; helper = (const void*)string_stos_helper; break;
+    case ZYDIS_MNEMONIC_STOSW: elem_size = 2; helper = (const void*)string_stos_helper; break;
+    case ZYDIS_MNEMONIC_STOSD: elem_size = 4; helper = (const void*)string_stos_helper; break;
+    case ZYDIS_MNEMONIC_LODSB: elem_size = 1; helper = (const void*)string_lods_helper; break;
+    case ZYDIS_MNEMONIC_LODSW: elem_size = 2; helper = (const void*)string_lods_helper; break;
+    case ZYDIS_MNEMONIC_LODSD: elem_size = 4; helper = (const void*)string_lods_helper; break;
+    case ZYDIS_MNEMONIC_CMPSB: elem_size = 1; helper = (const void*)string_cmps_helper; break;
+    case ZYDIS_MNEMONIC_CMPSW: elem_size = 2; helper = (const void*)string_cmps_helper; break;
+    case ZYDIS_MNEMONIC_CMPSD: elem_size = 4; helper = (const void*)string_cmps_helper; break;
+    case ZYDIS_MNEMONIC_SCASB: elem_size = 1; helper = (const void*)string_scas_helper; break;
+    case ZYDIS_MNEMONIC_SCASW: elem_size = 2; helper = (const void*)string_scas_helper; break;
+    case ZYDIS_MNEMONIC_SCASD: elem_size = 4; helper = (const void*)string_scas_helper; break;
+    default: return false;
+    }
+
+    // Determine REP mode from instruction attributes
+    uint32_t rep_mode = 0;
+    if (insn.attributes & ZYDIS_ATTRIB_HAS_REP)   rep_mode = 1;
+    if (insn.attributes & ZYDIS_ATTRIB_HAS_REPE)  rep_mode = 1;
+    if (insn.attributes & ZYDIS_ATTRIB_HAS_REPNE) rep_mode = 2;
+
+    // Capture EFLAGS (need DF for direction)
+    e.emit8(0x9C);                      // PUSHFQ
+    e.emit8(0x41); e.emit8(0x5E);      // POP R14
+
+    // Save GP to ctx
+    emit_save_all_gp(e);
+
+    // Call helper(ctx, eflags, elem_size, rep_mode)
+    emit_ccall_arg0_ctx(e);
+    emit_ccall_arg1_pa(e);              // arg1 = R14D (captured EFLAGS)
+    emit_ccall_arg2_imm(e, elem_size);
+    emit_ccall_arg3_imm(e, rep_mode);
+    emit_call_abs(e, helper);
+
+    // All helpers return EFLAGS in EAX; save before load_all_gp clobbers EAX
+    e.emit8(0x41); e.emit8(0x89); e.emit8(0xC6); // MOV R14D, EAX
+
+    // Load updated GP (ESI/EDI/ECX/EAX modified by helper)
+    emit_load_all_gp(e);
+
+    // Set host EFLAGS from R14 (original or new comparison result)
+    e.emit8(0x41); e.emit8(0x56);      // PUSH R14
+    e.emit8(0x9D);                      // POPFQ
+
     return true;
 }
 
