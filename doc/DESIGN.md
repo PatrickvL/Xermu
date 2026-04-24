@@ -248,6 +248,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
 | `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
+| `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 
 ---
 
@@ -305,7 +306,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 20 suites, CMake integration
+- [x] NASM test infrastructure: 21 suites, CMake integration
 
 ---
 
@@ -627,6 +628,19 @@ This is by far the largest single implementation effort.
 | `PTIMER_INTR_0`    | 0x009100  | Interrupt status (stub: always 0)         |
 
 This prevents Xbox kernel and game busy-wait loops that spin on PTIMER.
+
+**PCRTC (vblank interrupt)** ✅ DONE
+
+Periodic vblank interrupt (~60 Hz) from the NV2A CRTC:
+
+- `PCRTC_INTR_0` (0x600100): bit 0 = vblank pending.  Write-1-to-clear.
+- `PCRTC_INTR_EN_0` (0x600140): bit 0 = vblank interrupt enable.
+- `PMC_INTR_0` (0x000100): read-only summary; bit 24 = PCRTC pending.
+- `PMC_INTR_EN_0` (0x000140): master interrupt enable; bit 24 = PCRTC.
+- **IRQ delivery**: when vblank fires and both PCRTC and PMC enables are set,
+  the combined tick callback raises IRQ 1 on the PIC.  Games receive the
+  interrupt, clear PCRTC_INTR_0 via W1C, send EOI to PIC.
+- **Tick rate**: VBLANK_PERIOD = 16667 ticks (~60 Hz at 1 tick/trace).
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
