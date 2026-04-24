@@ -238,6 +238,30 @@ int main() {
     uint32_t stencil_ref = 0x80;
     memcpy(ram + pos, &stencil_ref, 4); pos += 4;
 
+    // === Command 28: SET_COMBINER_CONTROL = 0x00010001 (1 active stage) ===
+    uint32_t hdr28 = pb_inc(SET_COMBINER_CONTROL, 0, 1);
+    memcpy(ram + pos, &hdr28, 4); pos += 4;
+    uint32_t comb_ctl = 0x00010001;
+    memcpy(ram + pos, &comb_ctl, 4); pos += 4;
+
+    // === Command 29: SET_COMBINER_COLOR_ICW stage 0 ===
+    uint32_t hdr29 = pb_inc(SET_COMBINER_COLOR_ICW_0, 0, 1);
+    memcpy(ram + pos, &hdr29, 4); pos += 4;
+    uint32_t cicw0 = 0x08040401;
+    memcpy(ram + pos, &cicw0, 4); pos += 4;
+
+    // === Command 30: SET_COMBINER_COLOR_OCW stage 0 ===
+    uint32_t hdr30 = pb_inc(SET_COMBINER_COLOR_OCW_0, 0, 1);
+    memcpy(ram + pos, &hdr30, 4); pos += 4;
+    uint32_t cocw0 = 0x00C00000;
+    memcpy(ram + pos, &cocw0, 4); pos += 4;
+
+    // === Command 31: SET_COMBINER_SPECULAR_FOG_CW1 ===
+    uint32_t hdr31 = pb_inc(SET_COMBINER_SPECULAR_FOG_CW1, 0, 1);
+    memcpy(ram + pos, &hdr31, 4); pos += 4;
+    uint32_t specfog = 0x000000C0;
+    memcpy(ram + pos, &specfog, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -312,6 +336,12 @@ int main() {
     // Stencil state
     CHECK(pgraph.reg(SET_STENCIL_TEST_ENABLE) == 1, "stencil_test_enable");
     CHECK(pgraph.reg(SET_STENCIL_FUNC_REF)    == 0x80, "stencil_func_ref == 0x80");
+
+    // Combiner state
+    CHECK(pgraph.reg(SET_COMBINER_CONTROL)        == 0x00010001, "combiner_control");
+    CHECK(pgraph.reg(SET_COMBINER_COLOR_ICW_0)    == 0x08040401, "combiner_color_icw0");
+    CHECK(pgraph.reg(SET_COMBINER_COLOR_OCW_0)    == 0x00C00000, "combiner_color_ocw0");
+    CHECK(pgraph.reg(SET_COMBINER_SPECULAR_FOG_CW1) == 0x000000C0, "combiner_specfog_cw1");
 
     free(ram);
 
