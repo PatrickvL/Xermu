@@ -1,7 +1,7 @@
-# Xbox Guided Executor
+# Guided Executor
 
-A JIT-based x86-32 CPU emulator targeting the original Xbox, running on x86-64
-Intel hosts. Guest instructions execute almost natively — only privileged and
+A JIT-based x86-32 CPU emulator targeting Pentium III class CPUs, running on
+x86-64 hosts. Guest instructions execute almost natively — only privileged and
 memory-sensitive instructions are rewritten. Host registers *are* guest registers,
 with surgical interception points.
 
@@ -35,7 +35,7 @@ handlers. No guard pages, no VEH, no exception handling in the hot path.
     ├── emitter.hpp              Byte emitter, EA synthesis, fastmem helpers
     ├── trace_builder.hpp        TraceBuilder, TraceArena, PageVersions
     ├── trace_builder.cpp        Decode → classify → emit loop
-    ├── executor.hpp             XboxExecutor struct, dispatch_trace decl
+    ├── executor.hpp             Executor struct, dispatch_trace decl
     ├── executor.cpp             ASM trampoline (GCC/Clang), init, run loop
     ├── dispatch_trace.asm       MASM trampoline (MSVC)
     └── main.cpp                 Self-test: sum 1..10, fastmem round-trip
@@ -60,7 +60,7 @@ cmake --build build
 ## Running
 
 ```
-./build/Release/xbox_executor
+./build/Release/guided_executor
 ```
 
 Expected output:

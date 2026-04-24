@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xbox_guided_executor CXX)
+project(guided_executor CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -35,16 +35,16 @@ endif()
 # ---------------------------------------------------------------------------
 # Main executable (self-tests with embedded byte arrays)
 # ---------------------------------------------------------------------------
-add_executable(xbox_executor ${COMMON_SOURCES} src/main.cpp)
-target_include_directories(xbox_executor PRIVATE src)
-target_link_libraries(xbox_executor PRIVATE Zydis)
+add_executable(guided_executor ${COMMON_SOURCES} src/main.cpp)
+target_include_directories(guided_executor PRIVATE src)
+target_link_libraries(guided_executor PRIVATE Zydis)
 
 if(MSVC)
-    target_compile_options(xbox_executor PRIVATE /W3)
+    target_compile_options(guided_executor PRIVATE /W3)
 else()
-    target_compile_options(xbox_executor PRIVATE -Wall -Wextra -O2)
+    target_compile_options(guided_executor PRIVATE -Wall -Wextra -O2)
     if(UNIX)
-        target_link_libraries(xbox_executor PRIVATE m)
+        target_link_libraries(guided_executor PRIVATE m)
     endif()
 endif()
 

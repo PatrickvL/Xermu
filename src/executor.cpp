@@ -109,10 +109,10 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
 #endif // GCC/Clang — MSVC uses dispatch_trace.asm
 
 // ---------------------------------------------------------------------------
-// XboxExecutor
+// Executor
 // ---------------------------------------------------------------------------
 
-bool XboxExecutor::init(MmioMap* mmio) {
+bool Executor::init(MmioMap* mmio) {
     ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
     if (!ram) return false;
     memset(ram, 0xCC, GUEST_RAM_SIZE); // INT3 fill (debug aid)
@@ -138,12 +138,12 @@ bool XboxExecutor::init(MmioMap* mmio) {
     return true;
 }
 
-void XboxExecutor::destroy() {
+void Executor::destroy() {
     cc.destroy();
     if (ram) { platform::free_ram(ram, GUEST_RAM_SIZE); ram = nullptr; }
 }
 
-void XboxExecutor::load_guest(uint32_t pa, const void* src, size_t size) {
+void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
     assert(pa + size <= GUEST_RAM_SIZE);
     memcpy(ram + pa, src, size);
 }
@@ -154,7 +154,7 @@ void XboxExecutor::load_guest(uint32_t pa, const void* src, size_t size) {
 // ctx.eip == address of the privileged instruction.
 // ---------------------------------------------------------------------------
 
-void XboxExecutor::handle_privileged() {
+void Executor::handle_privileged() {
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LEGACY_32,
                      ZYDIS_STACK_WIDTH_32);
@@ -196,7 +196,7 @@ void XboxExecutor::handle_privileged() {
 
     case ZYDIS_MNEMONIC_CPUID: {
         uint32_t leaf = ctx.gp[GP_EAX];
-        // Xbox Pentium III (Coppermine): Family 6, Model 8, Stepping 3
+        // Pentium III Coppermine: Family 6, Model 8, Stepping 3
         switch (leaf) {
         case 0:
             ctx.gp[GP_EAX] = 2;               // max standard leaf
@@ -409,13 +409,13 @@ void XboxExecutor::handle_privileged() {
 // I/O port dispatch
 // ---------------------------------------------------------------------------
 
-void XboxExecutor::register_io(uint16_t port, IoReadFn read, IoWriteFn write,
+void Executor::register_io(uint16_t port, IoReadFn read, IoWriteFn write,
                                 void* user) {
     assert(n_io_ports < MAX_IO_PORTS);
     io_ports[n_io_ports++] = { port, read, write, user };
 }
 
-uint32_t XboxExecutor::io_read(uint16_t port, unsigned size) {
+uint32_t Executor::io_read(uint16_t port, unsigned size) {
     for (int i = 0; i < n_io_ports; ++i) {
         if (io_ports[i].port == port && io_ports[i].read)
             return io_ports[i].read(port, size, io_ports[i].user);
@@ -424,7 +424,7 @@ uint32_t XboxExecutor::io_read(uint16_t port, unsigned size) {
     return 0xFFFFFFFF;
 }
 
-void XboxExecutor::io_write(uint16_t port, uint32_t val, unsigned size) {
+void Executor::io_write(uint16_t port, uint32_t val, unsigned size) {
     for (int i = 0; i < n_io_ports; ++i) {
         if (io_ports[i].port == port && io_ports[i].write) {
             io_ports[i].write(port, val, size, io_ports[i].user);
@@ -439,7 +439,7 @@ void XboxExecutor::io_write(uint16_t port, uint32_t val, unsigned size) {
 // Run loop
 // ---------------------------------------------------------------------------
 
-void XboxExecutor::run(uint32_t entry_eip, uint64_t max_steps) {
+void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     ctx.eip = entry_eip;
 
     uint64_t steps = 0;

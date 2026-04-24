@@ -7,8 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 
-// Maximum guest RAM for this rudimentary executor: 128 MB.
-// The Xbox had 64 MB retail / 128 MB devkit.
+// Maximum guest RAM: 128 MB (e.g. Xbox devkit had 128 MB, retail 64 MB).
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +24,7 @@ struct IoPortEntry {
     void*      user;
 };
 
-struct XboxExecutor {
+struct Executor {
     GuestContext   ctx {};
     uint8_t*       ram  = nullptr;   // guest physical RAM [0 .. GUEST_RAM_SIZE)
 

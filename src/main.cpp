@@ -28,7 +28,7 @@ static MmioMap make_mmio() {
 static constexpr uint32_t STACK_TOP    = 0x0008'0000;
 static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
 
-static bool setup_exec(XboxExecutor& exec, MmioMap& mmio,
+static bool setup_exec(Executor& exec, MmioMap& mmio,
                         uint32_t load_pa, const uint8_t* code, size_t size) {
     if (!exec.init(&mmio)) { fprintf(stderr, "init failed\n"); return false; }
     exec.load_guest(load_pa, code, size);
@@ -74,7 +74,7 @@ static bool test_sum_loop() {
     printf("=== Test 1: Sum loop + fastmem round-trip ===\n");
 
     MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!setup_exec(*exec, mmio, 0x1000, test1_code, sizeof(test1_code)))
         return false;
 
@@ -142,7 +142,7 @@ static bool test_eflags_preservation() {
     printf("=== Test 2: EFLAGS preservation across memory dispatch ===\n");
 
     MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!setup_exec(*exec, mmio, 0x2000, test2_code, sizeof(test2_code)))
         return false;
 
@@ -206,7 +206,7 @@ static bool test_lea_push_pop() {
     printf("=== Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm ===\n");
 
     MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!setup_exec(*exec, mmio, 0x3000, test3_code, sizeof(test3_code)))
         return false;
 
@@ -277,7 +277,7 @@ static bool test_fpu_register_ops() {
     printf("=== Test 4: x87 register-only operations ===\n");
 
     MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!setup_exec(*exec, mmio, 0x4100, test4_code, sizeof(test4_code)))
         return false;
 
@@ -325,7 +325,7 @@ static bool test_fpu_memory_store() {
     printf("=== Test 5: x87 memory store (FISTP to RAM) ===\n");
 
     MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<XboxExecutor>();
+    auto exec = std::make_unique<Executor>();
     if (!setup_exec(*exec, mmio, 0x5000, test5_code, sizeof(test5_code)))
         return false;
 
