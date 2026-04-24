@@ -416,7 +416,7 @@ static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
     emit_fastmem_op(e, guest_enc, size_bits, is_load);
-    if (!is_load) emit_smc_page_bump(e);  // SMC: bump page version on store
+    if (!is_load) emit_smc_page_bump(e, false);  // SMC: MOV doesn't produce flags
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
@@ -448,7 +448,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
     if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
     else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
     else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
-    emit_smc_page_bump(e);  // SMC: bump page version on store
+    emit_smc_page_bump(e, false);  // SMC: MOV doesn't produce flags
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
@@ -558,8 +558,13 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Fast path: rewrite the instruction to use [R12+R14]
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
-    // SMC: bump page version if memory is the destination (write-back)
-    if (mem_idx == 0) emit_smc_page_bump(e);
+    // SMC: bump page version if memory is the destination (write-back).
+    // CMP and TEST read memory but don't write back — skip bump for them.
+    if (mem_idx == 0 &&
+        insn.mnemonic != ZYDIS_MNEMONIC_CMP &&
+        insn.mnemonic != ZYDIS_MNEMONIC_TEST) {
+        emit_smc_page_bump(e);  // preserve_flags=true (ALU produces flags)
+    }
     uint8_t* done_site = emit_jmp_fwd(e);
 
     // Slow path: MMIO not supported for ALU-mem — UD2 trap
@@ -610,8 +615,9 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     // Fast path: restore flags, then execute instruction
     emit_restore_flags(e);                      // POPFQ
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
-    // SMC: SETcc [mem] writes to memory (mem_idx == 0)
-    if (mem_idx == 0) emit_smc_page_bump(e);
+    // SMC: SETcc [mem] writes to memory.  Flags are still live here
+    // (SETcc/CMOVcc read but don't write EFLAGS), so preserve_flags=true.
+    if (mem_idx == 0) emit_smc_page_bump(e);  // preserve_flags=true (default)
     uint8_t* done_site = emit_jmp_fwd(e);       // JMP done
 
     // Slow path: balance PUSHFQ then UD2
@@ -714,7 +720,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_store_imm32(e, imm);
-        emit_smc_page_bump(e);
+        emit_smc_page_bump(e, false);  // PUSH doesn't produce flags
         uint8_t* done_site = emit_jmp_fwd(e);
 
         Emitter::patch_rel32(slow_site, e.cur());
@@ -743,7 +749,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_cmp_r14_r15(e);
         uint8_t* slow_site = emit_jae_fwd(e);
         emit_fastmem_op(e, reg_enc, 32, false);
-        emit_smc_page_bump(e);
+        emit_smc_page_bump(e, false);  // PUSH doesn't produce flags
         uint8_t* done_site = emit_jmp_fwd(e);
 
         Emitter::patch_rel32(slow_site, e.cur());
@@ -995,7 +1001,7 @@ bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
     if (insn.attributes & ZYDIS_ATTRIB_HAS_REPNE) rep_mode = 2;
 
     // Capture EFLAGS (need DF for direction)
-    e.emit8(0x9C);                      // PUSHFQ
+    e.emit8(0x9C);                     // PUSHFQ
     e.emit8(0x41); e.emit8(0x5E);      // POP R14
 
     // Save GP to ctx
@@ -1016,7 +1022,7 @@ bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
 
     // Set host EFLAGS from R14 (original or new comparison result)
     e.emit8(0x41); e.emit8(0x56);      // PUSH R14
-    e.emit8(0x9D);                      // POPFQ
+    e.emit8(0x9D);                     // POPFQ
 
     return true;
 }
@@ -1130,7 +1136,7 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         return false;
     }
     // SMC: bump page version if memory is the destination (FPU store)
-    if (mem_idx == 0) emit_smc_page_bump(e);
+    if (mem_idx == 0) emit_smc_page_bump(e, false);  // FPU doesn't produce x86 flags
     uint8_t* done_site = emit_jmp_fwd(e);
 
     // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
@@ -1224,7 +1230,7 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
             emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
-            emit_smc_page_bump(e);
+            emit_smc_page_bump(e, false);  // trace exit, flags irrelevant
             emit_epilog_static(e, target);
             return;
         }
@@ -1234,7 +1240,7 @@ void TraceBuilder::emit_call_exit(Emitter& e,
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
                 emit_fastmem_store_imm32(e, pc_after);  // store retaddr (no reg clobber)
-                emit_smc_page_bump(e);
+                emit_smc_page_bump(e, false);  // trace exit, flags irrelevant
                 emit_epilog_dynamic(e, enc);
                 return;
             }

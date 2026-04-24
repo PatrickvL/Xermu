@@ -22,6 +22,37 @@ struct PageVersions {
     uint32_t get(uint32_t pa) const { return ver[pa >> 12]; }
 };
 
+// ---------------------------------------------------------------------------
+// Software TLB for VA→PA translation when paging (CR0.PG) is enabled.
+// Direct-mapped, indexed by VPN & MASK. Separate read/write arrays so that
+// write permission is checked only on stores.
+// ---------------------------------------------------------------------------
+struct SoftTlb {
+    static constexpr int BITS = 8;
+    static constexpr int SIZE = 1 << BITS;   // 256 entries
+    static constexpr uint32_t MASK = SIZE - 1;
+    static constexpr uint32_t INVALID_TAG = 0xFFFFFFFF;
+
+    struct Entry {
+        uint32_t tag;       // VPN (VA >> 12), INVALID_TAG = empty
+        uint32_t pa_page;   // physical page base (PA & ~0xFFF)
+    };
+
+    Entry read_tlb[SIZE];
+    Entry write_tlb[SIZE];
+
+    void flush() {
+        for (auto& e : read_tlb)  e.tag = INVALID_TAG;
+        for (auto& e : write_tlb) e.tag = INVALID_TAG;
+    }
+    void flush_va(uint32_t va) {
+        uint32_t vpn = va >> 12;
+        uint32_t idx = vpn & MASK;
+        if (read_tlb[idx].tag == vpn)  read_tlb[idx].tag = INVALID_TAG;
+        if (write_tlb[idx].tag == vpn) write_tlb[idx].tag = INVALID_TAG;
+    }
+};
+
 struct TraceBuilder {
     TraceBuilder();
 

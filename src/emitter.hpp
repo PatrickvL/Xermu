@@ -542,30 +542,38 @@ inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
 // Inline SMC page-version bump after a fastmem STORE.
 //
 // Precondition: R14D still contains the guest PA that was written to.
-// After this sequence, R14 is clobbered.  Guest GP regs are not touched.
-// EFLAGS: INC clobbers OF/SF/ZF/AF/PF (but NOT CF).  This is acceptable
-//   because the bump is emitted inside the flag-save/restore brackets (or
-//   when flags are not live).
+// After this sequence, R14 is clobbered (SHR R14D,12).  Guest GP regs
+// other than RAX (saved/restored) are not touched.
 //
-// Encoding (14 bytes):
-//   PUSH RAX                           ; save guest EAX
-//   MOV  RAX, QWORD [R13 + 116]        ; RAX = ctx->page_versions pointer
-//   SHR  R14D, 12                      ; R14D = page index
-//   INC  DWORD [RAX + R14*4]           ; page_versions[page_index]++
-//   POP  RAX                           ; restore guest EAX
+// EFLAGS: SHR + INC both clobber arithmetic flags.
+//   - preserve_flags=true  → wrap in PUSHFQ/POPFQ (16 bytes).  Use when
+//     the guest instruction just produced flags that a later instruction
+//     may read (e.g. ADD/SUB/AND/OR [mem], … followed by Jcc).
+//   - preserve_flags=false → skip PUSHFQ/POPFQ (12 bytes).  Safe when
+//     the guest instruction does NOT produce arithmetic flags (MOV stores,
+//     FPU stores, PUSH, CALL return-address push) or on trace exit paths.
+//
+// Encoding (12 or 16 bytes):
+//   [PUSHFQ]                            ; optional
+//   PUSH RAX                            ; save guest EAX
+//   MOV  RAX, QWORD [R13 + 120]        ; RAX = ctx->page_versions pointer
+//   SHR  R14D, 12                       ; R14D = page index
+//   INC  DWORD [RAX + R14*4]            ; page_versions[page_index]++
+//   POP  RAX                            ; restore guest EAX
+//   [POPFQ]                             ; optional
 // ---------------------------------------------------------------------------
 
-inline void emit_smc_page_bump(Emitter& e) {
-    e.emit8(0x9C);                                      // PUSHFQ  — save flags
-    e.emit8(0x50);                                      // PUSH RAX
-    e.emit8(0x49); e.emit8(0x8B); e.emit8(0x45);        // MOV RAX, [R13+disp8]
-    e.emit8(120);                                       // disp8 = offsetof(page_versions)
-    e.emit8(0x41); e.emit8(0xC1); e.emit8(0xEE);        // SHR R14D, 12
+inline void emit_smc_page_bump(Emitter& e, bool preserve_flags = true) {
+    if (preserve_flags) e.emit8(0x9C);          // PUSHFQ
+    e.emit8(0x50);                               // PUSH RAX
+    e.emit8(0x49); e.emit8(0x8B); e.emit8(0x45); // MOV RAX, [R13+disp8]
+    e.emit8(120);                                // disp8 = offsetof(page_versions)
+    e.emit8(0x41); e.emit8(0xC1); e.emit8(0xEE); // SHR R14D, 12
     e.emit8(12);
-    e.emit8(0x42); e.emit8(0xFF); e.emit8(0x04);        // INC DWORD [RAX+R14*4]
-    e.emit8(0xB0);                                      // SIB: scale=2, idx=R14, base=RAX
-    e.emit8(0x58);                                      // POP RAX
-    e.emit8(0x9D);                                      // POPFQ  — restore flags
+    e.emit8(0x42); e.emit8(0xFF); e.emit8(0x04); // INC DWORD [RAX+R14*4]
+    e.emit8(0xB0);                               // SIB: scale=2, idx=R14, base=RAX
+    e.emit8(0x58);                               // POP RAX
+    if (preserve_flags) e.emit8(0x9D);           // POPFQ
 }
 
 
