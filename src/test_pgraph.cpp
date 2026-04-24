@@ -175,6 +175,33 @@ int main() {
     uint32_t cmask = 0x01010101;
     memcpy(ram + pos, &cmask, 4); pos += 4;
 
+    // === Command 20: SET_TEXTURE stage 0: offset + format + control + filter ===
+    uint32_t hdr20 = pb_inc(SET_TEXTURE_FORMAT + 0*64, 0, 1);
+    memcpy(ram + pos, &hdr20, 4); pos += 4;
+    uint32_t tex0_fmt = 0x0001162A;  // example packed format
+    memcpy(ram + pos, &tex0_fmt, 4); pos += 4;
+
+    uint32_t hdr20b = pb_inc(SET_TEXTURE_CONTROL0 + 0*64, 0, 1);
+    memcpy(ram + pos, &hdr20b, 4); pos += 4;
+    uint32_t tex0_ctl = 0x30101000;  // enable + min/max LOD
+    memcpy(ram + pos, &tex0_ctl, 4); pos += 4;
+
+    uint32_t hdr20c = pb_inc(SET_TEXTURE_FILTER + 0*64, 0, 1);
+    memcpy(ram + pos, &hdr20c, 4); pos += 4;
+    uint32_t tex0_flt = 0x04012000;  // bilinear
+    memcpy(ram + pos, &tex0_flt, 4); pos += 4;
+
+    uint32_t hdr20d = pb_inc(SET_TEXTURE_IMAGE_RECT + 0*64, 0, 1);
+    memcpy(ram + pos, &hdr20d, 4); pos += 4;
+    uint32_t tex0_rect = 0x02000100;  // 512 wide, 256 tall
+    memcpy(ram + pos, &tex0_rect, 4); pos += 4;
+
+    // === Command 21: SET_TEXTURE stage 1 offset ===
+    uint32_t hdr21 = pb_inc(SET_TEXTURE_OFFSET + 1*64, 0, 1);
+    memcpy(ram + pos, &hdr21, 4); pos += 4;
+    uint32_t tex1_off = 0x00400000;
+    memcpy(ram + pos, &tex1_off, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -232,6 +259,13 @@ int main() {
     CHECK(pgraph.reg_float(SET_VIEWPORT_SCALE_X + 4)   == -240.0f, "vp_scale_y == -240");
     CHECK(pgraph.reg(SET_SHADE_MODE)  == 0x1D01, "shade_mode == SMOOTH");
     CHECK(pgraph.reg(SET_COLOR_MASK)  == 0x01010101, "color_mask == all-enabled");
+
+    // Texture state
+    CHECK(pgraph.reg(SET_TEXTURE_FORMAT + 0*64)      == 0x0001162A, "tex0_format");
+    CHECK(pgraph.reg(SET_TEXTURE_CONTROL0 + 0*64)    == 0x30101000, "tex0_control0");
+    CHECK(pgraph.reg(SET_TEXTURE_FILTER + 0*64)      == 0x04012000, "tex0_filter");
+    CHECK(pgraph.reg(SET_TEXTURE_IMAGE_RECT + 0*64)  == 0x02000100, "tex0_image_rect");
+    CHECK(pgraph.reg(SET_TEXTURE_OFFSET + 1*64)      == 0x00400000, "tex1_offset");
 
     free(ram);
 
