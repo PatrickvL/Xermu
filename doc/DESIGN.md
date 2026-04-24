@@ -1206,8 +1206,40 @@ and Intel Arc.
 | `CxbxNV2APixelShaderConstants.hlsli`     | PS_REGISTER/PS_CHANNEL/PS_INPUTMAPPING/PS_TEXTUREMODES constants (C++/HLSL shared) |
 | `CxbxNV2AMathHelpers.hlsli`             | NV2A-accurate mul (0×anything=0), dot3, dot4 |
 
-#### 5.17 APU (Audio Processing Unit)
-**Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
+#### 5.17 APU (Audio Processing Unit) ✅ DONE (stub)
+
+MCPX APU register stub at `0xFE800000` (4 MB).  The Xbox audio processor
+has three sub-units: Voice Processor (VP), Global Processor (GP), and
+Encode Processor (EP), plus a front-end and setup engine.
+
+**Register blocks implemented:**
+
+| Register              | Offset     | Behaviour                        |
+|-----------------------|-----------|----------------------------------|
+| `NV_PAPU_ISTS`       | 0x1000    | Interrupt status (W1C)           |
+| `NV_PAPU_IEN`        | 0x1004    | Interrupt enable mask            |
+| `NV_PAPU_FECTL`      | 0x1100    | Front-end control                |
+| `NV_PAPU_FECV`       | 0x1104    | Front-end current voice (read)   |
+| `NV_PAPU_FESTATE`    | 0x1108    | Front-end state (0 = idle)       |
+| `NV_PAPU_FESTATUS`   | 0x110C    | Front-end status (0 = not busy)  |
+| `NV_PAPU_SECTL`      | 0x2000    | Setup engine control             |
+| `NV_PAPU_SESTATUS`   | 0x200C    | Setup engine status (0 = idle)   |
+| `NV_PAPU_GPRST`      | 0x3000    | GP reset control                 |
+| `NV_PAPU_GPISTS`     | 0x3004    | GP interrupt status (read)       |
+| `NV_PAPU_GPSADDR`    | 0x3008    | GP scratch base address          |
+| `NV_PAPU_EPRST`      | 0x4000    | EP reset control                 |
+| `NV_PAPU_EPISTS`     | 0x4004    | EP interrupt status (read)       |
+| `NV_PAPU_EPSADDR`    | 0x4008    | EP scratch base address          |
+
+All registers read sane defaults (0 = idle/no interrupts).  Writes are
+accepted silently.  `ISTS` uses write-1-to-clear semantics.  This is
+sufficient for games that probe audio hardware during init and don't hang
+waiting for DSP status transitions.
+
+**PCI identity:** Bus 0, Device 3, Function 0 — Vendor 0x10DE, Device 0x01B0.
+
+**Test:** `tests/apu.asm` — 12 assertions covering init defaults, R/W,
+and W1C behaviour.
 
 #### 5.18 Other Devices
 
