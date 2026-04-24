@@ -92,6 +92,7 @@ set(TEST_ASM_FILES
     tests/nv2a_timer.asm
     tests/pcrtc.asm
     tests/smbus.asm
+    tests/nv2a_gpu.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -122,7 +123,7 @@ if(NASM_EXECUTABLE)
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
-        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit" OR test_name STREQUAL "nv2a_timer" OR test_name STREQUAL "pcrtc" OR test_name STREQUAL "smbus")
+        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit" OR test_name STREQUAL "nv2a_timer" OR test_name STREQUAL "pcrtc" OR test_name STREQUAL "smbus" OR test_name STREQUAL "nv2a_gpu")
             add_test(
                 NAME    ${test_name}
                 COMMAND test_runner --xbox ${bin_file}
