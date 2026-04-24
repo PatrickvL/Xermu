@@ -26,7 +26,11 @@ static constexpr uint32_t ENABLE    = 0x200;   // subsystem enable
 } // namespace pmc
 
 namespace pbus {
-static constexpr uint32_t REG_0     = 0x200;   // bus control register 0
+static constexpr uint32_t INTR       = 0x100;   // PBUS interrupt status (W1C)
+static constexpr uint32_t INTR_EN    = 0x140;   // PBUS interrupt enable
+static constexpr uint32_t REG_0      = 0x200;   // bus control register 0
+static constexpr uint32_t FBIO_RAM   = 0x218;   // FBIO RAM type (DDR indicator)
+static constexpr uint32_t DEBUG_1    = 0x084;   // debug register 1
 } // namespace pbus
 
 namespace pfifo {
@@ -169,6 +173,7 @@ struct Nv2aState {
 
     Nv2aState() {
         pmc_regs[pmc::BOOT_0 / 4]             = 0x02A000A1;  // NV2A chip ID
+        pbus_regs[pbus::FBIO_RAM / 4]         = 0x00000003;  // DDR SDRAM
         ptimer_regs[ptimer::NUM / 4]           = 1;
         ptimer_regs[ptimer::DEN / 4]           = 1;
         pfb_regs[pfb::CFG0 / 4]               = 0x03070103;  // 64 MB RAM
@@ -374,6 +379,7 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // --- PBUS (0x001000) ---
     if (off < 0x002000) {
         uint32_t r = off - 0x001000;
+        if (r == pbus::INTR) { nv->pbus_regs[r / 4] &= ~val; return; }
         if (r / 4 < Nv2aState::PBUS_COUNT) nv->pbus_regs[r / 4] = val;
         return;
     }
