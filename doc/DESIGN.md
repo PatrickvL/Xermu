@@ -238,7 +238,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/usb.hpp`        | USB OHCI controller stubs (2 ports each)         | ✅ Working    |
 | `xbox/ioapic.hpp`     | I/O APIC: indirect regs, redir entries, RO bits  | ✅ Working    |
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
-| `xbox/flash.hpp`      | Flash ROM + MCPX: BIOS loading, shadow           | ✅ Working    |
+| `xbox/flash.hpp`      | Flash ROM + MCPX: CFI commands, ID/status/erase  | ✅ Working    |
 | `xbox/pci.hpp`        | PCI config space: BARs, IRQs, bridge, all devices | ✅ Working    |
 | `xbox/smbus.hpp`      | SMBus: EEPROM, SMC (smc:: commands), video enc   | ✅ Working    |
 | `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
@@ -288,6 +288,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/smbus_smc.asm`   | SMC commands: version, temps, fan, scratch (12)| ✅ ALL PASS   |
 | `tests/ide_dma.asm`      | IDE Bus Master DMA: cmd, status W1C, PRDT (10) | ✅ ALL PASS   |
 | `tests/usb_ohci.asm`     | OHCI: frame regs, HCCA, ED ptrs, interrupts (10)| ✅ ALL PASS   |
+| `tests/flash_cmd.asm`    | Flash CFI: ID, status, program, erase (10)      | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
