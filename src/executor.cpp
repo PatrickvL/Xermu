@@ -311,8 +311,24 @@ void Executor::handle_privileged() {
         // MSR index in ECX, result in EDX:EAX
         uint32_t msr = ctx.gp[GP_ECX];
         uint64_t val = 0;
-        // Stub: return 0 for all MSRs, log for debugging
-        fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
+        switch (msr) {
+        case 0x174: val = ctx.sysenter_cs;  break; // IA32_SYSENTER_CS
+        case 0x175: val = ctx.sysenter_esp; break; // IA32_SYSENTER_ESP
+        case 0x176: val = ctx.sysenter_eip; break; // IA32_SYSENTER_EIP
+        case 0x10:  // IA32_TIME_STAMP_COUNTER
+#if defined(_MSC_VER)
+            val = __rdtsc();
+#else
+            { uint32_t lo, hi;
+              __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+              val = ((uint64_t)hi << 32) | lo; }
+#endif
+            break;
+        default:
+            // Stub: return 0, log for debugging
+            fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
+            break;
+        }
         ctx.gp[GP_EAX] = (uint32_t)val;
         ctx.gp[GP_EDX] = (uint32_t)(val >> 32);
         ctx.eip += insn.length;
@@ -322,9 +338,16 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_WRMSR: {
         uint32_t msr = ctx.gp[GP_ECX];
         uint64_t val = ((uint64_t)ctx.gp[GP_EDX] << 32) | ctx.gp[GP_EAX];
-        // Stub: log and ignore
-        fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
-                (unsigned long long)val);
+        switch (msr) {
+        case 0x174: ctx.sysenter_cs  = (uint32_t)val; break;
+        case 0x175: ctx.sysenter_esp = (uint32_t)val; break;
+        case 0x176: ctx.sysenter_eip = (uint32_t)val; break;
+        default:
+            // Stub: log and ignore (MTRR, misc MSRs)
+            fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
+                    (unsigned long long)val);
+            break;
+        }
         ctx.eip += insn.length;
         return;
     }
@@ -444,6 +467,35 @@ void Executor::handle_privileged() {
         // Stub: ignore cache/task state instructions
         ctx.eip += insn.length;
         return;
+
+    case ZYDIS_MNEMONIC_SYSENTER: {
+        // SYSENTER: fast ring-3 → ring-0 transition.
+        // CS = SYSENTER_CS_MSR, SS = SYSENTER_CS_MSR + 8
+        // EIP = SYSENTER_EIP_MSR, ESP = SYSENTER_ESP_MSR
+        // IF cleared, VM cleared.
+        if (ctx.sysenter_cs == 0) {
+            // #GP(0) if SYSENTER_CS_MSR is 0
+            deliver_interrupt(13, ctx.eip, true, 0);
+            return;
+        }
+        ctx.virtual_if = false;
+        ctx.gp[GP_ESP] = ctx.sysenter_esp;
+        ctx.eip = ctx.sysenter_eip;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_SYSEXIT: {
+        // SYSEXIT: fast ring-0 → ring-3 return.
+        // CS = SYSENTER_CS_MSR + 16, SS = SYSENTER_CS_MSR + 24
+        // EIP = EDX, ESP = ECX
+        if (ctx.sysenter_cs == 0) {
+            deliver_interrupt(13, ctx.eip, true, 0);
+            return;
+        }
+        ctx.eip = ctx.gp[GP_EDX];
+        ctx.gp[GP_ESP] = ctx.gp[GP_ECX];
+        return;
+    }
 
     case ZYDIS_MNEMONIC_INT3:
     case ZYDIS_MNEMONIC_INT1:

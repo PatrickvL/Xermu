@@ -58,6 +58,12 @@ struct alignas(16) GuestContext {
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
     alignas(16) uint8_t guest_fpu[512];  // [128] guest x87/MMX/SSE state
     alignas(16) uint8_t host_fpu[512];   // [640] saved host state
+
+    // SYSENTER/SYSEXIT MSRs (IA32_SYSENTER_CS/EIP/ESP)
+    // Placed after FPU state to avoid shifting hardcoded offsets.
+    uint32_t  sysenter_cs  = 0;   // MSR 0x174
+    uint32_t  sysenter_esp = 0;   // MSR 0x175
+    uint32_t  sysenter_eip = 0;   // MSR 0x176
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);

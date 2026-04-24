@@ -4,8 +4,9 @@
 ; Tests:  CLI/STI    — interrupt flag toggling
 ;         CPUID      — vendor string and feature flags
 ;         RDTSC      — timestamp counter (monotonic, non-zero)
-;         RDMSR/WRMSR— MSR read/write (stub: returns 0)
+;         RDMSR/WRMSR— MSR read/write (SYSENTER CS/ESP/EIP)
 ;         LGDT/LIDT  — descriptor table base/limit loading
+;         SYSENTER/SYSEXIT — fast ring transition via MSRs
 ;
 ; Convention:  EAX=0 + HLT = pass.  EAX=N + HLT = assertion N failed.
 ; ===========================================================================
@@ -150,6 +151,87 @@
 
 .iret_ok:
     ASSERT_EQ eax, 0                         ; 17 — IRETD jumped correctly
+
+; ========================= SYSENTER MSRs ==================================
+; WRMSR/RDMSR for SYSENTER_CS (0x174), SYSENTER_ESP (0x175), SYSENTER_EIP (0x176).
+
+    ; Write SYSENTER_CS = 0x0008
+    mov  ecx, 0x174
+    xor  edx, edx
+    mov  eax, 0x0008
+    wrmsr
+    ; Read back SYSENTER_CS
+    xor  eax, eax
+    rdmsr
+    ASSERT_EQ eax, 0x0008                    ; 18 — SYSENTER_CS round-trip
+
+    ; Write SYSENTER_ESP = 0x80000
+    mov  ecx, 0x175
+    xor  edx, edx
+    mov  eax, 0x00080000
+    wrmsr
+    xor  eax, eax
+    rdmsr
+    ASSERT_EQ eax, 0x00080000               ; 19 — SYSENTER_ESP round-trip
+
+    ; Write SYSENTER_EIP = .sysenter_handler
+    mov  ecx, 0x176
+    xor  edx, edx
+    mov  eax, .sysenter_handler
+    wrmsr
+    xor  eax, eax
+    rdmsr
+    ASSERT_EQ eax, .sysenter_handler         ; 20 — SYSENTER_EIP round-trip
+
+; ========================= SYSENTER / SYSEXIT ==============================
+; Set up SYSENTER MSRs, execute SYSENTER, then SYSEXIT back.
+
+    ; SYSENTER_CS = 0x0008 (already set above)
+    ; SYSENTER_ESP = 0x70000 (separate stack for kernel entry)
+    mov  ecx, 0x175
+    xor  edx, edx
+    mov  eax, 0x00070000
+    wrmsr
+
+    ; SYSENTER_EIP = .sysenter_handler
+    mov  ecx, 0x176
+    xor  edx, edx
+    mov  eax, .sysenter_handler
+    wrmsr
+
+    ; Save current ESP and a return address for SYSEXIT.
+    mov  ebp, esp                            ; save original ESP
+    mov  edx, .sysexit_return                ; SYSEXIT target EIP → EDX
+    mov  ecx, ebp                            ; SYSEXIT target ESP → ECX
+    sysenter                                 ; → .sysenter_handler
+    ; Should not reach here.
+    mov  eax, 21
+    hlt
+
+.sysenter_handler:
+    ; SYSENTER arrived here. ESP = SYSENTER_ESP (0x70000).
+    ; Verify ESP changed.
+    cmp  esp, 0x00070000
+    je   .sysenter_esp_ok
+    mov  eax, 21
+    hlt
+.sysenter_esp_ok:
+    ; SYSEXIT: EIP = EDX (.sysexit_return), ESP = ECX (original ESP)
+    sysexit
+    ; Should not reach here.
+    mov  eax, 22
+    hlt
+
+.sysexit_return:
+    ; Verify ESP was restored by SYSEXIT.
+    cmp  esp, ebp
+    je   .sysexit_esp_ok
+    mov  eax, 22
+    hlt
+.sysexit_esp_ok:
+    ; Both SYSENTER and SYSEXIT worked.
+    %assign __test_num __test_num + 2        ; consumed assertions 21 + 22 inline
+    xor  eax, eax
 
 ; ========================= ALL PASSED =====================================
     PASS
