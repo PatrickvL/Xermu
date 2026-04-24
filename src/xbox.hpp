@@ -373,6 +373,212 @@ static void apu_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user) 
     // Silently drop unhandled writes.
 }
 
+// ============================= IDE (ATA) ===================================
+//
+// Xbox IDE controller (PCI Dev 9): dual-channel ATA.
+//   Primary   (0x1F0–0x1F7, ctrl 0x3F6): HDD (master)
+//   Secondary (0x170–0x177, ctrl 0x376): DVD (master)
+//
+// ATA task-file registers (offset from channel base):
+//   +0  Data (16-bit PIO read/write)
+//   +1  Error (read) / Features (write)
+//   +2  Sector Count
+//   +3  LBA Low  (Sector Number)
+//   +4  LBA Mid  (Cylinder Low)
+//   +5  LBA High (Cylinder High)
+//   +6  Device/Head
+//   +7  Status (read) / Command (write)
+//   Control register (0x3F6/0x376):
+//     Bit 1 = nIEN (disable interrupts), Bit 2 = SRST (software reset)
+//     Read returns Alternate Status.
+// ---------------------------------------------------------------------------
+
+struct IdeChannel {
+    // Task-file registers
+    uint8_t  error      = 0x01;     // Error register (read); 0x01 = no error
+    uint8_t  features   = 0;        // Features (write)
+    uint8_t  sect_count = 0x01;     // Sector count
+    uint8_t  lba_low    = 0x01;     // LBA[7:0]  / sector number
+    uint8_t  lba_mid    = 0x00;     // LBA[15:8] / cylinder low
+    uint8_t  lba_high   = 0x00;     // LBA[23:16]/ cylinder high
+    uint8_t  device     = 0x00;     // Device/head
+    uint8_t  status     = 0x50;     // Status: DRDY + DSC (device ready, seek complete)
+    uint8_t  control    = 0x00;     // Device control (nIEN, SRST)
+    bool     present    = false;    // true if device exists on this channel
+
+    // ATA IDENTIFY data (512 bytes) — filled once for present devices.
+    uint8_t  identify[512] = {};
+};
+
+struct IdeState {
+    IdeChannel primary;     // HDD
+    IdeChannel secondary;   // DVD
+
+    IdeState() {
+        // Primary master = HDD (present).
+        primary.present   = true;
+        primary.status    = 0x50;   // DRDY | DSC
+        init_hdd_identify(primary);
+
+        // Secondary master = DVD (present).
+        secondary.present = true;
+        secondary.status  = 0x50;   // DRDY | DSC
+        init_dvd_identify(secondary);
+    }
+
+    static void init_hdd_identify(IdeChannel& ch) {
+        memset(ch.identify, 0, 512);
+        auto* w = reinterpret_cast<uint16_t*>(ch.identify);
+        w[0]  = 0x0040;        // General config: fixed drive
+        w[1]  = 16383;         // Logical cylinders
+        w[3]  = 16;            // Logical heads
+        w[6]  = 63;            // Sectors per track
+        // Model string (words 27-46): "XBOX HDD            " (padded to 40 chars, byte-swapped)
+        set_ata_string(w + 27, "XBOX HDD", 40);
+        // Serial number (words 10-19)
+        set_ata_string(w + 10, "0123456789", 20);
+        // Firmware revision (words 23-26)
+        set_ata_string(w + 23, "1.00", 8);
+        w[47] = 0x8010;        // Max sectors per multi-R/W (16)
+        w[49] = 0x0200;        // Capabilities: LBA supported
+        w[53] = 0x0006;        // Words 64-70, 88 valid
+        w[60] = 0x5C10;        // Total sectors (LBA28) low  = ~8 GB
+        w[61] = 0x0097;        // Total sectors (LBA28) high
+        w[80] = 0x007E;        // Major version: ATA-1 through ATA-6
+        w[83] = 0x4000;        // Command set: 48-bit LBA not supported (8 GB HDD)
+        w[88] = 0x003F;        // Ultra DMA modes supported (0-5)
+    }
+
+    static void init_dvd_identify(IdeChannel& ch) {
+        memset(ch.identify, 0, 512);
+        auto* w = reinterpret_cast<uint16_t*>(ch.identify);
+        w[0]  = 0x8580;        // General config: ATAPI, CD-ROM, removable
+        set_ata_string(w + 27, "XBOX DVD", 40);
+        set_ata_string(w + 10, "0000000001", 20);
+        set_ata_string(w + 23, "1.00", 8);
+        w[49] = 0x0200;        // LBA
+        w[80] = 0x007E;        // ATA-6
+    }
+
+    // ATA strings are byte-swapped (each pair of bytes exchanged).
+    static void set_ata_string(uint16_t* dst, const char* src, int byte_len) {
+        char buf[64] = {};
+        int slen = 0;
+        while (src[slen] && slen < byte_len) { buf[slen] = src[slen]; slen++; }
+        for (int i = slen; i < byte_len; i++) buf[i] = ' ';  // pad with spaces
+        for (int i = 0; i < byte_len; i += 2)
+            dst[i / 2] = (uint16_t)((uint8_t)buf[i] << 8 | (uint8_t)buf[i + 1]);
+    }
+};
+
+static uint32_t ide_io_read(uint16_t port, unsigned size, void* user) {
+    auto* ide = static_cast<IdeState*>(user);
+
+    // Determine channel.
+    IdeChannel* ch;
+    int reg;
+    if (port >= 0x1F0 && port <= 0x1F7) {
+        ch = &ide->primary; reg = port - 0x1F0;
+    } else if (port == 0x3F6) {
+        ch = &ide->primary; reg = 8; // alternate status / control
+    } else if (port >= 0x170 && port <= 0x177) {
+        ch = &ide->secondary; reg = port - 0x170;
+    } else if (port == 0x376) {
+        ch = &ide->secondary; reg = 8;
+    } else {
+        return 0xFF;
+    }
+
+    if (!ch->present) return 0x00;  // No device: float low
+
+    switch (reg) {
+    case 0: return 0;                   // Data (PIO read — stub)
+    case 1: return ch->error;           // Error
+    case 2: return ch->sect_count;      // Sector count
+    case 3: return ch->lba_low;         // LBA low
+    case 4: return ch->lba_mid;         // LBA mid
+    case 5: return ch->lba_high;        // LBA high
+    case 6: return ch->device;          // Device/head
+    case 7: return ch->status;          // Status
+    case 8: return ch->status;          // Alternate status
+    default: return 0xFF;
+    }
+}
+
+static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
+    auto* ide = static_cast<IdeState*>(user);
+
+    IdeChannel* ch;
+    int reg;
+    if (port >= 0x1F0 && port <= 0x1F7) {
+        ch = &ide->primary; reg = port - 0x1F0;
+    } else if (port == 0x3F6) {
+        ch = &ide->primary; reg = 8;
+    } else if (port >= 0x170 && port <= 0x177) {
+        ch = &ide->secondary; reg = port - 0x170;
+    } else if (port == 0x376) {
+        ch = &ide->secondary; reg = 8;
+    } else {
+        return;
+    }
+
+    if (!ch->present) return;
+
+    uint8_t v = (uint8_t)val;
+
+    switch (reg) {
+    case 0: break;                          // Data (PIO write — stub)
+    case 1: ch->features = v; break;        // Features
+    case 2: ch->sect_count = v; break;      // Sector count
+    case 3: ch->lba_low = v; break;         // LBA low
+    case 4: ch->lba_mid = v; break;         // LBA mid
+    case 5: ch->lba_high = v; break;        // LBA high
+    case 6: ch->device = v; break;          // Device/head
+    case 7:                                  // Command
+        // Handle a few essential ATA commands.
+        switch (v) {
+        case 0xEC: // IDENTIFY DEVICE
+            ch->status = 0x58; // DRDY | DSC | DRQ (data ready)
+            ch->error  = 0;
+            break;
+        case 0xA1: // IDENTIFY PACKET DEVICE (ATAPI)
+            ch->status = 0x58;
+            ch->error  = 0;
+            break;
+        case 0xEF: // SET FEATURES
+            ch->status = 0x50; // DRDY | DSC (success, no data)
+            ch->error  = 0;
+            break;
+        case 0x91: // INITIALIZE DEVICE PARAMETERS
+            ch->status = 0x50;
+            ch->error  = 0;
+            break;
+        case 0xE7: // FLUSH CACHE
+            ch->status = 0x50;
+            ch->error  = 0;
+            break;
+        default:
+            // Unknown command — set error (abort).
+            ch->status = 0x51; // DRDY | ERR
+            ch->error  = 0x04; // ABRT
+            break;
+        }
+        break;
+    case 8: // Device control
+        ch->control = v;
+        if (v & 0x04) { // SRST — software reset
+            ch->status     = 0x50;
+            ch->error      = 0x01;
+            ch->sect_count = 0x01;
+            ch->lba_low    = 0x01;
+            ch->lba_mid    = 0x00;
+            ch->lba_high   = 0x00;
+            ch->device     = 0x00;
+        }
+        break;
+    }
+}
+
 // ============================= I/O APIC ====================================
 
 struct IoApicState {
@@ -940,6 +1146,7 @@ struct XboxHardware {
     MmioMap     mmio;
     Nv2aState   nv2a;
     ApuState    apu;
+    IdeState    ide;
     IoApicState ioapic;
     FlashState  flash;
     PciState    pci;

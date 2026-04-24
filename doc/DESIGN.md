@@ -1279,6 +1279,39 @@ Implementation plan:
    start/stop voices matching guest state changes.  No per-sample
    emulation of the DSP — software mixing in the Cubeb callback.
 
+**Input backend — SDL2/SDL3:**
+
+Controller and keyboard input uses SDL (Simple DirectMedia Layer).  SDL
+provides cross-platform gamepad support with hot-plug, rumble, and
+dead-zone handling:
+
+| Platform | SDL backend |
+|---|---|
+| Windows | XInput / DirectInput |
+| Linux | evdev / udev |
+| macOS | IOKit / GameController.framework |
+| Android | NDK input |
+
+The Xbox has 4 USB gamepad ports.  Each maps to an SDL `GameController`
+instance.  Guest reads gamepad state via the OHCI USB controller or XInput
+HLE stubs — the input backend translates host button/axis state into the
+Xbox gamepad report format (digital buttons, analog triggers, thumbsticks).
+
+**UI framework — Dear ImGui:**
+
+Debug/configuration overlay uses [Dear ImGui](https://github.com/ocornut/imgui).
+ImGui integrates directly with the Vulkan rendering backend (same swapchain):
+
+- Trace cache inspector (hit counts, hot traces)
+- Register/memory watch windows
+- GPU state viewer (NV2A PGRAPH, PFIFO status)
+- Performance counters (traces/sec, JIT compile rate)
+- Configuration: controller mapping, video settings, upscaling options
+
+Rendered as an overlay pass after the guest framebuffer presentation.
+No separate window system dependency — ImGui uses the existing Vulkan
+device/swapchain created for NV2A rendering.
+
 #### 5.18 Other Devices
 
 **8259A PIC (Programmable Interrupt Controller)** ✅ DONE
