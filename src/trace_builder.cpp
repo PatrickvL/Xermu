@@ -647,6 +647,17 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         bool src_esp = (insn.operand_count_visible >= 2 &&
                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                         ops[1].reg.value == ZYDIS_REGISTER_ESP);
+        // MOV ESP, imm32 → store immediate to ctx->gp[GP_ESP]
+        if (dst_esp && insn.operand_count_visible >= 2 &&
+            ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            uint32_t imm = (uint32_t)(int32_t)ops[1].imm.value.s;
+            // MOV DWORD [R13+16], imm32: REX.B=0x41, C7, mod=01 /0 rm=5(R13), disp8, imm32
+            e.emit8(0x41); e.emit8(0xC7);
+            e.emit8(uint8_t(0x40u | (0u << 3) | 5u));
+            e.emit8(gp_offset(GP_ESP));
+            e.emit32(imm);
+            return true;
+        }
         if (dst_esp && !src_esp) {
             // MOV ESP, r32 → store source register to ctx->gp[GP_ESP]
             uint8_t src_enc = 0;
@@ -868,12 +879,32 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     // Memory form: compute EA, bounds check, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/mem_idx == 0);
+
+    // ESP in reg field: guest ESP is not in a host register.  ModRM reg=4
+    // would encode host RSP.  Load guest ESP into R8D, rewrite with R8.
+    // IMPORTANT: only when reg field actually encodes a register, not an
+    // opcode extension (e.g. AND [mem],imm has reg=4 as opcode ext, not ESP).
+    bool esp_in_reg = false;
+    bool esp_is_dst_mem = false;
+    for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[i].reg.value == ZYDIS_REGISTER_ESP) {
+            esp_in_reg = true;
+            if (ops[i].actions & ZYDIS_OPERAND_ACTION_WRITE)
+                esp_is_dst_mem = true;
+            break;
+        }
+    }
+    if (esp_in_reg) emit_load_esp_to_r8(e);
+
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
 
     // Fast path: rewrite the instruction to use [R12+R14]
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+    // Store R8D back to ctx->gp[GP_ESP] if ESP was the destination.
+    if (esp_is_dst_mem) emit_store_r8_to_esp(e);
     // SMC: bump page version if memory is the destination (write-back).
     // CMP and TEST read memory but don't write back — skip bump for them.
     // preserve_flags = !save_flags: when the outer bracket is active it will
@@ -920,7 +951,17 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
                           GuestContext* /*ctx*/, bool /*save_flags*/) {
     int mem_idx = -1;
     if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
-        // reg-reg form: clean copy (SETcc r8, CMOVcc r,r)
+        // reg-reg form: SETcc r8, CMOVcc r,r
+        // For CMOVcc with ESP operand, route through emit_alu_esp_reg
+        // which correctly substitutes R14 for ESP.
+        if (insn.mnemonic >= ZYDIS_MNEMONIC_CMOVB &&
+            insn.mnemonic <= ZYDIS_MNEMONIC_CMOVZ) {
+            for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    ops[i].reg.value == ZYDIS_REGISTER_ESP)
+                    return emit_alu_esp_reg(e, insn, ops, raw);
+            }
+        }
         e.copy(raw, insn.length);
         return true;
     }
@@ -929,13 +970,26 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/mem_idx == 0); // SETcc writes, CMOVcc reads
 
+    // ESP in reg field: CMOVcc ESP, [mem]. Load guest ESP into R8D.
+    // Use operand scan, not raw reg field (which may be an opcode extension).
+    bool esp_in_reg = false;
+    for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[i].reg.value == ZYDIS_REGISTER_ESP) {
+            esp_in_reg = true;
+            break;
+        }
+    }
+    if (esp_in_reg) emit_load_esp_to_r8(e);
+
     emit_save_flags(e);                         // PUSHFQ (with alignment fix)
     emit_cmp_r14_r15(e);                        // CMP R14, R15
     uint8_t* slow_site = emit_jae_fwd(e);       // JAE slow
 
     // Fast path: restore flags, then execute instruction
     emit_restore_flags(e);                      // POPFQ
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+    if (esp_in_reg) emit_store_r8_to_esp(e);    // always store back (CMOVcc may or may not write)
     // SMC: SETcc [mem] writes to memory.  Flags are still live here
     // (SETcc/CMOVcc read but don't write EFLAGS), so preserve_flags=true.
     if (mem_idx == 0) emit_smc_page_bump(e);  // preserve_flags=true (default)
@@ -1385,7 +1439,10 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
 
     // Register-register form: verbatim copy (works natively in 64-bit mode)
+    // except MOVZX ESP, r8 which would corrupt host RSP.
     if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (ops[0].reg.value == ZYDIS_REGISTER_ESP)
+            return emit_alu_esp_reg(e, insn, ops, raw);
         e.copy(raw, insn.length);
         return true;
     }
@@ -1394,13 +1451,15 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
 
     unsigned src_bits = ops[1].size; // 8 or 16
+    bool esp_dst = (dst_enc == GP_ESP);
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_movzx(e, dst_enc, src_bits);
+    emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
@@ -1427,7 +1486,10 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
 
     // Register-register form: verbatim copy (works natively in 64-bit mode)
+    // except MOVSX ESP, r8 which would corrupt host RSP.
     if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (ops[0].reg.value == ZYDIS_REGISTER_ESP)
+            return emit_alu_esp_reg(e, insn, ops, raw);
         e.copy(raw, insn.length);
         return true;
     }
@@ -1436,13 +1498,15 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
 
     unsigned src_bits = ops[1].size; // 8 or 16
+    bool esp_dst = (dst_enc == GP_ESP);
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
     if (save_flags) emit_save_flags(e);
     emit_cmp_r14_r15(e);
     uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_movsx(e, dst_enc, src_bits);
+    emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
     uint8_t* done_site = emit_jmp_fwd(e);
 
     Emitter::patch_rel32(slow_site, e.cur());
