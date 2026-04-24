@@ -133,6 +133,24 @@ int main() {
     uint32_t clip_v = 0x01E00050;
     memcpy(ram + pos, &clip_v, 4); pos += 4;
 
+    // === Command 13: SET_SURFACE_ZETA_OFFSET = 0x00500000 ===
+    uint32_t hdr13 = pb_inc(SET_SURFACE_ZETA_OFFSET, 0, 1);
+    memcpy(ram + pos, &hdr13, 4); pos += 4;
+    uint32_t zeta_off = 0x00500000;
+    memcpy(ram + pos, &zeta_off, 4); pos += 4;
+
+    // === Command 14: CLEAR_SURFACE with depth+stencil = 0x03 ===
+    uint32_t hdr14 = pb_inc(CLEAR_SURFACE, 0, 1);
+    memcpy(ram + pos, &hdr14, 4); pos += 4;
+    uint32_t clear_depth = 0x03;  // Z + stencil
+    memcpy(ram + pos, &clear_depth, 4); pos += 4;
+
+    // === Command 15: CLEAR_SURFACE with color+depth = 0xF3 ===
+    uint32_t hdr15 = pb_inc(CLEAR_SURFACE, 0, 1);
+    memcpy(ram + pos, &hdr15, 4); pos += 4;
+    uint32_t clear_all = 0xF3;
+    memcpy(ram + pos, &clear_all, 4); pos += 4;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -152,8 +170,8 @@ int main() {
     CHECK(pgraph.reg(SET_TEXTURE_OFFSET + 2*64) == 0x00300000, "texture[2].offset == 0x300000");
     CHECK(pgraph.reg(SET_BEGIN_END) == 0, "begin_end_mode == 0 (END)");
     CHECK(pgraph.draw_count == 1, "draw_count == 1");
-    CHECK(pgraph.clear_count == 1, "clear_count == 1");
-    CHECK(pgraph.reg(CLEAR_SURFACE) == 0xF0, "clear_surface == 0xF0");
+    CHECK(pgraph.clear_count == 3, "clear_count == 3");
+    CHECK(pgraph.reg(CLEAR_SURFACE) == 0xF3, "clear_surface == 0xF3 (last clear)");
     CHECK(pgraph.reg(SET_CULL_FACE_ENABLE) == 1, "cull_face_enable == 1");
     CHECK(pgraph.reg(SET_CULL_FACE) == 0x0404, "cull_face == FRONT (0x0404)");
 
@@ -174,6 +192,14 @@ int main() {
     CHECK(pgraph.surface_clip_width() == 0x0280, "surface_clip_width == 640");
     CHECK(pgraph.surface_clip_y() == 0x0050, "surface_clip_y == 80");
     CHECK(pgraph.surface_clip_height() == 0x01E0, "surface_clip_height == 480");
+
+    // Clear tracking
+    CHECK(pgraph.clear_color_count == 2, "clear_color_count == 2 (0xF0, 0xF3)");
+    CHECK(pgraph.clear_depth_count == 2, "clear_depth_count == 2 (0x03, 0xF3)");
+
+    // Surface offsets
+    CHECK(pgraph.reg(SET_SURFACE_COLOR_OFFSET) == 0x00100000, "color_offset == 0x100000 (decode)");
+    CHECK(pgraph.reg(SET_SURFACE_ZETA_OFFSET)  == 0x00500000, "zeta_offset == 0x500000");
 
     free(ram);
 

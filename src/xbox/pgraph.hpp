@@ -126,6 +126,8 @@ struct PgraphState {
     uint32_t draw_count = 0;  // number of SET_BEGIN_END transitions from 0→nonzero
     uint32_t clear_count = 0;
     uint32_t total_methods = 0;
+    uint32_t clear_color_count = 0;  // clears that include color buffer
+    uint32_t clear_depth_count = 0;  // clears that include depth buffer
 
     // --- Surface decode helpers ---
     // SET_SURFACE_FORMAT encoding:
@@ -165,6 +167,9 @@ struct PgraphState {
         case nv097::CLEAR_SURFACE:
             reg(method) = data;
             clear_count++;
+            // Bits: 0=Z, 1=stencil, 4=R, 5=G, 6=B, 7=A
+            if (data & 0xF0) clear_color_count++;  // any color channel
+            if (data & 0x03) clear_depth_count++;   // Z or stencil
             return;
 
         case nv097::SET_TRANSFORM_PROGRAM_LOAD:
