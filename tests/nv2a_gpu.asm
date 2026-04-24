@@ -15,6 +15,11 @@
 ;  11. PRAMDAC MPLL_COEFF default readback
 ;  12. PRAMDAC VPLL_COEFF default readback
 ;  13. PFB_CFG0 = 0x03070103 (64 MB RAM)
+;  14. DMA_STATE idle when GET == PUT
+;  15. DMA pusher: GET advances toward PUT after ticks
+;  16. CACHE1_STATUS = empty after pusher drains
+;  12. PRAMDAC VPLL_COEFF default readback
+;  13. PFB_CFG0 = 0x03070103 (64 MB RAM)
 ; ===========================================================================
 
 %include "harness.inc"
@@ -45,6 +50,12 @@ VPLL_COEFF        equ NV2A + 0x680508
 
 ; PFB
 PFB_CFG0          equ NV2A + 0x100200
+
+; DMA pusher
+CACHE1_DMA_PUSH   equ NV2A + 0x003220
+CACHE1_DMA_PUT    equ NV2A + 0x003240
+CACHE1_DMA_GET    equ NV2A + 0x003244
+CACHE1_DMA_STATE  equ NV2A + 0x003228
 
 ; === 1. PMC_BOOT_0 = NV2A chip ID ===
     mov eax, [PMC_BOOT_0]
@@ -109,5 +120,37 @@ PFB_CFG0          equ NV2A + 0x100200
 ; === 13. PFB_CFG0 = 64 MB ===
     mov eax, [PFB_CFG0]
     ASSERT_EQ eax, 0x03070103
+
+; === 14. DMA_STATE idle when GET == PUT ===
+    ; Initially GET == PUT == 0, so DMA_STATE should be idle (0).
+    mov eax, [CACHE1_DMA_STATE]
+    ASSERT_EQ eax, 0
+
+; === 15. DMA pusher: GET advances toward PUT after ticks ===
+    ; Set DMA_PUT to 64 bytes ahead (16 dwords of "commands").
+    ; Use address 0x60000 as the push buffer (safe RAM area).
+    mov dword [CACHE1_DMA_PUT], 64
+    mov dword [CACHE1_DMA_GET], 0
+    ; Enable DMA pusher.
+    mov dword [CACHE1_DMA_PUSH], 1
+    ; Enable PUSH0.
+    mov dword [CACHE1_PUSH0], 1
+    ; Spin until GET catches up to PUT (tick callback advances GET).
+    mov ecx, 200000
+.spin_fifo:
+    mov eax, [CACHE1_DMA_GET]
+    cmp eax, 64
+    je .fifo_drained
+    dec ecx
+    jnz .spin_fifo
+    ; Timed out — fail.
+    mov eax, __test_num + 1
+    hlt
+.fifo_drained:
+    %assign __test_num __test_num + 1
+
+; === 16. CACHE1_STATUS = empty after pusher drains ===
+    mov eax, [CACHE1_STATUS]
+    ASSERT_EQ eax, 0x10         ; bit 4 = empty
 
     PASS

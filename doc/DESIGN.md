@@ -250,7 +250,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
-| `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO, PGRAPH, PRAMDAC, PFB regs (13)   | ✅ ALL PASS   |
+| `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 
 ---
@@ -649,10 +649,13 @@ Periodic vblank interrupt (~60 Hz) from the NV2A CRTC:
   interrupt, clear PCRTC_INTR_0 via W1C, send EOI to PIC.
 - **Tick rate**: VBLANK_PERIOD = 16667 ticks (~60 Hz at 1 tick/trace).
 
-**PFIFO (command FIFO engine)** ✅ DONE (stub)
+**PFIFO (command FIFO engine)** ✅ DONE (stub + DMA pusher)
 
 Register stubs that let games initialize the GPU command submission path
-without hanging.  No actual command processing.
+without hanging.  The DMA pusher advances `DMA_GET` toward `DMA_PUT` on each
+tick (up to 128 dwords/tick), so games that submit push buffer commands don't
+stall waiting for the GPU to consume them.  Commands are discarded (not
+interpreted) — actual rendering will be handled by the Vulkan backend (§5.16a).
 
 | Register              | Offset     | Behaviour                        |
 |-----------------------|-----------|----------------------------------|
@@ -663,6 +666,7 @@ without hanging.  No actual command processing.
 | `CACHE1_PUSH0`       | 0x003200  | Push access enable (bit 0)       |
 | `CACHE1_PUSH1`       | 0x003210  | Channel ID (bits 4:0)            |
 | `CACHE1_DMA_PUSH`    | 0x003220  | DMA pusher enable (bit 0)        |
+| `CACHE1_DMA_STATE`   | 0x003228  | Bit 0 = busy (GET ≠ PUT)        |
 | `CACHE1_DMA_PUT`     | 0x003240  | DMA put pointer                  |
 | `CACHE1_DMA_GET`     | 0x003244  | DMA get pointer                  |
 | `CACHE1_PULL0`       | 0x003250  | Pull access enable (bit 0)       |
@@ -692,6 +696,84 @@ retail hardware (crystal reference = 16.667 MHz):
 | `VPLL_COEFF`         | 0x680508  | 0x00031801   | Video pixel PLL (~25 MHz)|
 | `PLL_TEST_COUNTER`   | 0x680514  | 0            | PLL test readback       |
 | `GENERAL_CONTROL`    | 0x680600  | 0x00000101   | DAC control (read-only) |
+
+#### 5.16a NV2A Rendering via Vulkan
+**Priority: CRITICAL for visual output** — the NV2A GPU will be emulated by
+translating its fixed-function and programmable pipeline into Vulkan shaders
+on the host GPU.
+
+**Architecture:**
+
+The NV2A is an NV20-class GPU (GeForce 3 derivative) with a fixed-function
+transform & lighting pipeline, 4 texture combiners, vertex shaders (vs.1.1),
+and register combiners for pixel shading.  Rather than software-rasterising
+the guest GPU commands, we translate them into equivalent Vulkan draw calls:
+
+```
+Guest push buffer (PFIFO DMA)
+    │
+    ▼
+┌────────────────────┐
+│  Command Parser     │  Read NV2A method/data pairs from push buffer
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│  PGRAPH State       │  Shadow NV2A register state (combiners, textures,
+│  Tracker            │  transforms, vertex formats, render targets)
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│  Shader Compiler    │  NV2A vertex shader → SPIR-V vertex shader
+│  (SPIR-V)           │  NV2A register combiners → SPIR-V fragment shader
+└────────┬───────────┘
+         │
+         ▼
+┌────────────────────┐
+│  Vulkan Renderer    │  VkPipeline, VkRenderPass, draw calls
+│                     │  Framebuffer → swapchain present
+└────────────────────┘
+```
+
+**NV2A → Vulkan translation layers:**
+
+| NV2A Feature                  | Vulkan Equivalent                          |
+|-------------------------------|--------------------------------------------|
+| Vertex shader (vs.1.1)        | SPIR-V vertex shader (compiled at runtime) |
+| Register combiners (8 stages) | SPIR-V fragment shader (compiled at runtime)|
+| Fixed-function T&L            | SPIR-V vertex shader (generated from state)|
+| Texture units (4)             | VkSampler + VkImageView                    |
+| Render target / Z-buffer      | VkFramebuffer + VkRenderPass               |
+| Vertex arrays (inline/DMA)    | VkBuffer (vertex/index)                    |
+| Anti-aliasing (2×/4× MSAA)    | VkPipeline multisample state               |
+| Alpha test / blend             | VkPipeline color blend state               |
+| Fog                           | Fragment shader uniform                    |
+| Depth / stencil               | VkPipeline depth-stencil state             |
+| Swizzled textures             | CPU de-swizzle or compute shader           |
+| DXT1/DXT3/DXT5 compressed     | VK_FORMAT_BC1/BC2/BC3 (native)             |
+
+**Shader caching:** NV2A programs are short (max 136 vertex shader instructions,
+max 8 register combiner stages).  Compiled SPIR-V is cached keyed by the full
+NV2A program state hash.  Cache hit → reuse VkPipeline; miss → compile + link.
+
+**Texture handling:** Guest textures live in guest VRAM (the 64 MB main RAM
+region).  On first use, textures are uploaded to VkImage objects.  Texture
+invalidation is tracked via the page-version system (§2.6): when a page
+containing texture data is written by the CPU, the texture is marked dirty
+and re-uploaded on next GPU use.
+
+**Framebuffer readback:** When the guest CPU reads from the framebuffer
+address (PCRTC_START), a VkBuffer readback copies the rendered image into
+guest RAM for CPU-side compositing or screenshot capture.
+
+**Implementation phases:**
+1. Push buffer parser: decode NV2A methods from DMA push buffer
+2. PGRAPH state shadow: track all register combiner / vertex shader state
+3. Vertex shader → SPIR-V compiler
+4. Register combiner → SPIR-V fragment shader compiler
+5. Vulkan render pass assembly: vertex buffers, textures, draw calls
+6. Swapchain presentation: present rendered frame to host window
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
