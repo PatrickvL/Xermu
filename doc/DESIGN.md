@@ -186,7 +186,7 @@ and rebuild.
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (58 assertions)                   | ✅ ALL PASS   |
-| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE (41 assertions) | ✅ ALL PASS   |
+| `tests/memory.asm`    | Memory/addressing/PUSH/POP/LEAVE/8-16bit (51)    | ✅ ALL PASS   |
 | `tests/flow.asm`      | Control flow: LOOP/Jcc/CALL/RET/recursion (27)   | ✅ ALL PASS   |
 | `tests/fpu.asm`       | x87 FPU test suite (17 assertions)               | ✅ ALL PASS   |
 | `tests/sse.asm`       | SSE1 float ops test suite (48 assertions)        | ✅ ALL PASS   |
@@ -236,7 +236,8 @@ and rebuild.
 - [x] FS/GS segment override support (emit_ea_to_r14 adds segment base from ctx)
 - [x] CALL [mem] / JMP [mem] via C helpers (read_guest_mem32 / call_mem_helper)
 - [x] PUSH [mem] / POP [mem] via C helpers (push_mem_helper / pop_mem_helper)
-- [x] NASM test infrastructure: 9 suites, 349 total assertions, CMake integration
+- [x] 8/16-bit register MOV memory forms (AL/CL/DL/BL, AX-DI via guest_reg_enc)
+- [x] NASM test infrastructure: 9 suites, 359 total assertions, CMake integration
 
 ---
 
@@ -306,10 +307,13 @@ segment base from the context. Works with all addressing modes (disp-only,
 base, base+disp, base+index*scale+disp). The Xbox kernel uses FS for KPCR.
 Verified by `tests/segment.asm` (22 assertions).
 
-#### 5.5 ~~8-bit and 16-bit Register Operands in Memory Dispatch~~ Partially Done
-**Resolved for MOVZX/MOVSX.** MOVZX/MOVSX r32,[mem8/mem16] now have dedicated
-handlers using `emit_fastmem_movzx` / `emit_fastmem_movsx`. Still needed: direct
-8-bit and 16-bit register operand forms (e.g., `MOV AL, [mem]`, `MOV [mem], CX`).
+#### 5.5 ~~8-bit and 16-bit Register Operands in Memory Dispatch~~ ✅ DONE
+**Resolved.** MOVZX/MOVSX r32,[mem8/mem16] have dedicated handlers. Direct
+8/16-bit register forms (`MOV AL, [mem]`, `MOV [mem], CX`, etc.) now handled via
+`guest_reg_enc()` which maps 8-bit low (AL/CL/DL/BL), 16-bit (AX-DI), and 32-bit
+registers to their 3-bit encoding for `emit_fastmem_dispatch`. Note: AH/CH/DH/BH
+not supported (REX prefix conflict). Verified by `tests/memory.asm` (assertions
+42-51).
 
 #### 5.6 ~~Immediate-to-Memory Instructions~~ ✅ DONE
 **Resolved.** `emit_handler_mov_mem` detects `ops[other_idx].type == IMMEDIATE`

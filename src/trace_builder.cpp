@@ -431,7 +431,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     // MOV r, [m]  or  MOV [m], r
     if (ops[other_idx].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     uint8_t guest_enc = 0;
-    if (!reg32_enc(ops[other_idx].reg.value, guest_enc)) return false;
+    if (!guest_reg_enc(ops[other_idx].reg.value, guest_enc)) return false;
     return emit_fastmem_dispatch(e, ops[mem_idx], guest_enc,
                                   insn.operand_width, is_load, save_flags);
 }
