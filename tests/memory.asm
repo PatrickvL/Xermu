@@ -322,5 +322,33 @@
     mov  cx, 0xBEEF
     ASSERT_EQ ecx, 0xDEADBEEF               ; 51
 
+; ========================= PUSHAD / POPAD ==================================
+; PUSHAD saves all 8 GP regs; POPAD restores them (skipping ESP slot).
+    mov  eax, 0x11111111
+    mov  ecx, 0x22222222
+    mov  edx, 0x33333333
+    mov  ebx, 0x44444444
+    mov  ebp, 0x66666666
+    mov  esi, 0x77777777
+    mov  edi, 0x88888888
+    pushad
+    ; Clobber all registers
+    xor  eax, eax
+    xor  ecx, ecx
+    xor  edx, edx
+    xor  ebx, ebx
+    xor  ebp, ebp
+    xor  esi, esi
+    xor  edi, edi
+    popad
+    ASSERT_EQ eax, 0x11111111                ; 52
+    ASSERT_EQ ecx, 0x22222222                ; 53
+    ASSERT_EQ edx, 0x33333333                ; 54
+    ASSERT_EQ ebx, 0x44444444                ; 55
+    ASSERT_EQ ebp, 0x66666666                ; 56
+    ASSERT_EQ esi, 0x77777777                ; 57
+    ASSERT_EQ edi, 0x88888888                ; 58
+    mov  eax, 0                              ; reset for next test
+
 ; ============================== PASS =======================================
     PASS

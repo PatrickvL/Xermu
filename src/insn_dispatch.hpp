@@ -111,6 +111,14 @@ bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
                          const ZydisDecodedOperand* ops, const uint8_t* raw,
                          GuestContext* ctx, bool save_flags);
 
+bool emit_handler_pushad(Emitter& e, const ZydisDecodedInstruction& insn,
+                         const ZydisDecodedOperand* ops, const uint8_t* raw,
+                         GuestContext* ctx, bool save_flags);
+
+bool emit_handler_popad(Emitter& e, const ZydisDecodedInstruction& insn,
+                        const ZydisDecodedOperand* ops, const uint8_t* raw,
+                        GuestContext* ctx, bool save_flags);
+
 // ---------------------------------------------------------------------------
 // Dispatch table — Level 1 maps mnemonic → compact index, Level 2 has class
 // ---------------------------------------------------------------------------
@@ -134,6 +142,8 @@ enum InsnClassId : uint8_t {
     IC_PUSHFD,      // PUSHFD — push EFLAGS onto guest stack
     IC_POPFD,       // POPFD — pop EFLAGS from guest stack
     IC_STRING,      // MOVS/STOS/LODS/CMPS/SCAS (with optional REP prefix)
+    IC_PUSHAD,      // PUSHAD — push all GP regs onto guest stack
+    IC_POPAD,       // POPAD — pop all GP regs from guest stack
     IC_TERMINATOR,  // JMP/CALL/RET/Jcc/LOOP — trace exit
     IC_PRIVILEGED,  // HLT/LGDT/CLI/... — trap
     IC_MAX
@@ -158,6 +168,8 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_PUSHFD     */ { emit_handler_pushfd,    ICF_HAS_DISPATCH },
     /* IC_POPFD      */ { emit_handler_popfd,     ICF_HAS_DISPATCH },
     /* IC_STRING     */ { emit_handler_string,    ICF_HAS_DISPATCH },
+    /* IC_PUSHAD     */ { emit_handler_pushad,   ICF_HAS_DISPATCH },
+    /* IC_POPAD      */ { emit_handler_popad,    ICF_HAS_DISPATCH },
     /* IC_TERMINATOR */ { nullptr,                ICF_TERMINATOR },
     /* IC_PRIVILEGED */ { nullptr,                ICF_PRIVILEGED },
 };
@@ -227,6 +239,10 @@ inline void init_mnemonic_table() {
     // ---- PUSHFD / POPFD (guest stack, not host RSP) ----
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_PUSHFD]  = IC_PUSHFD;
     MNEMONIC_CLASS[ZYDIS_MNEMONIC_POPFD]   = IC_POPFD;
+
+    // ---- PUSHAD / POPAD (guest stack, all GP regs) ----
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_PUSHAD]  = IC_PUSHAD;
+    MNEMONIC_CLASS[ZYDIS_MNEMONIC_POPAD]   = IC_POPAD;
 
     // ---- String instructions (with optional REP/REPE/REPNE prefix) ----
     // Note: MOVSD and CMPSD share Zydis mnemonic with SSE2 scalar-double ops.
