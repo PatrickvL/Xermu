@@ -560,10 +560,14 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
     // SMC: bump page version if memory is the destination (write-back).
     // CMP and TEST read memory but don't write back — skip bump for them.
+    // preserve_flags = !save_flags: when the outer bracket is active it will
+    // restore flags at the end anyway, so the bump's own PUSHFQ/POPFQ would
+    // be redundant.  When no outer bracket, the bump must protect the ALU
+    // result flags from SHR+INC clobber.
     if (mem_idx == 0 &&
         insn.mnemonic != ZYDIS_MNEMONIC_CMP &&
         insn.mnemonic != ZYDIS_MNEMONIC_TEST) {
-        emit_smc_page_bump(e);  // preserve_flags=true (ALU produces flags)
+        emit_smc_page_bump(e, /*preserve_flags=*/!save_flags);
     }
     uint8_t* done_site = emit_jmp_fwd(e);
 
