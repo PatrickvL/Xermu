@@ -30,6 +30,29 @@ void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
         ctx->mmio->write(pa, value, size_bytes);
 }
 
+// PUSHFD helper: push EFLAGS onto the guest stack.
+// Called with the captured EFLAGS value in `eflags_val`.
+void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
+    uint32_t esp = ctx->gp[GP_ESP] - 4;
+    ctx->gp[GP_ESP] = esp;
+    if (esp < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        *reinterpret_cast<uint32_t*>(base + esp) = eflags_val;
+    }
+}
+
+// POPFD helper: pop EFLAGS from the guest stack.
+// Returns the 32-bit EFLAGS value.
+uint32_t popfd_helper(GuestContext* ctx) {
+    uint32_t esp = ctx->gp[GP_ESP];
+    ctx->gp[GP_ESP] = esp + 4;
+    if (esp < ctx->ram_size) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        return *reinterpret_cast<uint32_t*>(base + esp);
+    }
+    return 0;
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -408,14 +431,72 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
+// emit_handler_pushfd — PUSHFD: push EFLAGS onto guest stack.
+//
+// 1. Capture host EFLAGS into R14 (PUSHFQ + POP R14).
+// 2. Save all GP registers, call pushfd_helper(ctx, R14D), restore GP.
+// 3. The helper decrements guest ESP and stores EFLAGS at [fastmem+ESP].
+//
+// PUSHFD is read-only w.r.t. EFLAGS, so the save_flags wrapper preserves
+// them for subsequent instructions.
+// ---------------------------------------------------------------------------
+bool emit_handler_pushfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
+                         const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                         GuestContext* /*ctx*/, bool save_flags) {
+    // Capture EFLAGS → R14D
+    e.emit8(0x9C);                      // PUSHFQ
+    e.emit8(0x41); e.emit8(0x5E);      // POP R14
+
+    if (save_flags) emit_save_flags(e);
+
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);             // arg0 = ctx
+    emit_ccall_arg1_pa(e);              // arg1 = R14D (captured EFLAGS)
+    emit_call_abs(e, reinterpret_cast<void*>(pushfd_helper));
+    emit_load_all_gp(e);
+
+    if (save_flags) emit_restore_flags(e);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_handler_popfd — POPFD: pop EFLAGS from guest stack.
+//
+// 1. Save all GP, call popfd_helper(ctx) → returns EFLAGS in EAX.
+// 2. PUSH RAX + POPFQ to set host EFLAGS from returned value.
+// 3. Restore all GP registers (MOV does not affect EFLAGS).
+//
+// POPFD DEFINES new EFLAGS, so save_flags from a prior instruction is moot —
+// we still wrap to protect the call sequence, but the final POPFQ sets the
+// new flag state.
+// ---------------------------------------------------------------------------
+bool emit_handler_popfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
+                        const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
+                        GuestContext* /*ctx*/, bool /*save_flags*/) {
+    emit_save_all_gp(e);
+    emit_ccall_arg0_ctx(e);             // arg0 = ctx
+    emit_call_abs(e, reinterpret_cast<void*>(popfd_helper));
+    // EAX = popped EFLAGS value
+    e.emit8(0x50);                      // PUSH RAX
+    e.emit8(0x9D);                      // POPFQ  — sets host EFLAGS
+    emit_load_all_gp(e);               // MOVs don't touch flags
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // emit_handler_movzx_mem — MOVZX r32, [m] (byte/word source)
 // ---------------------------------------------------------------------------
 bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
-                            const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
+                            const ZydisDecodedOperand* ops, const uint8_t* raw,
                             GuestContext* /*ctx*/, bool save_flags) {
     if (insn.operand_count < 2) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY)   return false;
+
+    // Register-register form: verbatim copy (works natively in 64-bit mode)
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+        e.copy(raw, insn.length);
+        return true;
+    }
 
     uint8_t dst_enc = 0;
     if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
@@ -447,11 +528,16 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 // emit_handler_movsx_mem — MOVSX r32, [m] (byte/word source)
 // ---------------------------------------------------------------------------
 bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
-                            const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
+                            const ZydisDecodedOperand* ops, const uint8_t* raw,
                             GuestContext* /*ctx*/, bool save_flags) {
     if (insn.operand_count < 2) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY)   return false;
+
+    // Register-register form: verbatim copy (works natively in 64-bit mode)
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+        e.copy(raw, insn.length);
+        return true;
+    }
 
     uint8_t dst_enc = 0;
     if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
