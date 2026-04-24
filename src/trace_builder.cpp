@@ -1728,5 +1728,18 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     t->host_code = emit_buf;
     t->page_ver  = pv.get(guest_eip);
     t->valid     = true;
+
+    // Transfer pending link slots from the emitter to the trace.
+    // If the trace contains SMC writes (page version bumps), don't link —
+    // the write may invalidate the target trace during execution.
+    t->num_links = 0;
+    if (!e.smc_written) {
+        int start = (e.num_pending_links > Trace::MAX_LINKS)
+                  ? e.num_pending_links - Trace::MAX_LINKS : 0;
+        for (int i = start; i < e.num_pending_links; ++i)
+            t->add_link(e.pending_links[i].patch_site,
+                         e.pending_links[i].target_eip);
+    }
+
     return t;
 }

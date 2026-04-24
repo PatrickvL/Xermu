@@ -165,6 +165,53 @@ void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
+// Block linking helpers.
+// ---------------------------------------------------------------------------
+
+// Try to patch each unlinked exit of `t` to its target trace if present
+// in the trace cache.  Also validates the target's page version.
+void Executor::try_link_trace(Trace* t) {
+    for (int i = 0; i < t->num_links; ++i) {
+        auto& lk = t->links[i];
+        if (lk.linked) continue;
+
+        Trace* target = tcache.lookup(lk.target_eip);
+        if (!target || !target->valid) continue;
+
+        // Verify the target trace's page is still current.
+        uint32_t target_pa = lk.target_eip;
+        if (paging_enabled()) {
+            target_pa = translate_va(lk.target_eip, /*is_write=*/false);
+            if (target_pa == ~0u) continue;
+        }
+        if (pv.get(target_pa) != target->page_ver) continue;
+
+        // Patch the JMP rel32 to jump directly to the target's host_code.
+        Emitter::patch_rel32(lk.jmp_rel32, target->host_code);
+        lk.linked = true;
+    }
+}
+
+// Before invalidating a trace, unlink every trace that has a JMP patched
+// into this trace's host_code.  We scan all traces in the arena — this is
+// rare (only on SMC) so the O(N) scan is acceptable.
+void Executor::unlink_trace(Trace* t) {
+    for (size_t i = 0; i < arena.used; ++i) {
+        Trace& src = arena.pool[i];
+        if (!src.valid) continue;
+        for (int j = 0; j < src.num_links; ++j) {
+            auto& lk = src.links[j];
+            if (lk.linked && lk.target_eip == t->guest_eip) {
+                // Reset JMP rel32 to 0 → fallthrough to the cold exit stub.
+                int32_t zero = 0;
+                memcpy(lk.jmp_rel32, &zero, 4);
+                lk.linked = false;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Privileged instruction handler — decode and dispatch HLT, IN, OUT, etc.
 // Called from run loop when a trace exits with STOP_PRIVILEGED.
 // ctx.eip == address of the privileged instruction.
@@ -691,6 +738,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     ctx.halted = false;
 
     uint64_t steps = 0;
+    Trace* prev_trace = nullptr;
 
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) break;
@@ -704,6 +752,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             pending_irq &= ~(1u << irq);
             // Map IRQ to IDT vector: PIC-style IRQ 0-15 → vectors 0x20-0x2F.
             deliver_interrupt(uint8_t(0x20 + irq), ctx.eip);
+            prev_trace = nullptr; // chain broken by interrupt
         }
 
         uint32_t eip = ctx.eip;
@@ -718,6 +767,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 // Error code: bit 0=0 (not present), bit 2=0 (supervisor),
                 // bit 4=1 (instruction fetch).
                 deliver_interrupt(14, eip, /*has_error=*/true, /*error_code=*/0x10);
+                prev_trace = nullptr;
                 continue;
             }
         }
@@ -728,8 +778,10 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Validate: check page version for SMC.
         if (t && t->valid) {
             if (pv.get(code_pa) != t->page_ver) {
+                unlink_trace(t);      // remove incoming links before invalidation
                 tcache.invalidate(eip);
                 t = nullptr;
+                prev_trace = nullptr; // chain broken by invalidation
             }
         } else {
             t = nullptr;
@@ -749,6 +801,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             tcache.insert(t);
         }
 
+        // Block linking: eagerly link this trace's exits to existing targets,
+        // and try to link the previous trace's exits to this trace.
+        try_link_trace(t);
+        if (prev_trace && prev_trace->valid)
+            try_link_trace(prev_trace);
+
         // Execute the trace.
         ctx.eip         = eip;
         ctx.stop_reason = STOP_NONE;
@@ -757,9 +815,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Advance EIP to what the trace exit stub wrote.
         ctx.eip = ctx.next_eip;
         ++steps;
+        prev_trace = t;
 
         // Privileged instruction stop: decode and handle in the run loop.
         if (ctx.stop_reason == STOP_PRIVILEGED) {
+            prev_trace = nullptr; // chain broken
             handle_privileged();
             continue;
         }
@@ -767,6 +827,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Page fault during JIT memory access: deliver #PF (vector 14).
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
+            prev_trace = nullptr; // chain broken
             // Error code: bit 0 = 0 (not present), bit 2 = 0 (supervisor).
             // Full error code computation would check P, W/R, U/S bits;
             // for now use 0 (not-present supervisor read).
