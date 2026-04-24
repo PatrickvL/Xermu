@@ -1,99 +1,134 @@
 #pragma once
-// NV2A GPU register stubs — PMC, PFIFO, PTIMER, PCRTC, PGRAPH, PRAMDAC.
-// PFIFO DMA pusher parses NV2A push buffer commands from guest RAM.
+// ---------------------------------------------------------------------------
+// nv2a.hpp — NV2A GPU register file + PFIFO DMA pusher.
+//
+// Per-block flat register arrays indexed by block-relative offset / 4,
+// matching the PGRAPH / APU pattern.  Named constants in per-block
+// namespaces mirror NV2A register documentation.
+// ---------------------------------------------------------------------------
 #include "address_map.hpp"
 #include <cstdint>
 #include <cstring>
 
 namespace xbox {
 
+// ===================== Per-Block Register Offset Constants ==================
+// Offsets are relative to each block's base within the NV2A MMIO range.
+// Block bases (from NV2A_BASE): PMC +0x000000, PBUS +0x001000,
+// PFIFO +0x002000, PVIDEO +0x008000, PTIMER +0x009000, PFB +0x100000,
+// PGRAPH +0x400000, PCRTC +0x600000, PRAMDAC +0x680000.
+
+namespace pmc {
+static constexpr uint32_t BOOT_0    = 0x000;   // chip ID (NV2A derivative)
+static constexpr uint32_t INTR_0    = 0x100;   // master interrupt status (computed)
+static constexpr uint32_t INTR_EN   = 0x140;   // master interrupt enable
+static constexpr uint32_t ENABLE    = 0x200;   // subsystem enable
+} // namespace pmc
+
+namespace pbus {
+static constexpr uint32_t REG_0     = 0x200;   // bus control register 0
+} // namespace pbus
+
+namespace pfifo {
+// Base PFIFO registers (block-relative 0x0000-0x0FFF)
+static constexpr uint32_t INTR            = 0x0100;
+static constexpr uint32_t INTR_EN         = 0x0140;
+static constexpr uint32_t RUNOUT_STATUS   = 0x0400;
+static constexpr uint32_t CACHES          = 0x0500;
+static constexpr uint32_t MODE            = 0x0504;
+// CACHE1 registers (block-relative 0x1000-0x1FFF)
+static constexpr uint32_t CACHE1_PUSH0    = 0x1200;
+static constexpr uint32_t CACHE1_PUSH1    = 0x1210;
+static constexpr uint32_t CACHE1_STATUS   = 0x1214;
+static constexpr uint32_t CACHE1_DMA_PUSH = 0x1220;
+static constexpr uint32_t CACHE1_DMA_STATE = 0x1228; // computed: busy flag
+static constexpr uint32_t CACHE1_DMA_PUT  = 0x1240;
+static constexpr uint32_t CACHE1_DMA_GET  = 0x1244;
+static constexpr uint32_t CACHE1_DMA_SUBROUTINE = 0x124C; // bits[28:2] return addr, bit[0] active
+static constexpr uint32_t CACHE1_PULL0    = 0x1250;
+// Emulator extensions (diagnostics / testing)
+static constexpr uint32_t EXT_METHODS     = 0x1F00;  // methods dispatched count
+static constexpr uint32_t EXT_DWORDS      = 0x1F04;  // dwords consumed count
+static constexpr uint32_t EXT_JUMPS       = 0x1F08;  // jump commands count
+static constexpr uint32_t EXT_CALLS       = 0x1F0C;  // call commands count
+} // namespace pfifo
+
+namespace pvideo {
+static constexpr uint32_t INTR     = 0x100;    // PVIDEO interrupt status (W1C)
+} // namespace pvideo
+
+namespace ptimer {
+static constexpr uint32_t INTR     = 0x100;    // PTIMER interrupt (unused stub)
+static constexpr uint32_t NUM      = 0x200;    // numerator
+static constexpr uint32_t DEN      = 0x210;    // denominator
+static constexpr uint32_t TIME_0   = 0x400;    // low 32 bits of ns counter (computed)
+static constexpr uint32_t TIME_1   = 0x410;    // high 24 bits of ns counter (computed)
+} // namespace ptimer
+
+namespace pfb {
+static constexpr uint32_t CFG0     = 0x200;    // framebuffer config (RAM size)
+} // namespace pfb
+
+namespace pgraph_ctl {
+static constexpr uint32_t INTR       = 0x100;
+static constexpr uint32_t INTR_EN    = 0x140;
+static constexpr uint32_t CTX_STATUS = 0x170;
+static constexpr uint32_t FIFO       = 0x720;
+} // namespace pgraph_ctl
+
+namespace pcrtc {
+static constexpr uint32_t INTR     = 0x100;    // vblank interrupt status (W1C)
+static constexpr uint32_t INTR_EN  = 0x140;    // vblank interrupt enable
+static constexpr uint32_t START    = 0x800;    // framebuffer start address
+} // namespace pcrtc
+
+namespace pramdac {
+static constexpr uint32_t NVPLL     = 0x500;   // core PLL
+static constexpr uint32_t MPLL      = 0x504;   // memory PLL
+static constexpr uint32_t VPLL      = 0x508;   // video PLL
+static constexpr uint32_t PLL_TEST  = 0x514;   // PLL test register
+static constexpr uint32_t FP_DEBUG0 = 0x600;   // flat-panel debug 0
+static constexpr uint32_t FP_TMDS   = 0x8C0;   // TMDS control
+} // namespace pramdac
+
+// ========================== NV2A State =====================================
+
 struct Nv2aState {
-    uint32_t pmc_boot_0  = 0x02A000A1;  // NV2A chip ID (NV20 derivative)
-    uint32_t pmc_enable  = 0;           // PMC_ENABLE
-    uint32_t pmc_intr_en = 0;           // PMC_INTR_EN_0 (master IRQ enable)
-    uint32_t pfb_cfg0    = 0x03070103;  // 64 MB RAM
-    uint32_t pbus_0      = 0;
-    uint32_t ptimer_num  = 1;
-    uint32_t ptimer_den  = 1;
-    uint32_t pcrtc_start = 0;
-    uint32_t pcrtc_intr  = 0;           // PCRTC_INTR_0 (bit 0 = vblank pending)
-    uint32_t pcrtc_intr_en = 0;         // PCRTC_INTR_EN_0 (bit 0 = vblank enable)
-    uint32_t pvideo_intr = 0;
+    // --- Per-block register arrays (indexed by block-relative offset / 4) ---
+    static constexpr uint32_t PMC_COUNT     = 0x400  / 4;  // 256 slots
+    static constexpr uint32_t PBUS_COUNT    = 0x400  / 4;
+    static constexpr uint32_t PFIFO_COUNT   = 0x2000 / 4;  // 2048 slots (0x002000-0x003FFF)
+    static constexpr uint32_t PVIDEO_COUNT  = 0x200  / 4;
+    static constexpr uint32_t PTIMER_COUNT  = 0x800  / 4;
+    static constexpr uint32_t PFB_COUNT     = 0x400  / 4;
+    static constexpr uint32_t PGRAPH_COUNT  = 0x800  / 4;
+    static constexpr uint32_t PCRTC_COUNT   = 0x1000 / 4;
+    static constexpr uint32_t PRAMDAC_COUNT = 0x1000 / 4;
 
-    // PFIFO registers
-    uint32_t pfifo_intr      = 0;
-    uint32_t pfifo_intr_en   = 0;
-    uint32_t pfifo_caches    = 0;
-    uint32_t pfifo_mode      = 0;
-    uint32_t pfifo_cache1_push0 = 0;
-    uint32_t pfifo_cache1_pull0 = 0;
-    uint32_t pfifo_cache1_push1 = 0;
-    uint32_t pfifo_cache1_status = 0x10;
-    uint32_t pfifo_cache1_dma_push = 0;
-    uint32_t pfifo_cache1_dma_put = 0;
-    uint32_t pfifo_cache1_dma_get = 0;
-    uint32_t pfifo_runout_status = 0x10;
+    uint32_t pmc_regs[PMC_COUNT]         = {};
+    uint32_t pbus_regs[PBUS_COUNT]       = {};
+    uint32_t pfifo_regs[PFIFO_COUNT]     = {};
+    uint32_t pvideo_regs[PVIDEO_COUNT]   = {};
+    uint32_t ptimer_regs[PTIMER_COUNT]   = {};
+    uint32_t pfb_regs[PFB_COUNT]         = {};
+    uint32_t pgraph_regs[PGRAPH_COUNT]   = {};
+    uint32_t pcrtc_regs[PCRTC_COUNT]     = {};
+    uint32_t pramdac_regs[PRAMDAC_COUNT] = {};
 
-    // PGRAPH registers
-    uint32_t pgraph_intr     = 0;
-    uint32_t pgraph_intr_en  = 0;
-    uint32_t pgraph_fifo     = 0;
-    uint32_t pgraph_channel_ctx_status = 0;
-
-    // PRAMDAC registers — PLL / video clock configuration
-    uint32_t pramdac_nvpll   = 0x00011C01;
-    uint32_t pramdac_mpll    = 0x00011801;
-    uint32_t pramdac_vpll    = 0x00031801;
-    uint32_t pramdac_pll_test = 0;
-
-    // PTIMER: 56-bit freerunning nanosecond counter.
+    // PTIMER: 56-bit freerunning nanosecond counter (not a flat register).
     uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;
 
-    // PFIFO DMA pusher call stack (for CALL/RETURN, 1 level on Xbox).
-    uint32_t pfifo_dma_call_return = 0;
-    bool     pfifo_subr_active     = false;
-
-    // PFIFO command parsing stats (for diagnostics / testing).
-    uint32_t fifo_methods_dispatched = 0;
-    uint32_t fifo_dwords_consumed    = 0;
-    uint32_t fifo_jumps              = 0;
-    uint32_t fifo_calls              = 0;
-
     // Pointer to PGRAPH state shadow (set by xbox_setup, used for diag reads).
     struct PgraphState;  // forward decl — full definition in pgraph.hpp
-    void* pgraph_ptr = nullptr;  // points to PgraphState
+    void* pgraph_ptr = nullptr;
 
     // PCRTC vblank
     uint32_t vblank_counter = 0;
     static constexpr uint32_t VBLANK_PERIOD = 16667;
     bool     vblank_irq_pending = false;
 
-    void tick_timer() {
-        ptimer_ns += NS_PER_TICK;
-        if (++vblank_counter >= VBLANK_PERIOD) {
-            vblank_counter = 0;
-            if (pcrtc_intr_en & 1)
-                pcrtc_intr |= 1;
-            if ((pmc_intr_en & 0x01000000) && (pcrtc_intr & 1))
-                vblank_irq_pending = true;
-        }
-    }
-
-    static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
-
-    // ---------------------------------------------------------------
-    // NV2A push buffer command types (bits [31:29] of command header).
-    // ---------------------------------------------------------------
-    // Type 0b000: INCREASING — data dwords go to method, method+4, method+8, ...
-    // Type 0b100: NON_INCREASING — all data dwords go to the same method
-    // Bit [31:30] = 01: JUMP to address in bits [28:2] << 2
-    // All-zero dword = NOP (skip).
-    // ---------------------------------------------------------------
-
     // GPU method handler — called for each (subchannel, method, data) tuple.
-    // Override this for actual GPU command processing (PGRAPH state shadow).
-    // Default: no-op (discard).
     using MethodHandler = void(*)(void* user, uint32_t subchannel,
                                   uint32_t method, uint32_t data);
     MethodHandler method_handler = nullptr;
@@ -105,20 +140,63 @@ struct Nv2aState {
     FifoNotify fifo_notify      = nullptr;
     void*      fifo_notify_user = nullptr;
 
-    void tick_fifo(const uint8_t* ram, uint32_t ram_size_bytes) {
-        if (!(pfifo_cache1_dma_push & 1)) return;
-        if (!(pfifo_cache1_push0 & 1)) return;
-        if (pfifo_cache1_dma_get == pfifo_cache1_dma_put) {
-            pfifo_cache1_status = 0x10;
-            return;
+    Nv2aState() {
+        pmc_regs[pmc::BOOT_0 / 4]             = 0x02A000A1;  // NV2A chip ID
+        ptimer_regs[ptimer::NUM / 4]           = 1;
+        ptimer_regs[ptimer::DEN / 4]           = 1;
+        pfb_regs[pfb::CFG0 / 4]               = 0x03070103;  // 64 MB RAM
+        pfifo_regs[pfifo::CACHE1_STATUS / 4]   = 0x10;       // idle
+        pfifo_regs[pfifo::RUNOUT_STATUS / 4]   = 0x10;       // idle
+        pramdac_regs[pramdac::NVPLL / 4]       = 0x00011C01;
+        pramdac_regs[pramdac::MPLL / 4]        = 0x00011801;
+        pramdac_regs[pramdac::VPLL / 4]        = 0x00031801;
+    }
+
+    void tick_timer() {
+        ptimer_ns += NS_PER_TICK;
+        if (++vblank_counter >= VBLANK_PERIOD) {
+            vblank_counter = 0;
+            if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1)
+                pcrtc_regs[pcrtc::INTR / 4] |= 1;
+            if ((pmc_regs[pmc::INTR_EN / 4] & 0x01000000) &&
+                (pcrtc_regs[pcrtc::INTR / 4] & 1))
+                vblank_irq_pending = true;
         }
-        pfifo_cache1_status = 0;
-        uint32_t get = pfifo_cache1_dma_get;
-        uint32_t put = pfifo_cache1_dma_put;
+    }
+
+    uint32_t pmc_intr_0() const {
+        uint32_t val = 0;
+        if (pcrtc_regs[pcrtc::INTR / 4] & 1) val |= 0x01000000;
+        return val;
+    }
+
+    // ---------------------------------------------------------------
+    // PFIFO DMA pusher
+    // ---------------------------------------------------------------
+    static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
+
+    void tick_fifo(const uint8_t* ram, uint32_t ram_size_bytes) {
+        auto& dma_push = pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4];
+        auto& push0    = pfifo_regs[pfifo::CACHE1_PUSH0 / 4];
+        auto& dma_get  = pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+        auto& dma_put  = pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+        auto& status   = pfifo_regs[pfifo::CACHE1_STATUS / 4];
+        auto& subr     = pfifo_regs[pfifo::CACHE1_DMA_SUBROUTINE / 4];
+        auto& ext_methods = pfifo_regs[pfifo::EXT_METHODS / 4];
+        auto& ext_dwords  = pfifo_regs[pfifo::EXT_DWORDS / 4];
+        auto& ext_jumps   = pfifo_regs[pfifo::EXT_JUMPS / 4];
+        auto& ext_calls   = pfifo_regs[pfifo::EXT_CALLS / 4];
+
+        if (!(dma_push & 1)) return;
+        if (!(push0 & 1)) return;
+        if (dma_get == dma_put) { status = 0x10; return; }
+        status = 0;
+
+        uint32_t get = dma_get;
+        uint32_t put = dma_put;
         uint32_t consumed = 0;
 
         while (get != put && consumed < MAX_DWORDS_PER_TICK) {
-            // Bounds check — DMA addresses must be within RAM.
             if (get + 4 > ram_size_bytes) break;
 
             uint32_t hdr;
@@ -126,42 +204,37 @@ struct Nv2aState {
             get += 4;
             consumed++;
 
-            // NOP: all-zero dword.
-            if (hdr == 0) continue;
-
-            uint32_t type = (hdr >> 29) & 0x7;
+            if (hdr == 0) continue;  // NOP
 
             if ((hdr & 0xC0000000u) == 0x40000000u) {
-                // JUMP: target address = bits [28:2] << 2 (i.e. bits [28:0] with low 2 bits masked)
+                // JUMP
                 get = hdr & 0x1FFFFFFCu;
-                fifo_jumps++;
+                ext_jumps++;
                 continue;
             }
 
             if ((hdr & 3) == 2) {
-                // CALL: save GET, jump to target. Single-level on Xbox.
-                if (!pfifo_subr_active) {
-                    pfifo_dma_call_return = get;
-                    pfifo_subr_active = true;
+                // CALL: save GET, jump to target (single-level on Xbox).
+                if (!(subr & 1)) {
+                    subr = (get & 0x1FFFFFFC) | 1;
                     get = hdr & 0xFFFFFFFCu;
-                    fifo_calls++;
+                    ext_calls++;
                 }
-                // If subr_active already set, silently ignore (real HW raises error).
                 continue;
             }
 
             if (hdr == 0x00020000u) {
                 // RETURN: restore GET from saved address.
-                if (pfifo_subr_active) {
-                    get = pfifo_dma_call_return;
-                    pfifo_subr_active = false;
+                if (subr & 1) {
+                    get = subr & 0x1FFFFFFC;
+                    subr = 0;
                 }
                 continue;
             }
 
+            uint32_t type = (hdr >> 29) & 0x7;
             if (type == 0 || type == 4) {
-                // INCREASING (0) or NON_INCREASING (4).
-                uint32_t method     = (hdr >>  0) & 0x1FFC;  // bits [12:2], in bytes
+                uint32_t method     = (hdr >>  0) & 0x1FFC;
                 uint32_t subchannel = (hdr >> 13) & 0x7;
                 uint32_t count      = (hdr >> 18) & 0x7FF;
 
@@ -176,77 +249,88 @@ struct Nv2aState {
                     uint32_t m = (type == 0) ? (method + i * 4) : method;
                     if (method_handler)
                         method_handler(method_user, subchannel, m, data);
-                    fifo_methods_dispatched++;
+                    ext_methods++;
                 }
             }
         }
 done:
-        fifo_dwords_consumed += consumed;
-        pfifo_cache1_dma_get = get;
+        ext_dwords += consumed;
+        dma_get = get;
         if (get == put)
-            pfifo_cache1_status = 0x10;
-    }
-
-    uint32_t pmc_intr_0() const {
-        uint32_t val = 0;
-        if (pcrtc_intr & 1) val |= 0x01000000;
-        return val;
+            status = 0x10;
     }
 };
 
-static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
+// ========================== MMIO Handlers ==================================
+
+static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
-    if (off == 0x000000) return nv->pmc_boot_0;
-    if (off == 0x000100) return nv->pmc_intr_0();
-    if (off == 0x000140) return nv->pmc_intr_en;
-    if (off == 0x000200) return nv->pmc_enable;
-    if (off == 0x001200) return nv->pbus_0;
-    if (off == 0x001214) return 0;
-    if (off == 0x002100) return nv->pfifo_intr;
-    if (off == 0x002140) return nv->pfifo_intr_en;
-    if (off == 0x002500) return nv->pfifo_caches;
-    if (off == 0x002504) return nv->pfifo_mode;
-    if (off == 0x003200) return nv->pfifo_cache1_push0;
-    if (off == 0x003210) return nv->pfifo_cache1_push1;
-    if (off == 0x003220) return nv->pfifo_cache1_dma_push;
-    if (off == 0x003240) return nv->pfifo_cache1_dma_put;
-    if (off == 0x003244) return nv->pfifo_cache1_dma_get;
-    if (off == 0x003250) return nv->pfifo_cache1_pull0;
-    if (off == 0x003214) return nv->pfifo_cache1_status;
-    if (off == 0x002400) return nv->pfifo_runout_status;
-    if (off == 0x003228) {
-        bool busy = (nv->pfifo_cache1_dma_push & 1) &&
-                    (nv->pfifo_cache1_dma_get != nv->pfifo_cache1_dma_put);
-        return busy ? 1u : 0u;
+    // --- PMC (0x000000) ---
+    if (off < 0x001000) {
+        if (off == pmc::INTR_0) return nv->pmc_intr_0();  // computed
+        if (off / 4 < Nv2aState::PMC_COUNT) return nv->pmc_regs[off / 4];
+        return 0;
     }
-    // PFIFO command parser stats (emulator extensions, offset 0x003F00).
-    if (off == 0x003F00) return nv->fifo_methods_dispatched;
-    if (off == 0x003F04) return nv->fifo_dwords_consumed;
-    if (off == 0x003F08) return nv->fifo_jumps;
-    if (off == 0x003F0C) return nv->fifo_calls;
-    if (off == 0x009200) return nv->ptimer_num;
-    if (off == 0x009210) return nv->ptimer_den;
-    if (off == 0x009400) return (uint32_t)(nv->ptimer_ns & 0xFFFFFFE0u);
-    if (off == 0x009410) return (uint32_t)(nv->ptimer_ns >> 32);
-    if (off == 0x009100) return 0;
-    if (off == 0x100200) return nv->pfb_cfg0;
-    if (off == 0x100204) return 0;
-    if (off == 0x600100) return nv->pcrtc_intr;
-    if (off == 0x600140) return nv->pcrtc_intr_en;
-    if (off == 0x600800) return nv->pcrtc_start;
-    if (off == 0x008100) return nv->pvideo_intr;
-    if (off == 0x400100) return nv->pgraph_intr;
-    if (off == 0x400140) return nv->pgraph_intr_en;
-    if (off == 0x400720) return nv->pgraph_fifo;
-    if (off == 0x400170) return nv->pgraph_channel_ctx_status;
-    if (off == 0x680500) return nv->pramdac_nvpll;
-    if (off == 0x680504) return nv->pramdac_mpll;
-    if (off == 0x680508) return nv->pramdac_vpll;
-    if (off == 0x680514) return nv->pramdac_pll_test;
-    if (off == 0x680600) return 0x00000101;
-    if (off == 0x6808C0) return 0;
+    // --- PBUS (0x001000) ---
+    if (off < 0x002000) {
+        uint32_t r = off - 0x001000;
+        if (r / 4 < Nv2aState::PBUS_COUNT) return nv->pbus_regs[r / 4];
+        return 0;
+    }
+    // --- PFIFO (0x002000) ---
+    if (off < 0x004000) {
+        uint32_t r = off - 0x002000;
+        // DMA_STATE is computed: busy if push enabled and GET != PUT.
+        if (r == pfifo::CACHE1_DMA_STATE) {
+            bool busy = (nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
+                        (nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] !=
+                         nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4]);
+            return busy ? 1u : 0u;
+        }
+        if (r / 4 < Nv2aState::PFIFO_COUNT) return nv->pfifo_regs[r / 4];
+        return 0;
+    }
+    // --- PVIDEO (0x008000) ---
+    if (off >= 0x008000 && off < 0x009000) {
+        uint32_t r = off - 0x008000;
+        if (r / 4 < Nv2aState::PVIDEO_COUNT) return nv->pvideo_regs[r / 4];
+        return 0;
+    }
+    // --- PTIMER (0x009000) ---
+    if (off >= 0x009000 && off < 0x00A000) {
+        uint32_t r = off - 0x009000;
+        if (r == ptimer::TIME_0) return (uint32_t)(nv->ptimer_ns & 0xFFFFFFE0u);
+        if (r == ptimer::TIME_1) return (uint32_t)(nv->ptimer_ns >> 32);
+        if (r / 4 < Nv2aState::PTIMER_COUNT) return nv->ptimer_regs[r / 4];
+        return 0;
+    }
+    // --- PFB (0x100000) ---
+    if (off >= 0x100000 && off < 0x101000) {
+        uint32_t r = off - 0x100000;
+        if (r / 4 < Nv2aState::PFB_COUNT) return nv->pfb_regs[r / 4];
+        return 0;
+    }
+    // --- PGRAPH control (0x400000) ---
+    if (off >= 0x400000 && off < 0x401000) {
+        uint32_t r = off - 0x400000;
+        if (r / 4 < Nv2aState::PGRAPH_COUNT) return nv->pgraph_regs[r / 4];
+        return 0;
+    }
+    // --- PCRTC (0x600000) ---
+    if (off >= 0x600000 && off < 0x601000) {
+        uint32_t r = off - 0x600000;
+        if (r / 4 < Nv2aState::PCRTC_COUNT) return nv->pcrtc_regs[r / 4];
+        return 0;
+    }
+    // --- PRAMDAC (0x680000) ---
+    if (off >= 0x680000 && off < 0x681000) {
+        uint32_t r = off - 0x680000;
+        if (r == pramdac::FP_DEBUG0) return 0x00000101;  // hardwired
+        if (r / 4 < Nv2aState::PRAMDAC_COUNT) return nv->pramdac_regs[r / 4];
+        return 0;
+    }
 
     return 0;
 }
@@ -255,33 +339,74 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
-    if (off == 0x000140) { nv->pmc_intr_en = val; return; }
-    if (off == 0x000200) { nv->pmc_enable = val; return; }
-    if (off == 0x001200) { nv->pbus_0 = val;     return; }
-    if (off == 0x009200) { nv->ptimer_num = val;  return; }
-    if (off == 0x009210) { nv->ptimer_den = val;  return; }
-    if (off == 0x600100) { nv->pcrtc_intr &= ~val; return; }
-    if (off == 0x600140) { nv->pcrtc_intr_en = val; return; }
-    if (off == 0x600800) { nv->pcrtc_start = val; return; }
-    if (off == 0x008100) { nv->pvideo_intr &= ~val; return; }
-    if (off == 0x002100) { nv->pfifo_intr &= ~val; return; }
-    if (off == 0x002140) { nv->pfifo_intr_en = val; return; }
-    if (off == 0x002500) { nv->pfifo_caches = val; return; }
-    if (off == 0x002504) { nv->pfifo_mode = val; return; }
-    if (off == 0x003200) { nv->pfifo_cache1_push0 = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
-    if (off == 0x003210) { nv->pfifo_cache1_push1 = val; return; }
-    if (off == 0x003220) { nv->pfifo_cache1_dma_push = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
-    if (off == 0x003240) { nv->pfifo_cache1_dma_put = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
-    if (off == 0x003244) { nv->pfifo_cache1_dma_get = val; if (nv->fifo_notify) nv->fifo_notify(nv->fifo_notify_user); return; }
-    if (off == 0x003250) { nv->pfifo_cache1_pull0 = val; return; }
-    if (off == 0x400100) { nv->pgraph_intr &= ~val; return; }
-    if (off == 0x400140) { nv->pgraph_intr_en = val; return; }
-    if (off == 0x400720) { nv->pgraph_fifo = val; return; }
-    if (off == 0x400170) { nv->pgraph_channel_ctx_status = val; return; }
-    if (off == 0x680500) { nv->pramdac_nvpll = val; return; }
-    if (off == 0x680504) { nv->pramdac_mpll = val; return; }
-    if (off == 0x680508) { nv->pramdac_vpll = val; return; }
-    if (off == 0x680514) { nv->pramdac_pll_test = val; return; }
+    // --- PMC (0x000000) ---
+    if (off < 0x001000) {
+        if (off / 4 < Nv2aState::PMC_COUNT) nv->pmc_regs[off / 4] = val;
+        return;
+    }
+    // --- PBUS (0x001000) ---
+    if (off < 0x002000) {
+        uint32_t r = off - 0x001000;
+        if (r / 4 < Nv2aState::PBUS_COUNT) nv->pbus_regs[r / 4] = val;
+        return;
+    }
+    // --- PFIFO (0x002000) ---
+    if (off < 0x004000) {
+        uint32_t r = off - 0x002000;
+        // W1C interrupt status
+        if (r == pfifo::INTR) {
+            nv->pfifo_regs[r / 4] &= ~val;
+            return;
+        }
+        // Registers that trigger fifo_notify on write
+        bool notify = (r == pfifo::CACHE1_DMA_PUT  ||
+                       r == pfifo::CACHE1_PUSH0     ||
+                       r == pfifo::CACHE1_DMA_PUSH  ||
+                       r == pfifo::CACHE1_DMA_GET);
+        if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
+        if (notify && nv->fifo_notify)
+            nv->fifo_notify(nv->fifo_notify_user);
+        return;
+    }
+    // --- PVIDEO (0x008000) ---
+    if (off >= 0x008000 && off < 0x009000) {
+        uint32_t r = off - 0x008000;
+        if (r == pvideo::INTR) { nv->pvideo_regs[r / 4] &= ~val; return; }
+        if (r / 4 < Nv2aState::PVIDEO_COUNT) nv->pvideo_regs[r / 4] = val;
+        return;
+    }
+    // --- PTIMER (0x009000) ---
+    if (off >= 0x009000 && off < 0x00A000) {
+        uint32_t r = off - 0x009000;
+        if (r / 4 < Nv2aState::PTIMER_COUNT) nv->ptimer_regs[r / 4] = val;
+        return;
+    }
+    // --- PFB (0x100000) ---
+    if (off >= 0x100000 && off < 0x101000) {
+        uint32_t r = off - 0x100000;
+        if (r / 4 < Nv2aState::PFB_COUNT) nv->pfb_regs[r / 4] = val;
+        return;
+    }
+    // --- PGRAPH control (0x400000) ---
+    if (off >= 0x400000 && off < 0x401000) {
+        uint32_t r = off - 0x400000;
+        if (r == pgraph_ctl::INTR) { nv->pgraph_regs[r / 4] &= ~val; return; }
+        if (r / 4 < Nv2aState::PGRAPH_COUNT) nv->pgraph_regs[r / 4] = val;
+        return;
+    }
+    // --- PCRTC (0x600000) ---
+    if (off >= 0x600000 && off < 0x601000) {
+        uint32_t r = off - 0x600000;
+        if (r == pcrtc::INTR) { nv->pcrtc_regs[r / 4] &= ~val; return; }
+        if (r / 4 < Nv2aState::PCRTC_COUNT) nv->pcrtc_regs[r / 4] = val;
+        return;
+    }
+    // --- PRAMDAC (0x680000) ---
+    if (off >= 0x680000 && off < 0x681000) {
+        uint32_t r = off - 0x680000;
+        if (r / 4 < Nv2aState::PRAMDAC_COUNT) nv->pramdac_regs[r / 4] = val;
+        return;
+    }
 }
 
 } // namespace xbox

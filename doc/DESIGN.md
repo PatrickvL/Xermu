@@ -271,7 +271,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
-| `tests/apu.asm`       | APU: VP/GP/EP base + status registers (7)        | ✅ ALL PASS   |
+| `tests/apu.asm`       | APU: FE/SE/VP/GP/EP registers, idle-voice, FIFOs (20) | ✅ ALL PASS   |
 | `tests/ide.asm`       | IDE ATA: register defaults, IDENTIFY data, PIO (16) | ✅ ALL PASS   |
 | `tests/usb.asm`       | USB OHCI: register defaults, reset, PCI (12)     | ✅ ALL PASS   |
 | `tests/mtrr.asm`      | MTRR MSRs: variable + fixed range read/write (8) | ✅ ALL PASS   |
@@ -651,6 +651,15 @@ Test runner supports `--xbox` flag to use the full Xbox address map.
 **Priority: CRITICAL for games** — 16 MB of MMIO registers at `0xFD000000`.
 Responsible for all graphics. The NV2A is an NV20-class GPU (GeForce 3 derivative).
 This is by far the largest single implementation effort.
+
+**Architecture:** per-block flat register arrays in `Nv2aState`, each indexed by
+block-relative offset / 4.  Named constants in per-block namespaces (`pmc::`,
+`pfifo::`, `ptimer::`, `pfb::`, `pcrtc::`, `pramdac::`, `pgraph_ctl::`, `pvideo::`,
+`pbus::`).  Block routing in `nv2a_read`/`nv2a_write` maps the full NV2A offset to
+the correct block array.  Special cases: W1C for interrupt status registers,
+computed `PMC_INTR_0` and `PFIFO_CACHE1_DMA_STATE`, and PTIMER time reads from
+the 64-bit nanosecond counter.  PFIFO CALL/RETURN uses the hardware-accurate
+`CACHE1_DMA_SUBROUTINE` register (bits[28:2] = return addr, bit[0] = active).
 
 **PTIMER (freerunning counter)** ✅ DONE
 
@@ -1293,24 +1302,44 @@ MCPX APU register stub at `0xFE800000` (4 MB).  The Xbox audio processor
 has three sub-units: Voice Processor (VP), Global Processor (GP), and
 Encode Processor (EP), plus a front-end and setup engine.
 
+**Architecture:** flat `uint32_t regs[5120]` register array indexed by
+MMIO offset / 4, with named constants in the `papu::` namespace.  Same
+pattern as PGRAPH and NV2A.  MMIO handlers are trivial: reads return
+`regs[off/4]`, writes store `regs[off/4] = val`.  Special cases:
+W1C for `ISTS`/`GPISTS`/`EPISTS`, and `FETFORCE1` read always ORs in
+`SE2FE_IDLE_VOICE` (bit 7) so games don't hang waiting for the voice
+processor.
+
 **Register blocks implemented:**
 
 | Register              | Offset     | Behaviour                        |
 |-----------------------|-----------|----------------------------------|
 | `NV_PAPU_ISTS`       | 0x1000    | Interrupt status (W1C)           |
 | `NV_PAPU_IEN`        | 0x1004    | Interrupt enable mask            |
-| `NV_PAPU_FECTL`      | 0x1100    | Front-end control                |
-| `NV_PAPU_FECV`       | 0x1104    | Front-end current voice (read)   |
+| `NV_PAPU_FECTL`      | 0x1100    | Front-end control (method mode)  |
+| `NV_PAPU_FECV`       | 0x1110    | Front-end current voice (read)   |
 | `NV_PAPU_FESTATE`    | 0x1108    | Front-end state (0 = idle)       |
 | `NV_PAPU_FESTATUS`   | 0x110C    | Front-end status (0 = not busy)  |
-| `NV_PAPU_SECTL`      | 0x2000    | Setup engine control             |
-| `NV_PAPU_SESTATUS`   | 0x200C    | Setup engine status (0 = idle)   |
+| `NV_PAPU_FETFORCE1`  | 0x1504    | FE test force 1 (bit 7 = idle)   |
+| `NV_PAPU_SECTL`      | 0x2000    | Setup engine control (XCNTMODE)  |
+| `NV_PAPU_XGSCNT`     | 0x200C    | Global sample counter            |
+| `NV_PAPU_VPVADDR`    | 0x202C    | VP voice list base address       |
+| `NV_PAPU_VPSGEADDR`  | 0x2030    | VP scatter-gather base           |
+| `NV_PAPU_VPSSLADDR`  | 0x2034    | VP sample start list             |
+| `NV_PAPU_GPSADDR`    | 0x2040    | GP scratch address               |
+| `NV_PAPU_GPFADDR`    | 0x2044    | GP frame address                 |
+| `NV_PAPU_EPSADDR`    | 0x2048    | EP scratch address               |
+| `NV_PAPU_EPFADDR`    | 0x204C    | EP frame address                 |
+| `TVL2D..NVLMP`       | 0x2054–74 | Voice list descriptors (2D/3D/MP)|
+| `GPSMAXSGE..EPFMAXSGE`| 0x20D4–E0| SGE limits (GP/EP scratch/frame) |
 | `NV_PAPU_GPRST`      | 0x3000    | GP reset control                 |
-| `NV_PAPU_GPISTS`     | 0x3004    | GP interrupt status (read)       |
-| `NV_PAPU_GPSADDR`    | 0x3008    | GP scratch base address          |
+| `NV_PAPU_GPISTS`     | 0x3004    | GP interrupt status (W1C)        |
+| `GPOFBASE0..GPOFCUR3` | 0x3024–5C| GP output FIFO (4 channels)      |
+| `GPIFBASE0..GPIFCUR1` | 0x3064–7C| GP input FIFO (2 channels)       |
 | `NV_PAPU_EPRST`      | 0x4000    | EP reset control                 |
-| `NV_PAPU_EPISTS`     | 0x4004    | EP interrupt status (read)       |
-| `NV_PAPU_EPSADDR`    | 0x4008    | EP scratch base address          |
+| `NV_PAPU_EPISTS`     | 0x4004    | EP interrupt status (W1C)        |
+| `EPOFBASE0..EPOFCUR0` | 0x4024–2C| EP output FIFO (1 channel)       |
+| `EPIFBASE0..EPIFCUR0` | 0x4064–6C| EP input FIFO (1 channel)        |
 
 All registers read sane defaults (0 = idle/no interrupts).  Writes are
 accepted silently.  `ISTS` uses write-1-to-clear semantics.  This is
@@ -1319,8 +1348,8 @@ waiting for DSP status transitions.
 
 **PCI identity:** Bus 0, Device 3, Function 0 — Vendor 0x10DE, Device 0x01B0.
 
-**Test:** `tests/apu.asm` — 12 assertions covering init defaults, R/W,
-and W1C behaviour.
+**Test:** `tests/apu.asm` — 20 assertions covering init defaults, R/W, W1C,
+FETFORCE1 idle-voice, VP addresses, voice lists, SGE limits, GP/EP FIFOs.
 
 **Audio backend — Cubeb (cross-platform):**
 
@@ -1490,9 +1519,10 @@ Dual-channel ATA controller (PCI Bus 0, Dev 9) with standard I/O ports:
 - **Primary channel** (HDD): 0x1F0–0x1F7 (task file), 0x3F6 (control/alt status)
 - **Secondary channel** (DVD): 0x170–0x177 (task file), 0x376 (control/alt status)
 
-Task-file registers (R/W): Error, Features, Sector Count, LBA Low/Mid/High,
-Device/Head.  Status register is read-only; Command register is write-only
-(same port 0x1F7/0x177).
+**Architecture:** flat `uint8_t regs[9]` task-file register array per channel,
+indexed by port offset (0–8).  Named constants in `ide_tf::` namespace.
+Port 1 is dual-function: read = error, write = features (shared array slot).
+Port 7 is dual-function: read = status, write = command dispatch.
 
 **ATA commands handled:**
 
@@ -1530,6 +1560,11 @@ SET FEATURES, unknown command error, alternate status, and software reset.
 **SMBus Controller** ✅ DONE
 
 I/O ports 0xC000–0xC00F (MCPX), devices on the I²C bus:
+
+**Architecture:** flat `uint8_t regs[16]` array indexed by `(port & 0xF)`,
+with named constants in the `smbus::` namespace.  Reads return `regs[r]`,
+writes store `regs[r] = val`.  STATUS is W1C; CONTROL write triggers the
+SMBus transaction (auto-complete with status bit 4 set).
 
 - **EEPROM (24C02)** at address 0x54: 256-byte Xbox EEPROM with factory defaults
   — game region (NTSC-NA), serial number, MAC address, video standard

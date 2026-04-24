@@ -55,9 +55,10 @@ private:
     std::atomic<bool>       stop_flag{false};
 
     bool needs_processing() const {
-        return (nv2a->pfifo_cache1_dma_push & 1) &&
-               (nv2a->pfifo_cache1_push0 & 1) &&
-               (nv2a->pfifo_cache1_dma_get != nv2a->pfifo_cache1_dma_put);
+        return (nv2a->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
+               (nv2a->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] & 1) &&
+               (nv2a->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] !=
+                nv2a->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4]);
     }
 
     void run() {

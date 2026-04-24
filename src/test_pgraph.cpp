@@ -105,10 +105,10 @@ int main() {
     memcpy(ram + pos, &cull_face, 4); pos += 4;
 
     // --- Run the DMA pusher ---
-    nv2a.pfifo_cache1_dma_push = 1;
-    nv2a.pfifo_cache1_push0 = 1;
-    nv2a.pfifo_cache1_dma_get = pb_offset;
-    nv2a.pfifo_cache1_dma_put = pos;
+    nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
+    nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
+    nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = pb_offset;
+    nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = pos;
 
     // Tick multiple times to drain the push buffer.
     for (int i = 0; i < 10; i++)
@@ -129,9 +129,9 @@ int main() {
     CHECK(pgraph.reg(SET_CULL_FACE) == 0x0404, "cull_face == FRONT (0x0404)");
 
     // FIFO stats
-    CHECK(nv2a.fifo_methods_dispatched == pgraph.total_methods,
+    CHECK(nv2a.pfifo_regs[pfifo::EXT_METHODS / 4] == pgraph.total_methods,
           "fifo_methods == pgraph.total_methods");
-    CHECK(nv2a.pfifo_cache1_dma_get == pos, "DMA_GET == PUT (drained)");
+    CHECK(nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4] == pos, "DMA_GET == PUT (drained)");
 
     free(ram);
 

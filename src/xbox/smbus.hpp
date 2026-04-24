@@ -1,16 +1,30 @@
 #pragma once
 // SMBus controller stub — EEPROM, SMC, video encoders.
+//
+// Flat register array indexed by (port & 0xF), matching the PGRAPH/APU
+// pattern.  Named constants in the smbus:: namespace mirror Xbox SMBus
+// I/O port register layout.
 #include <cstdint>
 #include <cstring>
 
 namespace xbox {
 
+// ======================== SMBus Register Offsets ===========================
+// Port-relative offsets (port & 0xF).
+
+namespace smbus {
+static constexpr uint32_t STATUS  = 0x00;   // interrupt / completion status (W1C)
+static constexpr uint32_t CONTROL = 0x02;   // transaction trigger
+static constexpr uint32_t ADDRESS = 0x04;   // target device address + R/W bit
+static constexpr uint32_t DATA    = 0x06;   // data byte
+static constexpr uint32_t COMMAND = 0x08;   // SMBus command byte
+} // namespace smbus
+
+// =========================== SMBus State ==================================
+
 struct SmbusState {
-    uint8_t status  = 0;
-    uint8_t control = 0;
-    uint8_t address = 0;
-    uint8_t command = 0;
-    uint8_t data    = 0;
+    static constexpr uint32_t REG_COUNT = 16;
+    uint8_t regs[REG_COUNT] = {};
     uint8_t eeprom[256] = {};
 
     SmbusState() {
@@ -31,57 +45,58 @@ struct SmbusState {
     }
 };
 
+// ========================== I/O Handlers ==================================
+
 static uint32_t smbus_io_read(uint16_t port, unsigned /*size*/, void* user) {
     auto* s = static_cast<SmbusState*>(user);
-    switch (port & 0xF) {
-    case 0x00: return s->status;
-    case 0x02: return s->control;
-    case 0x04: return s->address;
-    case 0x06: return s->data;
-    case 0x08: return s->command;
-    default:   return 0;
-    }
+    uint32_t r = port & 0xF;
+    if (r < SmbusState::REG_COUNT) return s->regs[r];
+    return 0;
 }
 
 static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
     auto* s = static_cast<SmbusState*>(user);
-    switch (port & 0xF) {
-    case 0x00:
-        s->status &= ~(uint8_t)val;
+    uint32_t r = port & 0xF;
+    if (r >= SmbusState::REG_COUNT) return;
+
+    switch (r) {
+    case smbus::STATUS:
+        s->regs[r] &= ~(uint8_t)val;   // W1C
         return;
-    case 0x02: {
-        s->control = (uint8_t)val;
-        s->status |= 0x10;
-        uint8_t dev_addr = s->address >> 1;
-        bool is_read = (s->address & 1) != 0;
+    case smbus::CONTROL: {
+        s->regs[r] = (uint8_t)val;
+        s->regs[smbus::STATUS] |= 0x10; // transaction complete
+        uint8_t dev_addr = s->regs[smbus::ADDRESS] >> 1;
+        bool is_read = (s->regs[smbus::ADDRESS] & 1) != 0;
+        uint8_t cmd = s->regs[smbus::COMMAND];
 
         if (dev_addr == 0x54) {
-            if (is_read && s->command < sizeof(s->eeprom))
-                s->data = s->eeprom[s->command];
-            else if (!is_read && s->command < sizeof(s->eeprom))
-                s->eeprom[s->command] = s->data;
+            if (is_read && cmd < sizeof(s->eeprom))
+                s->regs[smbus::DATA] = s->eeprom[cmd];
+            else if (!is_read && cmd < sizeof(s->eeprom))
+                s->eeprom[cmd] = s->regs[smbus::DATA];
         } else if (dev_addr == 0x10) {
             if (is_read) {
-                switch (s->command) {
-                case 0x01: s->data = 0xD0; break;
-                case 0x03: s->data = 0x60; break;
-                case 0x09: s->data = 25;   break;
-                case 0x0A: s->data = 35;   break;
-                case 0x0F: s->data = 0x05; break;
-                case 0x11: s->data = 0x40; break;
-                default:   s->data = 0;    break;
+                switch (cmd) {
+                case 0x01: s->regs[smbus::DATA] = 0xD0; break;
+                case 0x03: s->regs[smbus::DATA] = 0x60; break;
+                case 0x09: s->regs[smbus::DATA] = 25;   break;
+                case 0x0A: s->regs[smbus::DATA] = 35;   break;
+                case 0x0F: s->regs[smbus::DATA] = 0x05; break;
+                case 0x11: s->regs[smbus::DATA] = 0x40; break;
+                default:   s->regs[smbus::DATA] = 0;    break;
                 }
             }
         } else if (dev_addr == 0x45) {
-            if (is_read) s->data = 0;
+            if (is_read) s->regs[smbus::DATA] = 0;
         } else if (dev_addr == 0x6A) {
-            if (is_read) s->data = 0;
+            if (is_read) s->regs[smbus::DATA] = 0;
         }
         return;
     }
-    case 0x04: s->address = (uint8_t)val; return;
-    case 0x06: s->data = (uint8_t)val;    return;
-    case 0x08: s->command = (uint8_t)val;  return;
+    default:
+        s->regs[r] = (uint8_t)val;
+        return;
     }
 }
 

@@ -1,5 +1,10 @@
 #pragma once
-// IDE (ATA) dual-channel controller — HDD + DVD with PIO data transfer.
+// ---------------------------------------------------------------------------
+// ide.hpp — IDE (ATA) dual-channel controller — HDD + DVD with PIO data
+// transfer.
+//
+// Flat task-file register array indexed by port offset (0-8), matching the
+// PGRAPH/APU pattern.  Named constants in the ide_tf:: namespace.
 //
 // Supports:
 //   - IDENTIFY DEVICE (0xEC) / IDENTIFY PACKET DEVICE (0xA1)
@@ -11,22 +16,45 @@
 //
 // Disk backing: set IdeChannel::image_data / image_size to a raw sector
 // image (512 bytes per sector).  No image = zero-fill on read, discard on write.
+// ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstring>
 
 namespace xbox {
 
+// ===================== ATA Task-File Register Offsets ======================
+// Port-relative offsets (0-8).  Ports 1 and 7 are dual-function:
+//   Port 1: read = ERROR, write = FEATURES (share same array slot).
+//   Port 7: read = STATUS, write dispatches command (STATUS stored in array).
+
+namespace ide_tf {
+static constexpr uint32_t DATA       = 0;   // 16-bit PIO data port
+static constexpr uint32_t ERR_FEAT   = 1;   // read: error; write: features
+static constexpr uint32_t SECT_COUNT = 2;
+static constexpr uint32_t LBA_LOW    = 3;
+static constexpr uint32_t LBA_MID    = 4;
+static constexpr uint32_t LBA_HIGH   = 5;
+static constexpr uint32_t DEVICE     = 6;
+static constexpr uint32_t STAT_CMD   = 7;   // read: status; write: command dispatch
+static constexpr uint32_t ALT_CTL    = 8;   // alternate status / device control
+} // namespace ide_tf
+
+// =========================== IDE Channel ===================================
+
 struct IdeChannel {
-    // Task-file registers
-    uint8_t  error      = 0x01;
-    uint8_t  features   = 0;
-    uint8_t  sect_count = 0x01;
-    uint8_t  lba_low    = 0x01;
-    uint8_t  lba_mid    = 0x00;
-    uint8_t  lba_high   = 0x00;
-    uint8_t  device     = 0x00;
-    uint8_t  status     = 0x50;
-    uint8_t  control    = 0x00;
+    // Task-file register array (indexed by port offset 0-8).
+    static constexpr uint32_t REG_COUNT = 9;
+    uint8_t regs[REG_COUNT] = {
+        0x00,   // DATA (unused as register; PIO handled separately)
+        0x01,   // ERROR
+        0x01,   // SECT_COUNT
+        0x01,   // LBA_LOW
+        0x00,   // LBA_MID
+        0x00,   // LBA_HIGH
+        0x00,   // DEVICE
+        0x50,   // STATUS (DRDY | DSC)
+        0x00,   // CONTROL
+    };
     bool     present    = false;
     uint8_t  identify[512] = {};
 
@@ -37,20 +65,18 @@ struct IdeChannel {
     uint8_t  sectors_left  = 0;   // sectors remaining for multi-sector commands
 
     // Backing disk image (raw sector image, no header).
-    // Caller owns the memory; nullptr = no backing (zero-fill reads, discard writes).
     uint8_t* image_data = nullptr;
-    uint64_t image_size = 0;       // bytes
+    uint64_t image_size = 0;
 
     static constexpr uint32_t SECTOR_SIZE = 512;
 
     uint32_t lba28() const {
-        return (uint32_t)lba_low |
-               ((uint32_t)lba_mid  << 8) |
-               ((uint32_t)lba_high << 16) |
-               ((uint32_t)(device & 0x0F) << 24);
+        return (uint32_t)regs[ide_tf::LBA_LOW] |
+               ((uint32_t)regs[ide_tf::LBA_MID]  << 8) |
+               ((uint32_t)regs[ide_tf::LBA_HIGH] << 16) |
+               ((uint32_t)(regs[ide_tf::DEVICE] & 0x0F) << 24);
     }
 
-    // Load the next sector from the image into data_buf.
     void load_sector(uint32_t lba) {
         uint64_t off = (uint64_t)lba * SECTOR_SIZE;
         if (image_data && off + SECTOR_SIZE <= image_size)
@@ -61,23 +87,23 @@ struct IdeChannel {
         data_len = SECTOR_SIZE;
     }
 
-    // Store the current data_buf to the image.
     void store_sector(uint32_t lba) {
         uint64_t off = (uint64_t)lba * SECTOR_SIZE;
         if (image_data && off + SECTOR_SIZE <= image_size)
             memcpy(image_data + off, data_buf, SECTOR_SIZE);
     }
 
-    // Advance to next sector in a multi-sector transfer (READ/WRITE SECTORS).
     void advance_sector() {
-        uint32_t lba = lba28();
-        lba++;
-        lba_low  = (uint8_t)(lba & 0xFF);
-        lba_mid  = (uint8_t)((lba >> 8) & 0xFF);
-        lba_high = (uint8_t)((lba >> 16) & 0xFF);
-        device   = (device & 0xF0) | (uint8_t)((lba >> 24) & 0x0F);
+        uint32_t lba = lba28() + 1;
+        regs[ide_tf::LBA_LOW]  = (uint8_t)(lba & 0xFF);
+        regs[ide_tf::LBA_MID]  = (uint8_t)((lba >> 8) & 0xFF);
+        regs[ide_tf::LBA_HIGH] = (uint8_t)((lba >> 16) & 0xFF);
+        regs[ide_tf::DEVICE]   = (regs[ide_tf::DEVICE] & 0xF0) |
+                                 (uint8_t)((lba >> 24) & 0x0F);
     }
 };
+
+// =========================== IDE State =====================================
 
 struct IdeState {
     IdeChannel primary;
@@ -85,10 +111,8 @@ struct IdeState {
 
     IdeState() {
         primary.present   = true;
-        primary.status    = 0x50;
         init_hdd_identify(primary);
         secondary.present = true;
-        secondary.status  = 0x50;
         init_dvd_identify(secondary);
     }
 
@@ -133,6 +157,8 @@ struct IdeState {
     }
 };
 
+// ========================== I/O Handlers ===================================
+
 static uint32_t ide_io_read(uint16_t port, unsigned size, void* user) {
     auto* ide = static_cast<IdeState*>(user);
     IdeChannel* ch;
@@ -154,32 +180,27 @@ static uint32_t ide_io_read(uint16_t port, unsigned size, void* user) {
         ch->data_pos += 2;
         ch->data_len -= 2;
         if (ch->data_len == 0) {
-            // Sector transfer complete.
             if (ch->sectors_left > 0) {
                 ch->sectors_left--;
                 if (ch->sectors_left > 0) {
-                    // More sectors: advance LBA and load next.
                     ch->advance_sector();
                     ch->load_sector(ch->lba28());
-                    ch->status = 0x58;  // DRDY | DSC | DRQ
+                    ch->regs[ide_tf::STAT_CMD] = 0x58;
                 } else {
-                    ch->status = 0x50;  // DRDY | DSC (transfer done)
+                    ch->regs[ide_tf::STAT_CMD] = 0x50;
                 }
             } else {
-                ch->status = 0x50;
+                ch->regs[ide_tf::STAT_CMD] = 0x50;
             }
         }
         return w;
     }
-    case 1: return ch->error;
-    case 2: return ch->sect_count;
-    case 3: return ch->lba_low;
-    case 4: return ch->lba_mid;
-    case 5: return ch->lba_high;
-    case 6: return ch->device;
-    case 7: return ch->status;
-    case 8: return ch->status;
-    default: return 0xFF;
+    case 7:
+    case 8:
+        return ch->regs[ide_tf::STAT_CMD];
+    default:
+        if (reg >= 1 && reg <= 6) return ch->regs[reg];
+        return 0xFF;
     }
 }
 
@@ -205,7 +226,6 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
         ch->data_pos += 2;
         ch->data_len -= 2;
         if (ch->data_len == 0) {
-            // Sector buffer full — write it out.
             ch->store_sector(ch->lba28());
             if (ch->sectors_left > 0) {
                 ch->sectors_left--;
@@ -214,70 +234,87 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
                     memset(ch->data_buf, 0, IdeChannel::SECTOR_SIZE);
                     ch->data_pos = 0;
                     ch->data_len = IdeChannel::SECTOR_SIZE;
-                    ch->status = 0x58;  // DRDY | DSC | DRQ
+                    ch->regs[ide_tf::STAT_CMD] = 0x58;
                 } else {
-                    ch->status = 0x50;  // DRDY | DSC (transfer done)
+                    ch->regs[ide_tf::STAT_CMD] = 0x50;
                 }
             } else {
-                ch->status = 0x50;
+                ch->regs[ide_tf::STAT_CMD] = 0x50;
             }
         }
         break;
     }
-    case 1: ch->features = v; break;
-    case 2: ch->sect_count = v; break;
-    case 3: ch->lba_low = v; break;
-    case 4: ch->lba_mid = v; break;
-    case 5: ch->lba_high = v; break;
-    case 6: ch->device = v; break;
+    case 1: case 2: case 3: case 4: case 5: case 6:
+        ch->regs[reg] = v;
+        break;
     case 7:
+        // Command dispatch — features value lives in regs[ERROR] slot.
         switch (v) {
         case 0xEC:  // IDENTIFY DEVICE
             memcpy(ch->data_buf, ch->identify, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
             ch->sectors_left = 0;
-            ch->status = 0x58; ch->error = 0;
+            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         case 0xA1:  // IDENTIFY PACKET DEVICE
             memcpy(ch->data_buf, ch->identify, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
             ch->sectors_left = 0;
-            ch->status = 0x58; ch->error = 0;
+            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         case 0x20: {  // READ SECTORS (PIO, LBA28)
-            uint8_t count = ch->sect_count;
-            if (count == 0) count = 1;  // 0 means 256, but clamp to 1 for safety
+            uint8_t count = ch->regs[ide_tf::SECT_COUNT];
+            if (count == 0) count = 1;
             ch->sectors_left = count;
             ch->load_sector(ch->lba28());
             ch->sectors_left--;
-            ch->status = 0x58; ch->error = 0;
+            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         }
         case 0x30: {  // WRITE SECTORS (PIO, LBA28)
-            uint8_t count = ch->sect_count;
+            uint8_t count = ch->regs[ide_tf::SECT_COUNT];
             if (count == 0) count = 1;
             ch->sectors_left = count;
             memset(ch->data_buf, 0, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
-            ch->status = 0x58; ch->error = 0;
+            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         }
-        case 0xEF: ch->status = 0x50; ch->error = 0; break;  // SET FEATURES
-        case 0x91: ch->status = 0x50; ch->error = 0; break;  // INIT DEV PARAMS
-        case 0xE7: ch->status = 0x50; ch->error = 0; break;  // FLUSH CACHE
-        default:   ch->status = 0x51; ch->error = 0x04; break;
+        case 0xEF:  // SET FEATURES
+            ch->regs[ide_tf::STAT_CMD] = 0x50;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
+            break;
+        case 0x91:  // INIT DEV PARAMS
+            ch->regs[ide_tf::STAT_CMD] = 0x50;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
+            break;
+        case 0xE7:  // FLUSH CACHE
+            ch->regs[ide_tf::STAT_CMD] = 0x50;
+            ch->regs[ide_tf::ERR_FEAT] = 0;
+            break;
+        default:
+            ch->regs[ide_tf::STAT_CMD] = 0x51;
+            ch->regs[ide_tf::ERR_FEAT] = 0x04;
+            break;
         }
         break;
     case 8:
-        ch->control = v;
+        ch->regs[ide_tf::ALT_CTL] = v;
         if (v & 0x04) {
-            ch->status = 0x50; ch->error = 0x01;
-            ch->sect_count = 0x01; ch->lba_low = 0x01;
-            ch->lba_mid = 0x00; ch->lba_high = 0x00;
-            ch->device = 0x00;
+            ch->regs[ide_tf::STAT_CMD]     = 0x50;
+            ch->regs[ide_tf::ERR_FEAT]      = 0x01;
+            ch->regs[ide_tf::SECT_COUNT] = 0x01;
+            ch->regs[ide_tf::LBA_LOW]    = 0x01;
+            ch->regs[ide_tf::LBA_MID]    = 0x00;
+            ch->regs[ide_tf::LBA_HIGH]   = 0x00;
+            ch->regs[ide_tf::DEVICE]     = 0x00;
         }
         break;
     }
