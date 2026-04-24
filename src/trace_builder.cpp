@@ -133,6 +133,19 @@ void popad_helper(GuestContext* ctx) {
     ctx->gp[GP_ESP] = esp;
 }
 
+// IRETD helper: pop EIP, CS, EFLAGS from guest stack (12 bytes).
+// Sets ctx->next_eip and ctx->eflags.  CS is ignored (flat model).
+void iret_helper(GuestContext* ctx) {
+    uint32_t esp = ctx->gp[GP_ESP];
+    uint32_t new_eip    = read_guest_mem32(ctx, esp); esp += 4;
+    /* uint32_t cs = */    read_guest_mem32(ctx, esp); esp += 4; // ignored
+    uint32_t new_eflags = read_guest_mem32(ctx, esp); esp += 4;
+    ctx->gp[GP_ESP] = esp;
+    ctx->next_eip   = new_eip;
+    // Preserve only safe flags (mask out VM, IOPL, VIF, VIP, RF):
+    ctx->eflags = (new_eflags & 0x003F7FD5u) | 0x02u; // bit 1 always set
+}
+
 // ---------------------------------------------------------------------------
 // String instruction helpers (MOVS/STOS/LODS/CMPS/SCAS).
 //
@@ -439,8 +452,17 @@ bool emit_handler_lea(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_mov_mem — MOV r,[m] / MOV [m],r / MOV [m],imm
+// emit_handler_mov_mem — MOV r,[m] / MOV [m],r / MOV [m],imm / MOV CRn,r
 // ---------------------------------------------------------------------------
+
+static bool is_control_register(ZydisRegister r) {
+    return r >= ZYDIS_REGISTER_CR0 && r <= ZYDIS_REGISTER_CR15;
+}
+
+static bool is_debug_register(ZydisRegister r) {
+    return r >= ZYDIS_REGISTER_DR0 && r <= ZYDIS_REGISTER_DR15;
+}
+
 bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
                           GuestContext* /*ctx*/, bool save_flags) {
@@ -1276,8 +1298,15 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             done_flag = true;
             switch (insn.mnemonic) {
             case ZYDIS_MNEMONIC_RET:
-            case ZYDIS_MNEMONIC_IRETD:
                 emit_ret_exit(e, ctx);
+                break;
+            case ZYDIS_MNEMONIC_IRETD:
+                // IRET: pop EIP, CS, EFLAGS via C helper
+                emit_save_all_gp(e);
+                emit_ccall_arg0_ctx(e);
+                emit_call_abs(e, reinterpret_cast<void*>(iret_helper));
+                // next_eip and eflags set by helper; just RET to trampoline
+                e.emit8(0xC3);
                 break;
             case ZYDIS_MNEMONIC_CALL:
                 emit_call_exit(e, insn, ops, pc_after, ctx);
@@ -1340,6 +1369,27 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             e.emit8(0xC3); // RET — run loop calls handle_privileged()
             done_flag = true;
             goto advance;
+        }
+
+        // ---- MOV CRn / MOV DRn — privileged, but shares MNEMONIC_MOV ----
+        if (insn.mnemonic == ZYDIS_MNEMONIC_MOV) {
+            bool has_cr_dr = false;
+            for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    (is_control_register(ops[i].reg.value) ||
+                     is_debug_register(ops[i].reg.value))) {
+                    has_cr_dr = true;
+                    break;
+                }
+            }
+            if (has_cr_dr) {
+                emit_save_all_gp(e);
+                emit_write_next_eip_imm(e, guest_pc);
+                emit_set_stop_reason(e, STOP_PRIVILEGED);
+                e.emit8(0xC3);
+                done_flag = true;
+                goto advance;
+            }
         }
 
         // ---- Dispatch table handler ----

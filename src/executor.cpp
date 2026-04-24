@@ -301,6 +301,60 @@ void XboxExecutor::handle_privileged() {
         return;
     }
 
+    case ZYDIS_MNEMONIC_MOV: {
+        // MOV CRn, r32  or  MOV r32, CRn
+        // ops[0] = destination, ops[1] = source
+        auto cr_to_ptr = [&](ZydisRegister r) -> uint32_t* {
+            switch (r) {
+            case ZYDIS_REGISTER_CR0: return &ctx.cr0;
+            case ZYDIS_REGISTER_CR2: return &ctx.cr2;
+            case ZYDIS_REGISTER_CR3: return &ctx.cr3;
+            case ZYDIS_REGISTER_CR4: return &ctx.cr4;
+            default: return nullptr;
+            }
+        };
+        auto gp_index = [](ZydisRegister r) -> int {
+            uint8_t enc;
+            return reg32_enc(r, enc) ? (int)enc : -1;
+        };
+
+        // MOV CRn, r32 (write to CR)
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint32_t* cr = cr_to_ptr(ops[0].reg.value);
+            int gp = gp_index(ops[1].reg.value);
+            if (cr && gp >= 0) {
+                *cr = ctx.gp[gp];
+                ctx.eip += insn.length;
+                return;
+            }
+            // MOV r32, CRn (read from CR)
+            cr = cr_to_ptr(ops[1].reg.value);
+            gp = gp_index(ops[0].reg.value);
+            if (cr && gp >= 0) {
+                ctx.gp[gp] = *cr;
+                ctx.eip += insn.length;
+                return;
+            }
+        }
+        fprintf(stderr, "[exec] unhandled MOV CR/DR at EIP=%08X\n", ctx.eip);
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_INVLPG:
+        // Stub: no paging yet, just advance EIP
+        ctx.eip += insn.length;
+        return;
+
+    case ZYDIS_MNEMONIC_WBINVD:
+    case ZYDIS_MNEMONIC_INVD:
+    case ZYDIS_MNEMONIC_CLTS:
+    case ZYDIS_MNEMONIC_LMSW:
+        // Stub: ignore cache/task state instructions
+        ctx.eip += insn.length;
+        return;
+
     case ZYDIS_MNEMONIC_OUT: {
         // OUT imm8, AL:   ops[0]=imm, ops[1]=reg(AL/AX/EAX)
         // OUT DX, AL:     ops[0]=DX,  ops[1]=reg(AL/AX/EAX)
