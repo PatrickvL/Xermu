@@ -115,18 +115,18 @@ int main() {
         nv2a.tick_fifo(ram, RAM_SIZE);
 
     // === Verify PGRAPH state ===
-    CHECK(pgraph.blend_enable == 1, "blend_enable == 1");
-    CHECK(pgraph.depth_test_enable == 1, "depth_test_enable == 1");
-    CHECK(pgraph.depth_func == 0x0203, "depth_func == LEQUAL (0x0203)");
-    CHECK(pgraph.surface_color_offset == 0x00100000, "surface_color_offset == 0x100000");
-    CHECK(pgraph.textures[0].offset == 0x00200000, "texture[0].offset == 0x200000");
-    CHECK(pgraph.textures[2].offset == 0x00300000, "texture[2].offset == 0x300000");
-    CHECK(pgraph.begin_end_mode == 0, "begin_end_mode == 0 (END)");
+    CHECK(pgraph.reg(SET_BLEND_ENABLE) == 1, "blend_enable == 1");
+    CHECK(pgraph.reg(SET_DEPTH_TEST_ENABLE) == 1, "depth_test_enable == 1");
+    CHECK(pgraph.reg(SET_DEPTH_FUNC) == 0x0203, "depth_func == LEQUAL (0x0203)");
+    CHECK(pgraph.reg(SET_SURFACE_COLOR_OFFSET) == 0x00100000, "surface_color_offset == 0x100000");
+    CHECK(pgraph.reg(SET_TEXTURE_OFFSET + 0*64) == 0x00200000, "texture[0].offset == 0x200000");
+    CHECK(pgraph.reg(SET_TEXTURE_OFFSET + 2*64) == 0x00300000, "texture[2].offset == 0x300000");
+    CHECK(pgraph.reg(SET_BEGIN_END) == 0, "begin_end_mode == 0 (END)");
     CHECK(pgraph.draw_count == 1, "draw_count == 1");
     CHECK(pgraph.clear_count == 1, "clear_count == 1");
-    CHECK(pgraph.clear_surface == 0xF0, "clear_surface == 0xF0");
-    CHECK(pgraph.cull_face_enable == 1, "cull_face_enable == 1");
-    CHECK(pgraph.cull_face == 0x0404, "cull_face == FRONT (0x0404)");
+    CHECK(pgraph.reg(CLEAR_SURFACE) == 0xF0, "clear_surface == 0xF0");
+    CHECK(pgraph.reg(SET_CULL_FACE_ENABLE) == 1, "cull_face_enable == 1");
+    CHECK(pgraph.reg(SET_CULL_FACE) == 0x0404, "cull_face == FRONT (0x0404)");
 
     // FIFO stats
     CHECK(nv2a.fifo_methods_dispatched == pgraph.total_methods,
