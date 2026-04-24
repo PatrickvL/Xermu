@@ -87,6 +87,7 @@ set(TEST_ASM_FILES
     tests/xbox.asm
     tests/hle.asm
     tests/linking.asm
+    tests/pic.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -117,7 +118,7 @@ if(NASM_EXECUTABLE)
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
-        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle")
+        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic")
             add_test(
                 NAME    ${test_name}
                 COMMAND test_runner --xbox ${bin_file}

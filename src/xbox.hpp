@@ -331,12 +331,147 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
 }
 
 // ============================= PIC (8259A) =================================
+// Dual 8259A PIC: master (ports 0x20-0x21), slave (ports 0xA0-0xA1).
+// Full ICW1-4 initialization sequence, IMR, IRR/ISR, OCW2/OCW3, cascade.
 
-static uint32_t pic_io_read(uint16_t /*port*/, unsigned /*size*/, void* /*user*/) {
-    return 0; // stub: no pending interrupts
+struct Pic8259 {
+    uint8_t irr         = 0;     // Interrupt Request Register
+    uint8_t imr         = 0xFF;  // Interrupt Mask Register (all masked)
+    uint8_t isr         = 0;     // In-Service Register
+    uint8_t vector_base = 0;     // ICW2: base vector (top 5 bits)
+    uint8_t icw3        = 0;     // ICW3: cascade config
+    bool    icw4_needed = false;
+    bool    auto_eoi    = false;
+    bool    read_isr    = false; // OCW3: read ISR (true) or IRR (false)
+    int     init_step   = 0;     // 0=operational, 1..3=expecting ICW2/3/4
+    bool    single_mode = false; // ICW1 bit 1: no slave
+
+    void raise(int line)  { irr |=  (1 << line); }
+    void lower(int line)  { irr &= ~(1 << line); }
+
+    bool has_pending() const { return (irr & ~imr & ~isr) != 0; }
+
+    int highest_pending() const {
+        uint8_t bits = irr & ~imr & ~isr;
+        if (!bits) return -1;
+        for (int i = 0; i < 8; ++i)
+            if (bits & (1 << i)) return i;
+        return -1;
+    }
+
+    uint8_t ack() {
+        int line = highest_pending();
+        if (line < 0) return vector_base;
+        irr &= ~(1 << line);
+        isr |=  (1 << line);
+        if (auto_eoi) isr &= ~(1 << line);
+        return uint8_t(vector_base + line);
+    }
+
+    void eoi() {
+        for (int i = 0; i < 8; ++i)
+            if (isr & (1 << i)) { isr &= ~(1 << i); return; }
+    }
+    void eoi_specific(int line) { isr &= ~(1 << line); }
+
+    void write(int port_off, uint8_t val) {
+        if (port_off == 0) {
+            if (val & 0x10) {                // ICW1
+                init_step   = 1;
+                irr = 0; isr = 0; imr = 0;
+                icw4_needed = (val & 0x01) != 0;
+                single_mode = (val & 0x02) != 0;
+                read_isr    = false;
+                return;
+            }
+            if ((val & 0x18) == 0x00) {      // OCW2
+                int cmd = (val >> 5) & 7;
+                if (cmd == 1) eoi();                     // non-specific EOI
+                else if (cmd == 3) eoi_specific(val & 7); // specific EOI
+                return;
+            }
+            if ((val & 0x18) == 0x08) {      // OCW3
+                if (val & 0x02) read_isr = (val & 0x01) != 0;
+                return;
+            }
+            return;
+        }
+        // port_off == 1
+        if (init_step == 1) {
+            vector_base = val & 0xF8;
+            init_step = single_mode ? (icw4_needed ? 3 : 0) : 2;
+            return;
+        }
+        if (init_step == 2) {
+            icw3 = val;
+            init_step = icw4_needed ? 3 : 0;
+            return;
+        }
+        if (init_step == 3) {
+            auto_eoi = (val & 0x02) != 0;
+            init_step = 0;
+            return;
+        }
+        imr = val;  // OCW1: write mask register
+    }
+
+    uint8_t read(int port_off) const {
+        if (port_off == 0) return read_isr ? isr : irr;
+        return imr;
+    }
+};
+
+struct PicPair {
+    Pic8259 master, slave;
+
+    // Raise a system IRQ line (0-15).
+    void raise_irq(int irq) {
+        if (irq < 8) { master.raise(irq); }
+        else          { slave.raise(irq - 8); master.raise(2); }
+    }
+    void lower_irq(int irq) {
+        if (irq < 8) { master.lower(irq); }
+        else {
+            slave.lower(irq - 8);
+            if (!slave.has_pending()) master.lower(2);
+        }
+    }
+
+    bool has_pending() const { return master.has_pending(); }
+
+    uint8_t ack() {
+        int line = master.highest_pending();
+        if (line == 2 && slave.has_pending()) {
+            // Cascade: master acknowledges IRQ 2, slave provides the vector.
+            master.irr &= ~(1 << 2);
+            master.isr |=  (1 << 2);
+            if (master.auto_eoi) master.isr &= ~(1 << 2);
+            return slave.ack();
+        }
+        return master.ack();
+    }
+};
+
+// I/O port handlers for PIC.
+static uint32_t pic_master_read(uint16_t port, unsigned /*size*/, void* user) {
+    return static_cast<PicPair*>(user)->master.read(port & 1);
 }
-static void pic_io_write(uint16_t, uint32_t, unsigned, void*) {
-    // stub: accept initialization commands silently
+static void pic_master_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
+    static_cast<PicPair*>(user)->master.write(port & 1, (uint8_t)val);
+}
+static uint32_t pic_slave_read(uint16_t port, unsigned /*size*/, void* user) {
+    return static_cast<PicPair*>(user)->slave.read(port & 1);
+}
+static void pic_slave_write(uint16_t port, uint32_t val, unsigned /*size*/, void* user) {
+    static_cast<PicPair*>(user)->slave.write(port & 1, (uint8_t)val);
+}
+
+// IRQ controller callbacks for Executor.
+static bool pic_irq_check(void* user) {
+    return static_cast<PicPair*>(user)->has_pending();
+}
+static uint8_t pic_irq_ack(void* user) {
+    return static_cast<PicPair*>(user)->ack();
 }
 
 // ============================= PIT (8254) ==================================
@@ -368,6 +503,7 @@ struct XboxHardware {
     FlashState  flash;
     PciState    pci;
     SmbusState  smbus;
+    PicPair     pic;
 };
 
 // Set up the Xbox MMIO map and I/O ports on an Executor.
@@ -397,10 +533,16 @@ inline XboxHardware* xbox_setup(Executor& exec) {
                  flash_read, flash_write, &hw->flash);
 
     // I/O ports
-    exec.register_io(0x20, pic_io_read, pic_io_write);         // PIC master
-    exec.register_io(0x21, pic_io_read, pic_io_write);
-    exec.register_io(0xA0, pic_io_read, pic_io_write);         // PIC slave
-    exec.register_io(0xA1, pic_io_read, pic_io_write);
+    exec.register_io(0x20, pic_master_read, pic_master_write, &hw->pic);
+    exec.register_io(0x21, pic_master_read, pic_master_write, &hw->pic);
+    exec.register_io(0xA0, pic_slave_read, pic_slave_write, &hw->pic);
+    exec.register_io(0xA1, pic_slave_read, pic_slave_write, &hw->pic);
+
+    // Connect PIC as the interrupt controller.
+    exec.irq_check = pic_irq_check;
+    exec.irq_ack   = pic_irq_ack;
+    exec.irq_user  = &hw->pic;
+
     exec.register_io(0x40, pit_io_read, pit_io_write);         // PIT ch0
     exec.register_io(0x43, pit_io_read, pit_io_write);         // PIT mode
     exec.register_io(0x61, sysctl_read, sysctl_write);         // System B
