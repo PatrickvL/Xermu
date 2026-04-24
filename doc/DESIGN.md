@@ -183,7 +183,7 @@ the call site:
 | Call site             | Guest produces flags? | PUSHFQ/POPFQ? | Bytes |
 |-----------------------|-----------------------|---------------|-------|
 | MOV [mem], reg/imm    | No                    | Skipped       | 12    |
-| ALU [mem] (ADD/SUB…)  | Yes                   | Emitted       | 16    |
+| ALU [mem] (ADD/SUB…)  | Yes                   | `!save_flags` | 12–16 |
 | SETcc/CMOVcc [mem]    | No (reads only)       | Emitted†      | 16    |
 | PUSH imm/reg          | No                    | Skipped       | 12    |
 | FPU/SSE [mem] store   | No (x86 flags)        | Skipped       | 12    |
@@ -191,6 +191,13 @@ the call site:
 
 † SETcc/CMOVcc: flags are live (just read by the instruction) and must survive
   to any subsequent flag-reading instruction in the trace.
+
+For ALU [mem] writes, `preserve_flags = !save_flags`: when the outer flag-save
+bracket is already active (protecting prior live flags from the CMP R14,R15
+clobber), the bump's own PUSHFQ/POPFQ is redundant — the outer POPFQ will
+restore flags anyway. When no outer bracket is present (full flag writers like
+ADD/SUB where prior flags are dead), the bump emits its own PUSHFQ/POPFQ to
+protect the new ALU result from SHR+INC. This avoids nested flag saves.
 
 **CMP/TEST [mem]**: These ALU instructions read memory but don't write back.
 The bump is correctly skipped for them (they are not stores).
