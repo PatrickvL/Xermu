@@ -55,6 +55,33 @@ static constexpr uint32_t EXT_CALLS       = 0x1F0C;  // call commands count
 
 namespace pvideo {
 static constexpr uint32_t INTR     = 0x100;    // PVIDEO interrupt status (W1C)
+static constexpr uint32_t INTR_EN  = 0x140;    // PVIDEO interrupt enable
+static constexpr uint32_t BUFFER   = 0x700;    // active buffer select (bit 4)
+static constexpr uint32_t STOP     = 0x704;    // stop overlay
+static constexpr uint32_t BASE0    = 0x900;    // buffer 0 base address
+static constexpr uint32_t BASE1    = 0x904;    // buffer 1 base address
+static constexpr uint32_t LIMIT0   = 0x908;    // buffer 0 limit
+static constexpr uint32_t LIMIT1   = 0x90C;    // buffer 1 limit
+static constexpr uint32_t LUMINANCE0 = 0x910;  // buffer 0 luminance range
+static constexpr uint32_t LUMINANCE1 = 0x914;  // buffer 1 luminance range
+static constexpr uint32_t CHROMINANCE0 = 0x918;// buffer 0 chrominance range
+static constexpr uint32_t CHROMINANCE1 = 0x91C;// buffer 1 chrominance range
+static constexpr uint32_t OFFSET0  = 0x920;    // buffer 0 offset
+static constexpr uint32_t OFFSET1  = 0x924;    // buffer 1 offset
+static constexpr uint32_t SIZE_IN0 = 0x928;    // buffer 0 input size
+static constexpr uint32_t SIZE_IN1 = 0x92C;    // buffer 1 input size
+static constexpr uint32_t POINT_IN0 = 0x930;   // buffer 0 input point
+static constexpr uint32_t POINT_IN1 = 0x934;   // buffer 1 input point
+static constexpr uint32_t DS_DX0   = 0x938;    // buffer 0 horizontal scale
+static constexpr uint32_t DS_DX1   = 0x93C;    // buffer 1 horizontal scale
+static constexpr uint32_t DT_DY0   = 0x940;    // buffer 0 vertical scale
+static constexpr uint32_t DT_DY1   = 0x944;    // buffer 1 vertical scale
+static constexpr uint32_t POINT_OUT0 = 0x948;  // buffer 0 output point
+static constexpr uint32_t POINT_OUT1 = 0x94C;  // buffer 1 output point
+static constexpr uint32_t SIZE_OUT0  = 0x950;  // buffer 0 output size
+static constexpr uint32_t SIZE_OUT1  = 0x954;  // buffer 1 output size
+static constexpr uint32_t FORMAT0  = 0x958;    // buffer 0 format (color, pitch)
+static constexpr uint32_t FORMAT1  = 0x95C;    // buffer 1 format
 } // namespace pvideo
 
 namespace ptimer {
@@ -98,7 +125,7 @@ struct Nv2aState {
     static constexpr uint32_t PMC_COUNT     = 0x400  / 4;  // 256 slots
     static constexpr uint32_t PBUS_COUNT    = 0x400  / 4;
     static constexpr uint32_t PFIFO_COUNT   = 0x2000 / 4;  // 2048 slots (0x002000-0x003FFF)
-    static constexpr uint32_t PVIDEO_COUNT  = 0x200  / 4;
+    static constexpr uint32_t PVIDEO_COUNT  = 0xA00  / 4;  // covers up to 0x960
     static constexpr uint32_t PTIMER_COUNT  = 0x800  / 4;
     static constexpr uint32_t PFB_COUNT     = 0x400  / 4;
     static constexpr uint32_t PGRAPH_COUNT  = 0x800  / 4;

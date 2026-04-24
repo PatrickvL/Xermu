@@ -281,6 +281,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing, JUMP, CALL/RETURN (8) | ✅ ALL PASS   |
 | `tests/ioapic.asm`   | I/O APIC: indirect regs, redir entries, RO bits (12) | ✅ ALL PASS   |
 | `tests/pci.asm`      | PCI config: BARs, IRQs, bridge, non-existent dev (18) | ✅ ALL PASS   |
+| `tests/pvideo.asm`   | NV2A PVIDEO: overlay buffer regs, scale, format (15) | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
