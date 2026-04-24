@@ -251,6 +251,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO, PGRAPH, PRAMDAC, PFB regs (13)   | ✅ ALL PASS   |
+| `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 
 ---
 
@@ -308,7 +309,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 23 suites, CMake integration
+- [x] NASM test infrastructure: 24 suites, CMake integration
 
 ---
 
@@ -554,6 +555,7 @@ Full codebase audit for correctness, efficiency, and consistency.  Fixes:
 | PUSH ESP / POP ESP emit host RSP instead of guest ESP | Host stack corruption; wrong value pushed/popped since ESP lives in `ctx->gp[4]` not a host register | C-helper `push_esp_helper` / `pop_esp_helper` that read/write `ctx->gp[GP_ESP]` directly |
 | `emit_ea_to_r14` with ESP base emits `LEA R14D,[RSP+disp]` | All `[ESP]` / `[ESP+N]` memory accesses use host RSP instead of guest ESP — widespread correctness failure | Load guest ESP from `ctx->gp[GP_ESP]` into R14, then `LEA R14D,[R14+disp]` for displacement |
 | MOV/ALU/LEA with ESP register operand executed natively on host RSP | `SUB ESP,N` / `ADD ESP,N` / `MOV ESP,r32` / `LEA ESP,[r+d]` corrupt host stack or produce wrong guest ESP | MOV ESP: read/write `ctx->gp[GP_ESP]` via `[R13+16]`. ALU ESP: load into R14, re-encode with R14, store back. LEA ESP: `emit_ea_to_r14` + `emit_store_r14_to_esp` |
+| ALU/MOVZX/MOVSX/CMOVcc with ESP in reg field + memory operand | `ADD [mem],ESP` / `ADD ESP,[mem]` / `MOVZX ESP,BYTE [mem]` use host RSP encoding (reg=4 in ModRM) | Load guest ESP into R8D, emit with R8 (REX.R+reg=0), store R8D back if ESP was destination. `MOV ESP,imm32` → `MOV DWORD [R13+16], imm32` |
 **Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
 12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
 (offset 120), right-shifts R14D (PA) by 12, and increments the version counter.

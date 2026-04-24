@@ -482,7 +482,8 @@ apply_segment:
 
 inline bool emit_rewrite_mem_to_fastmem(Emitter& e,
                                          const ZydisDecodedInstruction& insn,
-                                         const uint8_t* raw) {
+                                         const uint8_t* raw,
+                                         bool esp_in_r8 = false) {
     // 1. Copy legacy prefixes (skip address-size, segment overrides, REX)
     for (uint8_t i = 0; i < insn.raw.prefix_count; ++i) {
         uint8_t val = insn.raw.prefixes[i].value;
@@ -496,8 +497,9 @@ inline bool emit_rewrite_mem_to_fastmem(Emitter& e,
         e.emit8(val);
     }
 
-    // 2. Emit REX = 0x43 (REX.X=1 for R14, REX.B=1 for R12)
-    e.emit8(0x43);
+    // 2. Emit REX: 0x43 = REX.X(R14)+REX.B(R12)
+    //    When esp_in_r8: 0x47 = REX.R(R8)+REX.X(R14)+REX.B(R12)
+    e.emit8(esp_in_r8 ? 0x47u : 0x43u);
 
     // 3. Emit opcode escape bytes + opcode
     switch (insn.opcode_map) {
@@ -509,8 +511,10 @@ inline bool emit_rewrite_mem_to_fastmem(Emitter& e,
     }
     e.emit8(insn.opcode);
 
-    // 4. New ModRM: mod=00, reg=original reg field, rm=100 (SIB follows)
-    e.emit8(uint8_t((insn.raw.modrm.reg << 3) | 0x04));
+    // 4. New ModRM: mod=00, reg field, rm=100 (SIB follows)
+    //    When esp_in_r8: reg=0 (R8 low bits) instead of original reg field (4=RSP)
+    uint8_t reg = esp_in_r8 ? 0u : insn.raw.modrm.reg;
+    e.emit8(uint8_t((reg << 3) | 0x04));
 
     // 5. SIB: scale=0, index=R14(110), base=R12(100) = 0x34
     e.emit8(0x34);
@@ -588,18 +592,26 @@ inline void emit_fastmem_op(Emitter& e, uint8_t guest_enc,
 }
 
 // MOVZX r32, [R12+R14]  for 8/16-bit loads with zero-extension
-inline void emit_fastmem_movzx(Emitter& e, uint8_t guest_enc, unsigned src_bits) {
-    e.emit8(0x43); e.emit8(0x0F);
+// When esp_in_r8=true: use R8D as destination (REX.R=1, reg=0) for guest ESP.
+inline void emit_fastmem_movzx(Emitter& e, uint8_t guest_enc, unsigned src_bits,
+                                bool esp_in_r8 = false) {
+    uint8_t rex = esp_in_r8 ? 0x47u : 0x43u;
+    uint8_t enc = esp_in_r8 ? 0u : guest_enc;
+    e.emit8(rex); e.emit8(0x0F);
     e.emit8(src_bits == 8 ? 0xB6u : 0xB7u);
-    e.emit8(uint8_t((guest_enc << 3) | 4u));
+    e.emit8(uint8_t((enc << 3) | 4u));
     e.emit8(0x34);
 }
 
 // MOVSX r32, [R12+R14]  for 8/16-bit loads with sign-extension
-inline void emit_fastmem_movsx(Emitter& e, uint8_t guest_enc, unsigned src_bits) {
-    e.emit8(0x43); e.emit8(0x0F);
+// When esp_in_r8=true: use R8D as destination (REX.R=1, reg=0) for guest ESP.
+inline void emit_fastmem_movsx(Emitter& e, uint8_t guest_enc, unsigned src_bits,
+                                bool esp_in_r8 = false) {
+    uint8_t rex = esp_in_r8 ? 0x47u : 0x43u;
+    uint8_t enc = esp_in_r8 ? 0u : guest_enc;
+    e.emit8(rex); e.emit8(0x0F);
     e.emit8(src_bits == 8 ? 0xBEu : 0xBFu);
-    e.emit8(uint8_t((guest_enc << 3) | 4u));
+    e.emit8(uint8_t((enc << 3) | 4u));
     e.emit8(0x34);
 }
 
@@ -724,6 +736,24 @@ inline void emit_load_esp_to_r14(Emitter& e) {
 inline void emit_store_r14_to_esp(Emitter& e) {
     e.emit8(0x45); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
+    e.emit8(gp_offset(GP_ESP));
+}
+
+// Load ctx->esp into R8D (scratch for ESP-in-reg memory operations):
+//   MOV R8D, [R13 + gp_offset(GP_ESP)]
+//   REX=0x45 (REX.R R8, REX.B R13), 0x8B, mod=01 reg=0(R8&7) rm=5(R13&7), disp8
+inline void emit_load_esp_to_r8(Emitter& e) {
+    e.emit8(0x45); e.emit8(0x8B);
+    e.emit8(uint8_t(0x40u | (0u << 3) | 5u));
+    e.emit8(gp_offset(GP_ESP));
+}
+
+// Store R8D back to ctx->gp[GP_ESP]:
+//   MOV [R13 + gp_offset(GP_ESP)], R8D
+//   REX=0x45 (REX.R R8, REX.B R13), 0x89, mod=01 reg=0(R8&7) rm=5(R13&7), disp8
+inline void emit_store_r8_to_esp(Emitter& e) {
+    e.emit8(0x45); e.emit8(0x89);
+    e.emit8(uint8_t(0x40u | (0u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }
 

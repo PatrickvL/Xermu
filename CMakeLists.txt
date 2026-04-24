@@ -93,6 +93,7 @@ set(TEST_ASM_FILES
     tests/pcrtc.asm
     tests/smbus.asm
     tests/nv2a_gpu.asm
+    tests/esp_mem.asm
 )
 
 if(NASM_EXECUTABLE)
