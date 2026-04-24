@@ -424,7 +424,9 @@ a trap to the run loop.
 | MOV CRn, r / r, CRn | ✅ Read/write ctx->cr0/cr2/cr3/cr4              |
 | IN / OUT          | ✅ IoPortEntry dispatch table in Executor          |
 | LGDT / LIDT       | ✅ Update ctx->gdtr/idtr base/limit                |
-| LLDT / LTR        | Stub needed (not yet encountered)                  |
+| SGDT / SIDT       | ✅ Store gdtr/idtr to guest memory                 |
+| LLDT / LTR        | ✅ Load LDT/TSS selector into ctx                  |
+| SLDT / STR        | ✅ Store LDT/TSS selector from ctx                 |
 | CLI / STI         | ✅ Toggle ctx->virtual_if                          |
 | PUSHF / POPF      | ✅ Guest-stack handlers (IC_PUSHFD/IC_POPFD)       |
 | IRET              | ✅ Pop EIP/CS/EFLAGS via iret_helper               |
@@ -1543,7 +1545,7 @@ The executor supports two kernel modes, selectable at launch:
 | PE loader for xboxkrnl.exe | Medium | Planned |
 | MCPX/2BL boot chain (or entry shim) | Medium | Can skip ROM, jump to kernel entry |
 | OHCI USB controller stub | Medium | ✅ DONE |
-| More complete GDT/TSS handling | Easy | Partially done (LGDT, segment bases) |
+| More complete GDT/TSS handling | Easy | ✅ DONE |
 | MTRR MSRs | Easy | ✅ DONE |
 
 **Hybrid operation:** Both modes can coexist.  The LLE kernel runs natively,

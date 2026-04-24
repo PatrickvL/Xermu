@@ -72,6 +72,10 @@ struct alignas(16) GuestContext {
     uint64_t  mtrr_fix16k[2]   = {};  // MSR 0x258, 0x259
     uint64_t  mtrr_fix4k[8]    = {};  // MSR 0x268–0x26F
     uint64_t  mtrr_def_type    = 0x00000006; // MSR 0xFE (default = write-back)
+
+    // Task register and LDT selector (set by LTR / LLDT, read by STR / SLDT)
+    uint16_t  tr_sel   = 0;  // Task Register selector
+    uint16_t  ldtr_sel = 0;  // LDT Register selector
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);
