@@ -7,6 +7,7 @@
 enum StopReason : uint32_t {
     STOP_NONE       = 0,  // normal trace exit
     STOP_PRIVILEGED = 1,  // trace hit a privileged instruction (HLT/IN/OUT/...)
+    STOP_PAGE_FAULT = 2,  // VA→PA translation failed; CR2 set, run loop delivers #PF
 };
 
 // Host reserved registers during trace execution:

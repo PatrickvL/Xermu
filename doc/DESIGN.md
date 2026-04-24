@@ -413,7 +413,7 @@ a trap to the run loop.
 | CLI / STI         | ✅ Toggle ctx->virtual_if                          |
 | PUSHF / POPF      | ✅ Guest-stack handlers (IC_PUSHFD/IC_POPFD)       |
 | IRET              | ✅ Pop EIP/CS/EFLAGS via iret_helper               |
-| INVLPG            | ✅ Stub (no paging yet)                            |
+| INVLPG            | ✅ Flushes TLB entry for VA (§5.11)                |
 | WBINVD / INVD     | ✅ Stub                                            |
 | CLTS / LMSW       | ✅ Stub                                            |
 | CPUID             | ✅ Leaves 0 and 1 (vendor + features)              |
@@ -429,22 +429,66 @@ a trap to the run loop.
 
 Required to boot the Xbox kernel, which enables paging early in its startup.
 
-#### 5.11 Paging / Virtual Address Translation (CR0.PG)
-**Priority: CRITICAL for kernel** — The Xbox kernel runs with paging enabled.
-Every guest memory access must go through VA→PA translation when `CR0.PG=1`.
+#### 5.11 ~~Paging / Virtual Address Translation (CR0.PG)~~ ✅ DONE
+**Resolved.** Full 32-bit non-PAE page-table walk with 4 KB and 4 MB page support.
+Every guest memory access goes through VA→PA translation when `CR0.PG=1`.
 
-Design options:
-- **Software TLB**: maintain a `TLB[N]` of `{guest_va → guest_pa}` entries.
-  On every memory access, look up the TLB; on miss, walk guest page tables in
-  fastmem. The trace-emitted EA synthesis path becomes: compute guest VA → TLB
-  lookup → PA → fastmem/MMIO check. Adds latency but is correct and portable.
-- **Shadow page tables**: map a host VA region such that
-  `host_va = FASTMEM_BASE + shadow_pt(guest_va)`. When guest writes CR3 or
-  modifies PTEs, rebuild the shadow mapping. Guest VA accesses go through host
-  MMU — zero per-access overhead after shadow PT rebuild.
+**Implementation approach: JIT inline translate + C helper page walk**
 
-The software TLB approach is simpler to implement first; shadow PT can be added
-as an optimization later.
+When `CR0.PG` is set at trace-build time, the emitter inserts an inline
+`translate_va_jit()` C call after EA synthesis (before the CMP R14, R15 bounds
+check). The translate call:
+1. Saves guest RFLAGS and GP regs
+2. Calls `translate_va_jit(ctx, VA, is_write)` — a C-linkage page walker
+3. On success: `R14 = PA`, restores GP regs + RFLAGS, continues to fastmem path
+4. On fault: writes `STOP_PAGE_FAULT` + faulting EIP to ctx, restores state, RETs
+
+The run loop handles `STOP_PAGE_FAULT` by delivering `#PF` (vector 14) through IDT.
+
+**Key components:**
+
+- **`translate_va(va, is_write)`** (Executor member): Walks CR3 page directory →
+  page table in guest RAM. Supports 4 KB pages (PDE→PTE→PA) and 4 MB pages
+  (PDE.PS=1→PA). Checks Present and R/W bits. Sets Accessed/Dirty bits. Sets
+  CR2 to faulting VA on fault. Returns PA or `~0u` on fault.
+
+- **`translate_va_jit(ctx, va, is_write)`** (C-linkage, called from JIT): Same
+  page walk logic but reads CR3 and RAM pointer from GuestContext fields so it
+  can be called from JIT code with only a ctx pointer.
+
+- **`emit_translate_r14(e, is_write, fault_eip)`**: Emitter helper that generates
+  the inline PUSHFQ → save_gp → C call → check fault → MOV R14D,EAX → load_gp →
+  POPFQ sequence. Placed BEFORE `emit_save_flags` at each call site to keep the
+  stack clean on the fault exit path.
+
+- **`emit_paging_translate(e, is_write)`**: Wrapper; no-op when `e.paging` is false.
+
+- **CR0 write**: Flushes TLB and invalidates all cached traces (mode change makes
+  all emitted code stale — traces are built with a specific paging state).
+
+- **CR3 write**: Flushes TLB (`tlb.flush()`).
+
+- **INVLPG**: Computes EA from the instruction operand and calls `tlb.flush_va(ea)`.
+
+- **C helpers paging-aware**: All C-linkage helpers that access guest memory
+  (`pushfd_helper`, `popfd_helper`, `read_guest_mem32`, `write_guest_mem32`,
+  `xlatb_helper`, all string helpers, `deliver_interrupt` stack pushes, IDT reads)
+  call `guest_translate(ctx, addr, is_write)` which invokes `translate_va_jit`
+  when `CR0.PG` is set.
+
+- **EIP translation**: Run loop translates EIP VA→PA when paging is on before
+  passing to `builder.build()`. Instruction fetch page faults deliver `#PF`
+  (vector 14) with error code bit 4 (instruction fetch).
+
+**Performance note:** When paging is on, every JIT memory access incurs a C call
+for translation (PUSHFQ + save_gp + call + load_gp + POPFQ). This is correct
+but slower than the non-paging fast path. A future optimization could add an
+inline software TLB lookup in the JIT that avoids the C call on TLB hit.
+
+Test suite: `tests/paging.asm` — 9 assertions covering page table setup, paging
+enable, identity-mapped read/write, remapped page read/write (VA→different PA),
+PUSH/POP through paged stack, CALL/RET through paged stack, INVLPG + remap,
+and paging disable returning to flat mode.
 
 #### 5.12 ~~Interrupt / Exception Delivery~~ ✅ DONE
 **Resolved.** Full IDT-based interrupt delivery for software interrupts (INT n),

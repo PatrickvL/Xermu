@@ -33,6 +33,7 @@ struct Executor {
     TraceArena     arena;
     TraceBuilder   builder;
     PageVersions   pv;
+    SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
 
     // I/O port dispatch table (small fixed table — only a handful needed).
     static constexpr int MAX_IO_PORTS = 16;
@@ -73,6 +74,14 @@ struct Executor {
 
     // Raise a pending hardware IRQ line (checked at trace boundaries).
     void raise_irq(unsigned irq_line) { pending_irq |= (1u << irq_line); }
+
+    // Translate guest VA → PA via page-table walk (when CR0.PG=1).
+    // Returns PA on success, or ~0u on fault (sets CR2 and optionally
+    // delivers #PF).  `is_write` controls W/R bit in error code.
+    uint32_t translate_va(uint32_t va, bool is_write);
+
+    // Is paging currently enabled?
+    bool paging_enabled() const { return (ctx.cr0 & 0x80000000u) != 0; }
 };
 
 // ---------------------------------------------------------------------------

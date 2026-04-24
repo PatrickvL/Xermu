@@ -141,6 +141,7 @@ bool Executor::init(MmioMap* mmio) {
     ctx.virtual_if   = true;
     ctx.halted       = false;
     ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // SMC write-side
+    tlb.flush();
 
     // Initialize guest FPU state to clean defaults.
     // FCW = 0x037F: all x87 exceptions masked, double precision, round-nearest
@@ -340,6 +341,16 @@ void Executor::handle_privileged() {
             int gp = gp_index(ops[1].reg.value);
             if (cr && gp >= 0) {
                 *cr = ctx.gp[gp];
+                // Flush TLB on CR3 write; invalidate all traces on CR0 write
+                // (paging mode change makes all emitted code stale).
+                if (ops[0].reg.value == ZYDIS_REGISTER_CR3)
+                    tlb.flush();
+                if (ops[0].reg.value == ZYDIS_REGISTER_CR0) {
+                    tlb.flush();
+                    tcache.clear();
+                    cc.reset();
+                    arena.reset();
+                }
                 ctx.eip += insn.length;
                 return;
             }
@@ -357,10 +368,22 @@ void Executor::handle_privileged() {
         return;
     }
 
-    case ZYDIS_MNEMONIC_INVLPG:
-        // Stub: no paging yet, just advance EIP
+    case ZYDIS_MNEMONIC_INVLPG: {
+        // INVLPG m — invalidate TLB entry for the page containing EA.
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint32_t ea = 0;
+            if (ops[0].mem.disp.has_displacement)
+                ea = (uint32_t)ops[0].mem.disp.value;
+            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].mem.base, enc))
+                    ea += ctx.gp[enc];
+            }
+            tlb.flush_va(ea);
+        }
         ctx.eip += insn.length;
         return;
+    }
 
     case ZYDIS_MNEMONIC_WBINVD:
     case ZYDIS_MNEMONIC_INVD:
@@ -502,7 +525,16 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
         return;
     }
 
-    uint32_t desc_pa = ctx.idtr_base + idt_offset;
+    uint32_t desc_addr = ctx.idtr_base + idt_offset;
+    uint32_t desc_pa = desc_addr;
+    if (paging_enabled()) {
+        desc_pa = translate_va(desc_addr, false);
+        if (desc_pa == ~0u) {
+            fprintf(stderr, "[exec] IDT descriptor VA %08X page fault\n", desc_addr);
+            ctx.halted = true;
+            return;
+        }
+    }
     if (desc_pa + 8 > GUEST_RAM_SIZE) {
         fprintf(stderr, "[exec] IDT descriptor PA %08X out of range\n", desc_pa);
         ctx.halted = true;
@@ -532,13 +564,22 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
                           | 0x02u;  // bit 1 always set
     uint32_t esp = ctx.gp[GP_ESP];
 
-    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &saved_eflags, 4);
-    uint32_t cs_val = (uint32_t)selector;
-    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &cs_val, 4);
-    esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &return_eip, 4);
+    auto push32 = [&](uint32_t val) {
+        esp -= 4;
+        uint32_t pa = esp;
+        if (paging_enabled()) {
+            pa = translate_va(esp, true);
+            if (pa == ~0u) return; // page fault during push
+        }
+        if (pa < GUEST_RAM_SIZE) memcpy(ram + pa, &val, 4);
+    };
+
+    push32(saved_eflags);
+    push32((uint32_t)selector);
+    push32(return_eip);
 
     if (has_error) {
-        esp -= 4; if (esp < GUEST_RAM_SIZE) memcpy(ram + esp, &error_code, 4);
+        push32(error_code);
     }
 
     ctx.gp[GP_ESP] = esp;
@@ -549,6 +590,86 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
     }
 
     ctx.eip = handler;
+}
+
+// ---------------------------------------------------------------------------
+// VA → PA page-table walk (32-bit non-PAE, 4 KB pages).
+//
+// Page directory: 1024 × 4-byte entries at PA = CR3 & ~0xFFF.
+//   PDE[31:12] = page table PA base
+//   PDE[7]     = PS (page size): 1 = 4 MB page (direct map), 0 = 4 KB page table
+//   PDE[0]     = P (present)
+//
+// Page table (if PS=0): 1024 × 4-byte entries.
+//   PTE[31:12] = physical page base
+//   PTE[1]     = R/W (0 = read-only)
+//   PTE[0]     = P (present)
+//
+// Returns PA on success, ~0u on fault.
+// On fault: sets CR2 = faulting VA.  The caller should deliver #PF (vector 14)
+// with an appropriate error code.
+// ---------------------------------------------------------------------------
+
+uint32_t Executor::translate_va(uint32_t va, bool is_write) {
+    uint32_t pdir_pa = ctx.cr3 & 0xFFFFF000u;
+    uint32_t pdi     = (va >> 22) & 0x3FF;
+    uint32_t pti     = (va >> 12) & 0x3FF;
+
+    // Read PDE
+    uint32_t pde_pa = pdir_pa + pdi * 4;
+    if (pde_pa + 4 > GUEST_RAM_SIZE) goto fault;
+    uint32_t pde;
+    memcpy(&pde, ram + pde_pa, 4);
+
+    if (!(pde & 1)) goto fault; // not present
+
+    // 4 MB page (PS=1)?
+    if (pde & 0x80) {
+        // PA = PDE[31:22] << 22 | VA[21:0]
+        uint32_t pa = (pde & 0xFFC00000u) | (va & 0x003FFFFFu);
+        // Check write permission
+        if (is_write && !(pde & 2)) goto fault;
+        // Set accessed + dirty bits
+        if (!(pde & 0x20) || (is_write && !(pde & 0x40))) {
+            pde |= 0x20;  // accessed
+            if (is_write) pde |= 0x40;  // dirty
+            memcpy(ram + pde_pa, &pde, 4);
+        }
+        return pa;
+    }
+
+    // 4 KB page table
+    {
+        uint32_t pt_pa = (pde & 0xFFFFF000u) + pti * 4;
+        if (pt_pa + 4 > GUEST_RAM_SIZE) goto fault;
+        uint32_t pte;
+        memcpy(&pte, ram + pt_pa, 4);
+
+        if (!(pte & 1)) goto fault; // not present
+
+        if (is_write && !(pte & 2)) goto fault; // read-only
+
+        uint32_t pa = (pte & 0xFFFFF000u) | (va & 0xFFF);
+
+        // Set accessed + dirty bits
+        bool need_pde_update = !(pde & 0x20);
+        bool need_pte_update = !(pte & 0x20) || (is_write && !(pte & 0x40));
+        if (need_pde_update) {
+            pde |= 0x20;
+            memcpy(ram + pde_pa, &pde, 4);
+        }
+        if (need_pte_update) {
+            pte |= 0x20;
+            if (is_write) pte |= 0x40;
+            memcpy(ram + pt_pa, &pte, 4);
+        }
+
+        return pa;
+    }
+
+fault:
+    ctx.cr2 = va;
+    return ~0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,12 +698,26 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
         uint32_t eip = ctx.eip;
 
+        // When paging is enabled, translate EIP (VA) to PA for code fetch.
+        // The trace cache keys on the guest VA (ctx.eip).
+        uint32_t code_pa = eip;
+        if (paging_enabled()) {
+            code_pa = translate_va(eip, /*is_write=*/false);
+            if (code_pa == ~0u) {
+                // #PF on instruction fetch: deliver page fault (vector 14).
+                // Error code: bit 0=0 (not present), bit 2=0 (supervisor),
+                // bit 4=1 (instruction fetch).
+                deliver_interrupt(14, eip, /*has_error=*/true, /*error_code=*/0x10);
+                continue;
+            }
+        }
+
         // Lookup trace in cache.
         Trace* t = tcache.lookup(eip);
 
         // Validate: check page version for SMC.
         if (t && t->valid) {
-            if (pv.get(eip) != t->page_ver) {
+            if (pv.get(code_pa) != t->page_ver) {
                 tcache.invalidate(eip);
                 t = nullptr;
             }
@@ -592,12 +727,15 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
         // Build if missing.
         if (!t) {
-            t = builder.build(eip, ram, GUEST_RAM_SIZE,
+            t = builder.build(code_pa, ram, GUEST_RAM_SIZE,
                               cc, arena, pv, &ctx);
             if (!t) {
-                fprintf(stderr, "[exec] build failed at EIP=%08X — halting\n", eip);
+                fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;
             }
+            // Override guest_eip to store the VA (for cache lookup).
+            t->guest_eip = eip;
+            t->page_ver  = pv.get(code_pa);
             tcache.insert(t);
         }
 
@@ -613,6 +751,16 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Privileged instruction stop: decode and handle in the run loop.
         if (ctx.stop_reason == STOP_PRIVILEGED) {
             handle_privileged();
+            continue;
+        }
+
+        // Page fault during JIT memory access: deliver #PF (vector 14).
+        // translate_va_jit already set CR2 to the faulting VA.
+        if (ctx.stop_reason == STOP_PAGE_FAULT) {
+            // Error code: bit 0 = 0 (not present), bit 2 = 0 (supervisor).
+            // Full error code computation would check P, W/R, U/S bits;
+            // for now use 0 (not-present supervisor read).
+            deliver_interrupt(14, ctx.eip, /*has_error=*/true, /*error_code=*/0);
             continue;
         }
 
