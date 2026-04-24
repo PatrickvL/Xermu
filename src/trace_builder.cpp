@@ -186,6 +186,25 @@ uint32_t call_mem_helper(GuestContext* ctx, uint32_t pa, uint32_t retaddr) {
     return target;
 }
 
+// PUSH ESP helper: pushes pre-decrement ESP value onto the guest stack.
+// Guest ESP is NOT in a host register, so the generic PUSH r32 path would
+// incorrectly store the host RSP.  This helper reads old ESP from ctx,
+// decrements, and writes the old value — matching real x86 PUSH ESP semantics.
+void push_esp_helper(GuestContext* ctx) {
+    uint32_t old_esp = ctx->gp[GP_ESP];
+    uint32_t new_esp = old_esp - 4;
+    ctx->gp[GP_ESP] = new_esp;
+    write_guest_mem32(ctx, new_esp, old_esp);
+}
+
+// POP ESP helper: pops a 32-bit value from [old ESP] and sets ESP to that
+// value.  On real x86, the +4 from POP is overwritten by the popped value.
+void pop_esp_helper(GuestContext* ctx) {
+    uint32_t old_esp = ctx->gp[GP_ESP];
+    uint32_t val = read_guest_mem32(ctx, old_esp);
+    ctx->gp[GP_ESP] = val;
+}
+
 // PUSH [mem] helper: reads 32-bit value from `pa`, pushes onto guest stack.
 void push_mem_helper(GuestContext* ctx, uint32_t pa) {
     uint32_t val = read_guest_mem32(ctx, pa);
@@ -839,6 +858,19 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         uint8_t reg_enc = 0;
         if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
 
+        // PUSH ESP special case: ESP is not in a host register, so the
+        // generic fastmem_op path would incorrectly store host RSP.
+        // Delegate to a C helper that reads/writes ctx->gp[GP_ESP].
+        if (reg_enc == GP_ESP) {
+            if (save_flags) emit_save_flags(e);
+            emit_save_all_gp(e);
+            emit_ccall_arg0_ctx(e);
+            emit_call_abs(e, reinterpret_cast<void*>(push_esp_helper));
+            emit_load_all_gp(e);
+            if (save_flags) emit_restore_flags(e);
+            return true;
+        }
+
         emit_sub_ctx_esp(e, 4);
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
@@ -889,6 +921,19 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         uint8_t reg_enc = 0;
         if (!reg32_enc(ops[0].reg.value, reg_enc)) return false;
+
+        // POP ESP special case: ESP is not in a host register, so the
+        // generic fastmem_op path would incorrectly load into host RSP.
+        // On real x86, POP ESP sets ESP = [old ESP] (the +4 is overwritten).
+        if (reg_enc == GP_ESP) {
+            if (save_flags) emit_save_flags(e);
+            emit_save_all_gp(e);
+            emit_ccall_arg0_ctx(e);
+            emit_call_abs(e, reinterpret_cast<void*>(pop_esp_helper));
+            emit_load_all_gp(e);
+            if (save_flags) emit_restore_flags(e);
+            return true;
+        }
 
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/false);

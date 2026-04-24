@@ -238,7 +238,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
 | `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
-| `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC (33)    | ✅ ALL PASS   |
+| `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC/PUSH_ESP (39) | ✅ ALL PASS   |
 | `tests/smc.asm`       | Self-modifying code: patch imm/opcode/jmp/alu (11) | ✅ ALL PASS   |
 | `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
 | `tests/paging.asm`    | Page table walk, 4KB/4MB pages, INVLPG (9)         | ✅ ALL PASS   |
@@ -549,6 +549,7 @@ Full codebase audit for correctness, efficiency, and consistency.  Fixes:
 | IRETD exit missing `emit_load_all_gp` after C call | EAX/ECX/EDX corrupted by volatile-register clobber; trampoline saves junk to `ctx->gp[]` | Added `emit_load_all_gp(e)` + EFLAGS restore via `MOV R14D,[R13+36]; PUSH R14; POPFQ` before RET |
 | LOOPE/LOOPNE always branch to `taken_eip` | Incorrect control flow — ZF and ECX conditions ignored | Check original ZF (JNZ/JZ rel32) before DEC ECX; each path decrements ECX and branches correctly |
 | CALL direct/register write return address with no ESP bounds check | Host memory corruption if guest ESP is out of range | Added `CMP R14, R15; JAE` → UD2 guard before `emit_fastmem_store_imm32` |
+| PUSH ESP / POP ESP emit host RSP instead of guest ESP | Host stack corruption; wrong value pushed/popped since ESP lives in `ctx->gp[4]` not a host register | C-helper `push_esp_helper` / `pop_esp_helper` that read/write `ctx->gp[GP_ESP]` directly |
 **Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
 12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
 (offset 120), right-shifts R14D (PA) by 12, and increments the version counter.
