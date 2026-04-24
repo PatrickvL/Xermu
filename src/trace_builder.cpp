@@ -207,6 +207,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 // ---------------------------------------------------------------------------
 // emit_handler_alu_mem — ALU r,[m] / [m],r / [m],imm
 // For instructions with no mem operand (reg-reg), falls back to clean copy.
+// Memory forms use the generic rewriter to execute ALU on [R12+R14].
 // ---------------------------------------------------------------------------
 bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -217,70 +218,28 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         return emit_clean_insn(e, insn, ops, raw);
     }
 
-    // Find the register operand (if any)
-    int reg_idx = -1;
-    for (int i = 0; i < (int)insn.operand_count; ++i) {
-        if (i != mem_idx && ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            reg_idx = i;
-            break;
-        }
-    }
+    // Memory form: compute EA, bounds check, rewrite for fastmem
+    if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    if (save_flags) emit_save_flags(e);
+    emit_cmp_r14_r15(e);
+    uint8_t* slow_site = emit_jae_fwd(e);
 
-    if (reg_idx >= 0) {
-        // ALU reg, [mem]  or  ALU [mem], reg
-        uint8_t guest_enc = 0;
-        if (!reg32_enc(ops[reg_idx].reg.value, guest_enc)) return false;
-        bool is_load = (mem_idx != 0); // reg is dest → load from mem first
-        // Load the memory operand into guest_enc, then re-emit the instruction
-        // as a reg-reg form? No — we need to do the ALU on the fastmem directly.
-        // Strategy: load mem→R14 scratch, copy to temp, do ALU in-place.
-        // Simpler: load mem value to a temp reg, then do ALU reg,reg form.
-        //
-        // Actually, the simplest correct approach:
-        //   1. Load EA → R14
-        //   2. fastmem/MMIO dispatch to read/write through guest_enc
-        //   3. Then execute the original instruction verbatim on register results
-        //
-        // BUT: the original insn operates on [mem] which we can't directly use.
-        // The proven approach from emit_mem_dispatch: we emit the data transfer
-        // (load or store) through fastmem, and the guest register already holds
-        // the correct value. For ALU though, we need the full ALU operation.
-        //
-        // For ALU [mem], reg (store-form read-modify-write):
-        //   We need: read [mem], ALU with reg, write [mem]. Too complex for inline.
-        //   Fall back to: not supported for now for RMW mem forms.
-        //
-        // For ALU reg, [mem] (load-form):
-        //   Load [mem] into a scratch, MOV reg, ALU_result. Also complex.
-        //
-        // The simple correct solution that works for most real cases:
-        // For CMP/TEST reg,[mem] — read-only, just load the mem into a scratch
-        // and re-emit the instruction with the scratch. But CMP has its own
-        // operand encoding...
-        //
-        // Actually, the cleanest approach that matches what was already working:
-        // emit_mem_dispatch loads/stores the register through fastmem. This works
-        // for MOV but not for ALU, because ALU needs the operation to happen.
-        //
-        // Let's use the robust approach: just do the fastmem load/store through
-        // the existing path. For ALU reg, [mem]: load mem→reg (fastmem), then
-        // the original instruction is already in the pipeline? No — the original
-        // instruction is the ALU, not a MOV.
-        //
-        // OK, the correct minimal approach:
-        // - We don't inline the ALU. We load from memory, then emit a reg-reg
-        //   version of the same ALU.
-        return emit_fastmem_dispatch(e, ops[mem_idx], guest_enc,
-                                      insn.operand_width, is_load, save_flags);
-    }
+    // Fast path: rewrite the instruction to use [R12+R14]
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    uint8_t* done_site = emit_jmp_fwd(e);
 
-    // ALU [mem], imm — read-modify-write with immediate
-    // For now, fall through as unsupported
-    return false;
+    // Slow path: MMIO not supported for ALU-mem — UD2 trap
+    Emitter::patch_rel32(slow_site, e.cur());
+    e.emit8(0x0F); e.emit8(0x0B); // UD2
+
+    Emitter::patch_rel32(done_site, e.cur());
+    if (save_flags) emit_restore_flags(e);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // emit_handler_test_mem — TEST r,[m] / [m],r  (read-only)
+// Memory forms use the generic rewriter.
 // ---------------------------------------------------------------------------
 bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -290,12 +249,24 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         e.copy(raw, insn.length);
         return true;
     }
-    // TEST reg, [mem] — same as MOV-style load, then reg-reg TEST is implicit
-    // in the flag result. But we need to actually DO the TEST.
-    // For now, treat like ALU — the MOV dispatch loads the value, but we lose
-    // the TEST operation. This is a limitation to address later with full
-    // ALU-mem support.
-    return false;
+
+    // Memory form: compute EA, bounds check, rewrite for fastmem
+    if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+    if (save_flags) emit_save_flags(e);
+    emit_cmp_r14_r15(e);
+    uint8_t* slow_site = emit_jae_fwd(e);
+
+    // Fast path: rewrite the instruction to use [R12+R14]
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    uint8_t* done_site = emit_jmp_fwd(e);
+
+    // Slow path: UD2
+    Emitter::patch_rel32(slow_site, e.cur());
+    e.emit8(0x0F); e.emit8(0x0B); // UD2
+
+    Emitter::patch_rel32(done_site, e.cur());
+    if (save_flags) emit_restore_flags(e);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +825,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
         if (icf & ICF_PRIVILEGED) {
             emit_save_all_gp(e);
             emit_write_next_eip_imm(e, guest_pc);
-            e.emit8(0x0F); e.emit8(0x0B); // UD2 → executor signal handler
+            emit_set_stop_reason(e, STOP_PRIVILEGED);
+            e.emit8(0xC3); // RET — run loop calls handle_privileged()
             done_flag = true;
             goto advance;
         }

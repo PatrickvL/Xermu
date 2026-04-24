@@ -19,18 +19,23 @@ set(ZYDIS_FEATURE_ENCODER   OFF CACHE BOOL "" FORCE)
 set(ZYDIS_MINIMAL_MODE      OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zydis)
 
-set(SOURCES
+# ---------------------------------------------------------------------------
+# Common source files (shared between executables)
+# ---------------------------------------------------------------------------
+set(COMMON_SOURCES
     src/trace_builder.cpp
     src/executor.cpp
-    src/main.cpp
 )
 
 if(MSVC)
     enable_language(ASM_MASM)
-    list(APPEND SOURCES src/dispatch_trace.asm)
+    list(APPEND COMMON_SOURCES src/dispatch_trace.asm)
 endif()
 
-add_executable(xbox_executor ${SOURCES})
+# ---------------------------------------------------------------------------
+# Main executable (self-tests with embedded byte arrays)
+# ---------------------------------------------------------------------------
+add_executable(xbox_executor ${COMMON_SOURCES} src/main.cpp)
 target_include_directories(xbox_executor PRIVATE src)
 target_link_libraries(xbox_executor PRIVATE Zydis)
 
@@ -41,4 +46,70 @@ else()
     if(UNIX)
         target_link_libraries(xbox_executor PRIVATE m)
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Test runner executable (loads flat 32-bit .bin files)
+# ---------------------------------------------------------------------------
+add_executable(test_runner ${COMMON_SOURCES} src/test_runner.cpp)
+target_include_directories(test_runner PRIVATE src)
+target_link_libraries(test_runner PRIVATE Zydis)
+
+if(MSVC)
+    target_compile_options(test_runner PRIVATE /W3)
+else()
+    target_compile_options(test_runner PRIVATE -Wall -Wextra -O2)
+    if(UNIX)
+        target_link_libraries(test_runner PRIVATE m)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# NASM test binary assembly (optional — only if NASM is installed)
+# ---------------------------------------------------------------------------
+find_program(NASM_EXECUTABLE nasm)
+
+set(TEST_ASM_FILES
+    tests/alu.asm
+    tests/memory.asm
+    tests/flow.asm
+    tests/fpu.asm
+)
+
+if(NASM_EXECUTABLE)
+    message(STATUS "Found NASM: ${NASM_EXECUTABLE}")
+
+    set(TEST_BINS "")
+    foreach(asm_file ${TEST_ASM_FILES})
+        get_filename_component(test_name ${asm_file} NAME_WE)
+        set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
+        add_custom_command(
+            OUTPUT  ${bin_file}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/tests
+            COMMAND ${NASM_EXECUTABLE} -f bin
+                    -I${CMAKE_CURRENT_SOURCE_DIR}/tests/
+                    -o ${bin_file}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${asm_file}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${asm_file}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/harness.inc
+            COMMENT "Assembling ${asm_file} → ${test_name}.bin"
+        )
+        list(APPEND TEST_BINS ${bin_file})
+    endforeach()
+
+    add_custom_target(test_bins ALL DEPENDS ${TEST_BINS})
+
+    # CTest integration
+    enable_testing()
+    foreach(asm_file ${TEST_ASM_FILES})
+        get_filename_component(test_name ${asm_file} NAME_WE)
+        set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
+        add_test(
+            NAME    ${test_name}
+            COMMAND test_runner ${bin_file}
+        )
+    endforeach()
+else()
+    message(WARNING "NASM not found — NASM test binaries will not be assembled. "
+                    "Install NASM to enable: https://www.nasm.us/")
 endif()
