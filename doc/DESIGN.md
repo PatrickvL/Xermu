@@ -72,7 +72,7 @@ During trace execution, four host registers are pinned:
 | R12      | `fastmem_base` — host pointer to guest PA 0          |
 | R13      | `GuestContext*` — executor context pointer            |
 | R14      | EA scratch — used for address computation staging     |
-| R15      | `ram_size` — comparison threshold for fastmem check   |
+| R15      | `ram_size` — fastmem window size (320 MB with aliasing, 128 MB fallback) |
 
 This eliminates bounds-check overhead: every memory access is a CMP + conditional
 branch to a slow path, with the fast path being a single `[R12 + R14]` dereference.
@@ -213,7 +213,7 @@ The bump is correctly skipped for them (they are not stores).
 | File                  | Purpose                                        | Status        |
 |-----------------------|------------------------------------------------|---------------|
 | `CMakeLists.txt`      | Build config, Zydis fetch, MASM for MSVC       | ✅ Working    |
-| `platform.hpp`        | OS memory allocation (RWX + RW)                | ✅ Working    |
+| `platform.hpp`        | OS memory allocation (RWX + RW), aliased fastmem window   | ✅ Working    |
 | `context.hpp`         | `GuestContext` struct, register indices         | ✅ Working    |
 | `mmio.hpp`            | MMIO region dispatch table                     | ✅ Working    |
 | `code_cache.hpp`      | 32 MB executable slab allocator                | ✅ Working    |
@@ -1576,11 +1576,46 @@ Link slot layout per trace:
 | `target_eip`| `uint32_t`| Guest EIP this exit targets              |
 | `linked`    | `bool`    | `true` if patched to a real target trace |
 
-#### 5.22 ~~Fastmem Window (4 GB VA Reservation)~~ — Rejected
-Rejected: guard-page / VEH-based MMIO dispatch contradicts the core design
-principle (§2.3 — "No Guard Pages"). The inline CMP R14,R15 + JAE slow_path
-pattern is the correct approach: every memory access is rewritten at JIT time
-with no OS exception handling in the hot path.
+#### 5.22 Fastmem Aliased Window ✅ DONE
+
+The original design rejected a 4 GB guard-page / VEH-based fastmem window
+(§2.3 — "No Guard Pages").  The inline `CMP R14, R15; JAE slow_path` pattern
+remains the correct approach.  However, the NV2A tiling mirror region at
+PA `0x0C000000`–`0x13FFFFFF` aliases main RAM, and with `R15 = GUEST_RAM_SIZE`
+(128 MB = `0x08000000`), every mirror access fell through to the MMIO slow path —
+a significant penalty for framebuffer / texture operations.
+
+**Solution: Aliased fastmem window (320 MB).**
+
+The fastmem window is enlarged to `FASTMEM_WINDOW_SIZE = 0x14000000` (320 MB) and
+backed by platform memory aliasing so the mirror region maps to the same physical
+pages as main RAM with zero overhead:
+
+```
+Offset          Size     Contents
+──────────────  ───────  ────────────────────────────────────
+0x00000000      128 MB   Main RAM (shared-memory section)
+0x08000000       64 MB   Gap (committed zero-fill, no devices)
+0x0C000000       64 MB   Mirror alias #1 → backing[0, 64 MB)
+0x10000000       64 MB   Mirror alias #2 → backing[0, 64 MB)
+```
+
+`R15 = FASTMEM_WINDOW_SIZE` (320 MB) so `CMP R14, R15` passes for both main RAM
+and mirror accesses, resolving to `OP [R12 + R14]` — a direct host dereference
+with ~3 cycle overhead.  Addresses above 320 MB (NV2A MMIO at `0xFD000000`,
+APU at `0xFE800000`, etc.) correctly take the MMIO slow path.
+
+**Platform implementation** (`platform.hpp`):
+
+| Platform       | Backing                  | Aliasing mechanism                                     |
+|----------------|--------------------------|--------------------------------------------------------|
+| Windows 10+    | `CreateFileMappingW`     | `VirtualAlloc2` placeholder + `MapViewOfFile3` per-region |
+| Linux          | `memfd_create`           | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
+| macOS / BSD    | `shm_open` + `unlink`   | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
+
+Windows APIs are resolved at runtime via `GetProcAddress` (from `kernelbase.dll`)
+so the emulator links against plain `kernel32.lib` and gracefully falls back to
+a plain `VirtualAlloc` allocation (with MMIO mirror dispatch) on older Windows.
 
 #### 5.23 ~~Trace Cache Improvements~~ ✅ DONE
 - Two-level direct-mapped cache: `page_map[(eip>>12) & L1_MASK][(eip & 0xFFF) >> 1]`
@@ -1613,7 +1648,7 @@ The executor provides containment of ring-0 guest code essentially for free:
 
 | Escape Vector | Mitigation |
 |---|---|
-| Raw memory write to host VA | Fastmem window containment; PA >= ram_size → MMIO dispatch |
+| Raw memory write to host VA | Fastmem window containment; PA >= ram_size (320 MB) → MMIO dispatch |
 | RDMSR/WRMSR to control host MSRs | All MSR access dispatched through thunk |
 | LGDT/LIDT to install real IDT | Thunk updates `ctx->idtr_base` only |
 | CLI/STI to mask host interrupts | Toggle `ctx->virtual_if` (virtual) |

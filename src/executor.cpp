@@ -126,7 +126,15 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
 // ---------------------------------------------------------------------------
 
 bool Executor::init(MmioMap* mmio) {
-    ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
+    // Try aliased fastmem window: main RAM at offset 0, mirror at 0x0C000000.
+    fastmem_window = platform::alloc_fastmem_window(FASTMEM_WINDOW_SIZE,
+                                                     GUEST_RAM_SIZE);
+    if (fastmem_window.base) {
+        ram = static_cast<uint8_t*>(fastmem_window.base);
+    } else {
+        // Fallback: plain allocation (mirror goes through MMIO slow path).
+        ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
+    }
     if (!ram) return false;
     memset(ram, 0xCC, GUEST_RAM_SIZE); // INT3 fill (debug aid)
 
@@ -134,7 +142,9 @@ bool Executor::init(MmioMap* mmio) {
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.fastmem_base = (uint64_t)(uintptr_t)ram;
-    ctx.ram_size     = GUEST_RAM_SIZE;
+    // If aliased window is active, ram_size covers the full window (including mirror).
+    // Otherwise, only the plain RAM size.
+    ctx.ram_size     = fastmem_window.base ? FASTMEM_WINDOW_SIZE : GUEST_RAM_SIZE;
     ctx.mmio         = mmio;
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
@@ -156,7 +166,12 @@ bool Executor::init(MmioMap* mmio) {
 
 void Executor::destroy() {
     cc.destroy();
-    if (ram) { platform::free_ram(ram, GUEST_RAM_SIZE); ram = nullptr; }
+    if (fastmem_window.base) {
+        platform::free_fastmem_window(fastmem_window);
+    } else if (ram) {
+        platform::free_ram(ram, GUEST_RAM_SIZE);
+    }
+    ram = nullptr;
 }
 
 void Executor::load_guest(uint32_t pa, const void* src, size_t size) {

@@ -10,6 +10,11 @@
 // Maximum guest RAM: 128 MB (e.g. Xbox devkit had 128 MB, retail 64 MB).
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
+// Fastmem window: covers 0x00000000–0x13FFFFFF (320 MB) so that both
+// main RAM (0x00000000) and the NV2A tiling mirror (0x0C000000) are
+// within the fast CMP R14,R15 / OP [R12+R14] path.
+static constexpr uint32_t FASTMEM_WINDOW_SIZE = 0x14000000u; // 320 MB
+
 // ---------------------------------------------------------------------------
 // I/O port dispatch — callbacks for IN/OUT handled by the executor.
 // ---------------------------------------------------------------------------
@@ -27,6 +32,7 @@ struct IoPortEntry {
 struct Executor {
     GuestContext   ctx {};
     uint8_t*       ram  = nullptr;   // guest physical RAM [0 .. GUEST_RAM_SIZE)
+    platform::AliasedWindow fastmem_window;  // aliased fastmem (RAM + mirror)
 
     CodeCache      cc;
     TraceCache     tcache;
