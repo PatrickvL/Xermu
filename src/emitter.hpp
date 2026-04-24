@@ -308,6 +308,9 @@ inline void emit_epilog_conditional(Emitter& e,
 // R14 = register 14: reg field = R14&7 = 6, requires REX.R=1 → REX base 0x44
 // All guest base/index are EAX–EDI (indices 0-7), no REX.B/REX.X needed.
 // ---------------------------------------------------------------------------
+// Forward declarations for helpers used in emit_ea_to_r14 (defined below).
+inline void emit_load_esp_to_r14(Emitter& e);
+inline void emit_store_r14_to_esp(Emitter& e);
 
 inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
     assert(op.type == ZYDIS_OPERAND_TYPE_MEMORY);
@@ -346,18 +349,27 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         uint8_t base_enc;
         if (!reg32_enc(m.base, base_enc)) return false;
 
+        // ESP special: guest ESP is NOT in a host register; read from ctx.
+        if (base_enc == 4) {
+            emit_load_esp_to_r14(e); // R14D = ctx->gp[GP_ESP]
+            if (has_disp && disp != 0) {
+                // LEA R14D, [R14+disp]  (no flags clobbered)
+                // R14 as both src and dst: REX.R=1 REX.B=1 → 0x45
+                bool d8 = (disp >= -128 && disp <= 127);
+                uint8_t mod = d8 ? 1u : 2u;
+                e.emit8(0x45); e.emit8(0x8D);
+                e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | R14_REG));
+                if (d8) e.emit8((uint8_t)(int8_t)disp);
+                else    e.emit32((uint32_t)disp);
+            }
+            goto apply_segment;
+        }
+
         if (!has_disp || disp == 0) {
             // EBP special: mod=00 rm=101 means disp32-only, force mod=01 disp8=0
             if (base_enc == 5) {
                 e.emit8(REX_R14); e.emit8(0x8D);
                 e.emit8(uint8_t(0x40u | (R14_REG << 3) | 5u)); e.emit8(0);
-                goto apply_segment;
-            }
-            // ESP special: rm=100 requires SIB
-            if (base_enc == 4) {
-                e.emit8(REX_R14); e.emit8(0x8D);
-                e.emit8(uint8_t((R14_REG << 3) | 4u)); // mod=00 rm=4
-                e.emit8(0x24); // SIB: scale=0 index=4(none) base=4(ESP)
                 goto apply_segment;
             }
             // Simple: MOV R14D, base_reg  (mod=11)
@@ -369,14 +381,8 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         bool d8   = (disp >= -128 && disp <= 127);
         uint8_t mod = d8 ? 1 : 2;
 
-        if (base_enc == 4) { // ESP + disp → SIB
-            e.emit8(REX_R14); e.emit8(0x8D);
-            e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u));
-            e.emit8(0x24);
-        } else {
-            e.emit8(REX_R14); e.emit8(0x8D);
-            e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | base_enc));
-        }
+        e.emit8(REX_R14); e.emit8(0x8D);
+        e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | base_enc));
         if (d8) e.emit8((uint8_t)(int8_t)disp);
         else    e.emit32((uint32_t)disp);
         goto apply_segment;
@@ -408,6 +414,26 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
 
         uint8_t base_enc;
         if (!reg32_enc(m.base, base_enc)) return false;
+
+        // ESP as base: load guest ESP into R14 first, then use R14 as base.
+        if (base_enc == 4) {
+            emit_load_esp_to_r14(e); // R14D = ctx->gp[GP_ESP]
+            // LEA R14D, [R14 + index*scale + disp]
+            // REX: R14 dest (REX.R=1), R14 base (REX.B=1), index is 0-7 (REX.X=0)
+            uint8_t sib_r14 = uint8_t((scale_enc << 6) | (index_enc << 3) | (R14_REG));
+            uint8_t mod;
+            if (!has_disp || disp == 0)
+                mod = 0;
+            else
+                mod = (disp >= -128 && disp <= 127) ? 1u : 2u;
+            // R14 as both reg and base: REX = 0x45 (REX.R + REX.B)
+            e.emit8(0x45); e.emit8(0x8D);
+            e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u)); // rm=4 → SIB
+            e.emit8(sib_r14);
+            if      (mod == 1) e.emit8((uint8_t)(int8_t)(has_disp ? disp : 0));
+            else if (mod == 2) e.emit32((uint32_t)disp);
+            goto apply_segment;
+        }
 
         uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | base_enc);
 
@@ -688,6 +714,15 @@ inline void emit_add_ctx_esp(Emitter& e, uint8_t amount) {
 //   REX=0x45 (REX.R R14, REX.B R13), 0x8B, mod=01 reg=6(R14&7) rm=5(R13&7), disp8
 inline void emit_load_esp_to_r14(Emitter& e) {
     e.emit8(0x45); e.emit8(0x8B);
+    e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
+    e.emit8(gp_offset(GP_ESP));
+}
+
+// Store R14D back to ctx->gp[GP_ESP]:
+//   MOV [R13 + gp_offset(GP_ESP)], R14D
+//   REX=0x45 (REX.R R14, REX.B R13), 0x89, mod=01 reg=6(R14&7) rm=5(R13&7), disp8
+inline void emit_store_r14_to_esp(Emitter& e) {
+    e.emit8(0x45); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }

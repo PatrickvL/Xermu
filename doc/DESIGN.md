@@ -238,7 +238,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/segment.asm`   | FS/GS segment override tests (22 assertions)     | ✅ ALL PASS   |
 | `tests/indirect.asm`  | JMP/CALL [mem], PUSH/POP [mem] (20 assertions)   | ✅ ALL PASS   |
 | `tests/privileged.asm` | CLI/STI/CPUID/RDTSC/LGDT/LIDT/CR0-4/IRET (17)   | ✅ ALL PASS   |
-| `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC/PUSH_ESP (39) | ✅ ALL PASS   |
+| `tests/misc.asm`      | ENTER/LEAVE/XLATB/CBW/CDQ/LAHF/SAHF/CLC/ESP (50)   | ✅ ALL PASS   |
 | `tests/smc.asm`       | Self-modifying code: patch imm/opcode/jmp/alu (11) | ✅ ALL PASS   |
 | `tests/interrupt.asm`  | INT→IDT→IRETD, nested, CLI/STI, INT3, EFLAGS (9) | ✅ ALL PASS   |
 | `tests/paging.asm`    | Page table walk, 4KB/4MB pages, INVLPG (9)         | ✅ ALL PASS   |
@@ -550,6 +550,8 @@ Full codebase audit for correctness, efficiency, and consistency.  Fixes:
 | LOOPE/LOOPNE always branch to `taken_eip` | Incorrect control flow — ZF and ECX conditions ignored | Check original ZF (JNZ/JZ rel32) before DEC ECX; each path decrements ECX and branches correctly |
 | CALL direct/register write return address with no ESP bounds check | Host memory corruption if guest ESP is out of range | Added `CMP R14, R15; JAE` → UD2 guard before `emit_fastmem_store_imm32` |
 | PUSH ESP / POP ESP emit host RSP instead of guest ESP | Host stack corruption; wrong value pushed/popped since ESP lives in `ctx->gp[4]` not a host register | C-helper `push_esp_helper` / `pop_esp_helper` that read/write `ctx->gp[GP_ESP]` directly |
+| `emit_ea_to_r14` with ESP base emits `LEA R14D,[RSP+disp]` | All `[ESP]` / `[ESP+N]` memory accesses use host RSP instead of guest ESP — widespread correctness failure | Load guest ESP from `ctx->gp[GP_ESP]` into R14, then `LEA R14D,[R14+disp]` for displacement |
+| MOV/ALU/LEA with ESP register operand executed natively on host RSP | `SUB ESP,N` / `ADD ESP,N` / `MOV ESP,r32` / `LEA ESP,[r+d]` corrupt host stack or produce wrong guest ESP | MOV ESP: read/write `ctx->gp[GP_ESP]` via `[R13+16]`. ALU ESP: load into R14, re-encode with R14, store back. LEA ESP: `emit_ea_to_r14` + `emit_store_r14_to_esp` |
 **Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
 12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
 (offset 120), right-shifts R14D (PA) by 12, and increments the version counter.
