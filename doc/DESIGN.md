@@ -228,6 +228,7 @@ The bump is correctly skipped for them (they are not stores).
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
 | `pe_loader.hpp`       | Win32 PE loader (xboxkrnl.exe) + export resolver | ✅ Working    |
 | `xbe_loader.hpp`      | Xbox XBE loader: sections, thunks, TLS, HLE     | ✅ Working    |
+| `xbox/pgraph.hpp`     | PGRAPH state shadow (NV097 method → state)       | ✅ Working    |
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (52 assertions)                   | ✅ ALL PASS   |
@@ -262,6 +263,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/flash.asm`     | Flash ROM: BIOS shadow + flash base reads (4)    | ✅ ALL PASS   |
 | `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
 | `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing + JUMP (5)      | ✅ ALL PASS   |
+| `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
 
@@ -319,7 +321,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 32 suites, CMake integration
+- [x] NASM test infrastructure: 33 suites, CMake integration
 
 ---
 
@@ -701,9 +703,26 @@ Standard PFIFO registers:| Register              | Offset     | Behaviour       
 | `CACHE1_STATUS`      | 0x003214  | Bit 4 = empty (init: 0x10)       |
 | `PFIFO_RUNOUT_STATUS`| 0x002400  | Bit 4 = empty (init: 0x10)       |
 
-**PGRAPH (3D engine)** ✅ DONE (stub)
+**PGRAPH (3D engine)** ✅ DONE (register stubs + state shadow)
 
-Register stubs for the 3D graphics pipeline:
+Register stubs for the 3D graphics pipeline, plus a full PGRAPH state shadow
+(`src/xbox/pgraph.hpp`) that captures GPU method calls from the PFIFO DMA
+pusher.  The state shadow tracks:
+
+- **Surface**: format, pitch, colour/zeta offsets, clip dimensions
+- **Blend**: enable, src/dst factors, equation, colour
+- **Depth/stencil**: test enable, function, mask, stencil ops
+- **Rasterizer**: cull face, front face, shade mode, colour mask
+- **Textures**: offset, format, control, filter, image rect (4 stages)
+- **Vertex shader**: program upload (136 slots × 4 dwords), constant upload
+  (192 × vec4)
+- **Register combiners**: colour/alpha ICW/OCW (8 stages), specular/fog
+- **Primitive**: BEGIN_END mode, draw count, clear count
+
+The state shadow is wired via `Nv2aState::method_handler` so that every
+method dispatched by `tick_fifo()` updates the shadow automatically.
+14-assertion C++ unit test (`src/test_pgraph.cpp`) verifies end-to-end:
+push buffer commands → PFIFO parse → PGRAPH state capture.
 
 | Register              | Offset     | Behaviour                        |
 |-----------------------|-----------|----------------------------------|
