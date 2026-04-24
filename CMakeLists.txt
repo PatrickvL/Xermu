@@ -65,6 +65,17 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# PE loader unit test (standalone — no JIT, no Zydis)
+# ---------------------------------------------------------------------------
+add_executable(test_pe_loader src/test_pe_loader.cpp)
+target_include_directories(test_pe_loader PRIVATE src)
+if(MSVC)
+    target_compile_options(test_pe_loader PRIVATE /W3)
+else()
+    target_compile_options(test_pe_loader PRIVATE -Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
 # NASM test binary assembly (optional — only if NASM is installed)
 # ---------------------------------------------------------------------------
 find_program(NASM_EXECUTABLE nasm)
@@ -127,6 +138,10 @@ if(NASM_EXECUTABLE)
 
     # CTest integration
     enable_testing()
+
+    # C++ unit tests (no NASM dependency)
+    add_test(NAME pe_loader COMMAND test_pe_loader)
+
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)

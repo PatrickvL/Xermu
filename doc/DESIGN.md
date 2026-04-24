@@ -226,6 +226,8 @@ The bump is correctly skipped for them (they are not stores).
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
 | `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
+| `pe_loader.hpp`       | Win32 PE loader (xboxkrnl.exe) + export resolver | ✅ Working    |
+| `xbe_loader.hpp`      | Xbox XBE loader: sections, thunks, TLS, HLE     | ✅ Working    |
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (52 assertions)                   | ✅ ALL PASS   |
@@ -252,6 +254,13 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
+| `tests/apu.asm`       | APU: VP/GP/EP base + status registers (7)        | ✅ ALL PASS   |
+| `tests/ide.asm`       | IDE ATA: register defaults, IDENTIFY, PCI (10)   | ✅ ALL PASS   |
+| `tests/usb.asm`       | USB OHCI: register defaults, reset, PCI (12)     | ✅ ALL PASS   |
+| `tests/mtrr.asm`      | MTRR MSRs: variable + fixed range read/write (8) | ✅ ALL PASS   |
+| `tests/gdt_tss.asm`   | GDT/TSS: LLDT/LTR/SLDT/STR/SGDT/SIDT (10)       | ✅ ALL PASS   |
+| `tests/flash.asm`     | Flash ROM: BIOS shadow + flash base reads (4)    | ✅ ALL PASS   |
+| `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
 
 ---
 
@@ -1559,13 +1568,35 @@ The executor supports two kernel modes, selectable at launch:
   manager, scheduler, device drivers — all running as guest code.
 - The executor already emulates the hardware the kernel needs:
   PIC, PIT, PCI config space, SMBus (EEPROM/SMC), NV2A MMIO, APU, IDE.
+
+**PE Loader** (`src/pe_loader.hpp`) ✅ DONE
+
+Generic Win32 PE (x86-32) loader for loading `xboxkrnl.exe` and other Xbox
+system binaries into guest RAM:
+
+- **DOS/PE header parsing**: validates `MZ` magic, locates PE signature,
+  parses COFF header (must be `IMAGE_FILE_MACHINE_I386`) and PE32 optional
+  header.
+- **Section mapping**: iterates the section table and copies each section's
+  raw data to `image_base + section_rva` in guest RAM.  Sections larger in
+  memory than on disk are zero-filled (BSS).
+- **No relocations**: images are loaded at their preferred base — the Xbox
+  kernel is always linked at a fixed address.
+- **Export resolution**: `resolve_export_by_ordinal()` parses the PE export
+  directory to look up kernel function addresses by ordinal number.  This
+  is used to wire up the kernel thunk table when running in LLE mode.
+- **12-assertion C++ unit test** (`src/test_pe_loader.cpp`): constructs a
+  minimal PE in memory with 2 sections and an export directory, writes it
+  to a temp file, loads it, and verifies image base, entry point, section
+  content, ordinal resolution, and error handling.
+
 - **Remaining gaps for LLE boot:**
 
 | Gap | Difficulty | Status |
 |---|---|---|
 | SYSENTER / SYSEXIT | Easy | ✅ DONE |
 | SYSENTER MSRs (CS/EIP/ESP) | Easy | ✅ DONE |
-| PE loader for xboxkrnl.exe | Medium | Planned |
+| PE loader for xboxkrnl.exe | Medium | ✅ DONE |
 | MCPX/2BL boot chain (or entry shim) | Medium | ROM loading ✅ DONE; boot execution planned |
 | OHCI USB controller stub | Medium | ✅ DONE |
 | More complete GDT/TSS handling | Easy | ✅ DONE |
