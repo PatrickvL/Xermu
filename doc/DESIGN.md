@@ -239,7 +239,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/ioapic.hpp`     | I/O APIC: indirect regs, redir entries, RO bits  | ✅ Working    |
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
 | `xbox/flash.hpp`      | Flash ROM + MCPX: BIOS loading, shadow           | ✅ Working    |
-| `xbox/pci.hpp`        | PCI configuration space (type 0, CF8/CFC)        | ✅ Working    |
+| `xbox/pci.hpp`        | PCI config space: BARs, IRQs, bridge, all devices | ✅ Working    |
 | `xbox/smbus.hpp`      | SMBus: EEPROM, SMC, video encoder                | ✅ Working    |
 | `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
 | `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
@@ -280,6 +280,7 @@ The bump is correctly skipped for them (they are not stores).
 | `test_pe_loader.cpp`  | PE loader C++ unit test (12 assertions)           | ✅ ALL PASS   |
 | `tests/pfifo.asm`     | PFIFO DMA pusher: command parsing, JUMP, CALL/RETURN (8) | ✅ ALL PASS   |
 | `tests/ioapic.asm`   | I/O APIC: indirect regs, redir entries, RO bits (12) | ✅ ALL PASS   |
+| `tests/pci.asm`      | PCI config: BARs, IRQs, bridge, non-existent dev (18) | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (14 assertions) | ✅ ALL PASS   |
 
 ---
@@ -640,7 +641,10 @@ Implemented in `src/xbox/` component files with `xbox_setup()` in `src/xbox/setu
   masks delivery_status/remote_irr as RO, redir high only [31:24] writable).
   Entries default to masked (bit 16).  Named constants in `ioapic::` namespace.
 - **PCI configuration space**: I/O ports 0xCF8/0xCFC with Xbox device table
-  (Host Bridge, LPC, SMBus, NV2A, APU, USB×2, IDE, AGP bridge).
+  (Host Bridge, LPC, SMBus, NV2A, APU, USB×2, IDE, AGP bridge).  Named
+  constants in `pci_cfg::` namespace.  All devices have correct BARs, IRQ lines,
+  and class codes.  AGP bridge has Type 1 header with secondary bus.  Non-existent
+  devices return 0xFFFFFFFF per PCI spec.
 - **SMBus**: I/O ports 0xC000–0xC00E, status/control/address/data registers,
   auto-complete transactions, EEPROM read stub (device 0x54).
 - **PIC**: full 8259A dual PIC (§5.18).
