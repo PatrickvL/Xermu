@@ -57,24 +57,48 @@ static constexpr uint32_t BIOS_SIZE         = 0x00100000u;  // 1 MB
 // ============================= NV2A GPU ====================================
 
 struct Nv2aState {
-    uint32_t pmc_boot_0 = 0x02A000A1;  // NV2A chip ID (NV20 derivative)
-    uint32_t pmc_enable = 0;
-    uint32_t pfb_cfg0   = 0x03070103;  // 64 MB RAM
-    uint32_t pbus_0     = 0;
-    uint32_t ptimer_num = 1;
-    uint32_t ptimer_den = 1;
+    uint32_t pmc_boot_0  = 0x02A000A1;  // NV2A chip ID (NV20 derivative)
+    uint32_t pmc_enable  = 0;           // PMC_ENABLE
+    uint32_t pmc_intr_en = 0;           // PMC_INTR_EN_0 (master IRQ enable)
+    uint32_t pfb_cfg0    = 0x03070103;  // 64 MB RAM
+    uint32_t pbus_0      = 0;
+    uint32_t ptimer_num  = 1;
+    uint32_t ptimer_den  = 1;
     uint32_t pcrtc_start = 0;
+    uint32_t pcrtc_intr  = 0;           // PCRTC_INTR_0 (bit 0 = vblank pending)
+    uint32_t pcrtc_intr_en = 0;         // PCRTC_INTR_EN_0 (bit 0 = vblank enable)
     uint32_t pvideo_intr = 0;
 
     // PTIMER: 56-bit freerunning nanosecond counter.
-    // TIME_0 = bits[31:5] of nanosecond counter (bits[4:0] sub-ns, read as 0).
-    // TIME_1 = bits[28:0] of (nanoseconds >> 32).
-    // Tick rate: ~31.25 MHz crystal * (num/den).  Default num/den=1/1.
-    // We advance by a fixed quantum per executor tick.
-    uint64_t ptimer_ns = 0;   // monotonic nanosecond counter
+    uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;  // ~10 MHz effective
 
-    void tick_timer() { ptimer_ns += NS_PER_TICK; }
+    // PCRTC vblank: fires every VBLANK_PERIOD ticks (~60 Hz at ~16667 ticks).
+    uint32_t vblank_counter = 0;
+    static constexpr uint32_t VBLANK_PERIOD = 16667;
+    bool     vblank_irq_pending = false;  // set by tick, cleared by hw_tick_callback
+
+    void tick_timer() {
+        ptimer_ns += NS_PER_TICK;
+
+        // Vblank generation.
+        if (++vblank_counter >= VBLANK_PERIOD) {
+            vblank_counter = 0;
+            if (pcrtc_intr_en & 1)
+                pcrtc_intr |= 1;   // set vblank pending
+            // Signal to the combined tick callback to raise IRQ.
+            if ((pmc_intr_en & 0x01000000) && (pcrtc_intr & 1))
+                vblank_irq_pending = true;
+        }
+    }
+
+    // PMC_INTR_0: read-only summary of all NV2A interrupt sources.
+    // Bit 24 = PCRTC interrupt pending.
+    uint32_t pmc_intr_0() const {
+        uint32_t val = 0;
+        if (pcrtc_intr & 1) val |= 0x01000000;  // bit 24: PCRTC
+        return val;
+    }
 };
 
 static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
@@ -83,7 +107,9 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
 
     // PMC (0x000xxx) — master control
     if (off == 0x000000) return nv->pmc_boot_0;    // PMC_BOOT_0
-    if (off == 0x000200) return nv->pmc_enable;     // PMC_ENABLE
+    if (off == 0x000100) return nv->pmc_intr_0();  // PMC_INTR_0 (summary)
+    if (off == 0x000140) return nv->pmc_intr_en;   // PMC_INTR_EN_0
+    if (off == 0x000200) return nv->pmc_enable;    // PMC_ENABLE
 
     // PBUS (0x001xxx) — bus control
     if (off == 0x001200) return nv->pbus_0;         // PBUS_PCI_NV_0
@@ -106,7 +132,8 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     if (off == 0x100204) return 0;                  // PFB_CFG1
 
     // PCRTC (0x600xxx) — CRTC
-    if (off == 0x600100) return 0;                  // PCRTC_INTR_0
+    if (off == 0x600100) return nv->pcrtc_intr;     // PCRTC_INTR_0
+    if (off == 0x600140) return nv->pcrtc_intr_en;  // PCRTC_INTR_EN_0
     if (off == 0x600800) return nv->pcrtc_start;    // PCRTC_START
 
     // PVIDEO (0x008xxx) — video overlay
@@ -120,13 +147,15 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
+    if (off == 0x000140) { nv->pmc_intr_en = val; return; }    // PMC_INTR_EN_0
     if (off == 0x000200) { nv->pmc_enable = val; return; }
     if (off == 0x001200) { nv->pbus_0 = val;     return; }
     if (off == 0x009200) { nv->ptimer_num = val;  return; }
     if (off == 0x009210) { nv->ptimer_den = val;  return; }
+    if (off == 0x600100) { nv->pcrtc_intr &= ~val; return; }   // PCRTC_INTR_0 W1C
+    if (off == 0x600140) { nv->pcrtc_intr_en = val; return; }  // PCRTC_INTR_EN_0
     if (off == 0x600800) { nv->pcrtc_start = val; return; }
-    if (off == 0x600100) { nv->pvideo_intr &= ~val; return; } // W1C
-    if (off == 0x008100) { nv->pvideo_intr &= ~val; return; } // W1C
+    if (off == 0x008100) { nv->pvideo_intr &= ~val; return; }  // W1C
 
     // Silently drop unhandled writes.
 }
@@ -645,6 +674,11 @@ static void hw_tick_callback(void* user) {
     auto* hw = static_cast<XboxHardware*>(user);
     hw->pit.tick();
     hw->nv2a.tick_timer();
+    // Raise NV2A vblank IRQ on PIC if pending.
+    if (hw->nv2a.vblank_irq_pending) {
+        hw->nv2a.vblank_irq_pending = false;
+        hw->pic.raise_irq(1);  // NV2A → IRQ 1 on Xbox
+    }
 }
 
 // Set up the Xbox MMIO map and I/O ports on an Executor.
@@ -690,7 +724,7 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.register_io(0x43, pit_io_read, pit_io_write, &hw->pit); // PIT mode
 
     // Wire PIT channel 0 → IRQ 0 on PIC.
-    hw->pit.pic = &hw->pic;
+    hw->pit.pic  = &hw->pic;
 
     // Periodic tick: call PIT + NV2A PTIMER every trace dispatch.
     exec.tick_fn     = hw_tick_callback;
