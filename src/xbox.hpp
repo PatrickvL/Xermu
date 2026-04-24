@@ -69,6 +69,33 @@ struct Nv2aState {
     uint32_t pcrtc_intr_en = 0;         // PCRTC_INTR_EN_0 (bit 0 = vblank enable)
     uint32_t pvideo_intr = 0;
 
+    // PFIFO registers
+    uint32_t pfifo_intr      = 0;       // PFIFO_INTR_0
+    uint32_t pfifo_intr_en   = 0;       // PFIFO_INTR_EN_0
+    uint32_t pfifo_caches    = 0;       // PFIFO_CACHES (bit 0 = reassign enable)
+    uint32_t pfifo_mode      = 0;       // PFIFO_MODE (per-channel DMA/PIO)
+    uint32_t pfifo_cache1_push0 = 0;    // CACHE1_PUSH0 (bit 0 = access enable)
+    uint32_t pfifo_cache1_pull0 = 0;    // CACHE1_PULL0 (bit 0 = access enable)
+    uint32_t pfifo_cache1_push1 = 0;    // CACHE1_PUSH1 (channel id in bits 4:0)
+    uint32_t pfifo_cache1_status = 0x10; // CACHE1_STATUS (bit 4 = empty)
+    uint32_t pfifo_cache1_dma_push = 0;  // CACHE1_DMA_PUSH (bit 0 = access enable)
+    uint32_t pfifo_cache1_dma_put = 0;
+    uint32_t pfifo_cache1_dma_get = 0;
+    uint32_t pfifo_runout_status = 0x10; // RUNOUT_STATUS (bit 4 = empty)
+
+    // PGRAPH registers
+    uint32_t pgraph_intr     = 0;       // PGRAPH_INTR
+    uint32_t pgraph_intr_en  = 0;       // PGRAPH_NSOURCE / INTR_EN
+    uint32_t pgraph_fifo     = 0;       // PGRAPH_FIFO (bit 0 = access enable)
+    uint32_t pgraph_channel_ctx_status = 0; // PGRAPH_CTX_CONTROL (bit 24 = channel valid)
+
+    // PRAMDAC registers — PLL / video clock configuration
+    // Default PLL values: NV_CLK = 233 MHz, MEM_CLK = 200 MHz, VIDEO_CLK = 25.175 MHz
+    uint32_t pramdac_nvpll   = 0x00011C01;  // NVPLL_COEFF (N=0x1C, M=1, P=0 → ~233 MHz)
+    uint32_t pramdac_mpll    = 0x00011801;  // MPLL_COEFF  (N=0x18, M=1, P=0 → ~200 MHz)
+    uint32_t pramdac_vpll    = 0x00031801;  // VPLL_COEFF  (N=0x18, M=1, P=3 → ~25 MHz)
+    uint32_t pramdac_pll_test = 0;          // PLL_TEST_COUNTER
+
     // PTIMER: 56-bit freerunning nanosecond counter.
     uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;  // ~10 MHz effective
@@ -116,9 +143,18 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     if (off == 0x001214) return 0;                  // PBUS interrupt status
 
     // PFIFO (0x002xxx) — FIFO engine
-    if (off == 0x002100) return 0;                  // PFIFO_INTR_0
-    if (off == 0x002140) return 0;                  // PFIFO_INTR_EN_0
-    if (off == 0x002500) return 0;                  // PFIFO_CACHES
+    if (off == 0x002100) return nv->pfifo_intr;           // PFIFO_INTR_0
+    if (off == 0x002140) return nv->pfifo_intr_en;        // PFIFO_INTR_EN_0
+    if (off == 0x002500) return nv->pfifo_caches;         // PFIFO_CACHES
+    if (off == 0x002504) return nv->pfifo_mode;           // PFIFO_MODE
+    if (off == 0x003200) return nv->pfifo_cache1_push0;   // CACHE1_PUSH0
+    if (off == 0x003210) return nv->pfifo_cache1_push1;   // CACHE1_PUSH1
+    if (off == 0x003220) return nv->pfifo_cache1_dma_push;// CACHE1_DMA_PUSH
+    if (off == 0x003240) return nv->pfifo_cache1_dma_put; // CACHE1_DMA_PUT
+    if (off == 0x003244) return nv->pfifo_cache1_dma_get; // CACHE1_DMA_GET
+    if (off == 0x003250) return nv->pfifo_cache1_pull0;   // CACHE1_PULL0
+    if (off == 0x003214) return nv->pfifo_cache1_status;  // CACHE1_STATUS
+    if (off == 0x002400) return nv->pfifo_runout_status;  // PFIFO_RUNOUT_STATUS
 
     // PTIMER (0x009xxx) — timer
     if (off == 0x009200) return nv->ptimer_num;
@@ -139,6 +175,21 @@ static uint32_t nv2a_read(uint32_t pa, unsigned size, void* user) {
     // PVIDEO (0x008xxx) — video overlay
     if (off == 0x008100) return nv->pvideo_intr;
 
+    // PGRAPH (0x400xxx) — 3D engine
+    if (off == 0x400100) return nv->pgraph_intr;            // PGRAPH_INTR
+    if (off == 0x400140) return nv->pgraph_intr_en;         // PGRAPH_INTR_EN
+    if (off == 0x400720) return nv->pgraph_fifo;            // PGRAPH_FIFO
+    if (off == 0x400170) return nv->pgraph_channel_ctx_status; // PGRAPH_CTX_CONTROL
+
+    // PRAMDAC (0x680xxx) — PLL / video clock
+    if (off == 0x680500) return nv->pramdac_nvpll;          // NVPLL_COEFF
+    if (off == 0x680504) return nv->pramdac_mpll;           // MPLL_COEFF
+    if (off == 0x680508) return nv->pramdac_vpll;           // VPLL_COEFF
+    if (off == 0x680514) return nv->pramdac_pll_test;       // PLL_TEST_COUNTER
+    // PRAMDAC general control: bit 0 = VGA blanking, bit 4 = DAC width (8bpp)
+    if (off == 0x680600) return 0x00000101;                 // PRAMDAC_GENERAL_CONTROL
+    if (off == 0x6808C0) return 0;                          // PRAMDAC_FP_DEBUG_0
+
     // Default: bus float
     return 0;
 }
@@ -156,6 +207,30 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off == 0x600140) { nv->pcrtc_intr_en = val; return; }  // PCRTC_INTR_EN_0
     if (off == 0x600800) { nv->pcrtc_start = val; return; }
     if (off == 0x008100) { nv->pvideo_intr &= ~val; return; }  // W1C
+
+    // PFIFO writes
+    if (off == 0x002100) { nv->pfifo_intr &= ~val; return; }      // PFIFO_INTR_0 W1C
+    if (off == 0x002140) { nv->pfifo_intr_en = val; return; }     // PFIFO_INTR_EN_0
+    if (off == 0x002500) { nv->pfifo_caches = val; return; }      // PFIFO_CACHES
+    if (off == 0x002504) { nv->pfifo_mode = val; return; }        // PFIFO_MODE
+    if (off == 0x003200) { nv->pfifo_cache1_push0 = val; return; }// CACHE1_PUSH0
+    if (off == 0x003210) { nv->pfifo_cache1_push1 = val; return; }// CACHE1_PUSH1
+    if (off == 0x003220) { nv->pfifo_cache1_dma_push = val; return; } // CACHE1_DMA_PUSH
+    if (off == 0x003240) { nv->pfifo_cache1_dma_put = val; return; }  // CACHE1_DMA_PUT
+    if (off == 0x003244) { nv->pfifo_cache1_dma_get = val; return; }  // CACHE1_DMA_GET
+    if (off == 0x003250) { nv->pfifo_cache1_pull0 = val; return; }// CACHE1_PULL0
+
+    // PGRAPH writes
+    if (off == 0x400100) { nv->pgraph_intr &= ~val; return; }    // PGRAPH_INTR W1C
+    if (off == 0x400140) { nv->pgraph_intr_en = val; return; }   // PGRAPH_INTR_EN
+    if (off == 0x400720) { nv->pgraph_fifo = val; return; }      // PGRAPH_FIFO
+    if (off == 0x400170) { nv->pgraph_channel_ctx_status = val; return; }
+
+    // PRAMDAC writes
+    if (off == 0x680500) { nv->pramdac_nvpll = val; return; }    // NVPLL_COEFF
+    if (off == 0x680504) { nv->pramdac_mpll = val; return; }     // MPLL_COEFF
+    if (off == 0x680508) { nv->pramdac_vpll = val; return; }     // VPLL_COEFF
+    if (off == 0x680514) { nv->pramdac_pll_test = val; return; } // PLL_TEST_COUNTER
 
     // Silently drop unhandled writes.
 }

@@ -250,6 +250,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
+| `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO, PGRAPH, PRAMDAC, PFB regs (13)   | ✅ ALL PASS   |
 
 ---
 
@@ -307,7 +308,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 22 suites, CMake integration
+- [x] NASM test infrastructure: 23 suites, CMake integration
 
 ---
 
@@ -645,6 +646,50 @@ Periodic vblank interrupt (~60 Hz) from the NV2A CRTC:
   the combined tick callback raises IRQ 1 on the PIC.  Games receive the
   interrupt, clear PCRTC_INTR_0 via W1C, send EOI to PIC.
 - **Tick rate**: VBLANK_PERIOD = 16667 ticks (~60 Hz at 1 tick/trace).
+
+**PFIFO (command FIFO engine)** ✅ DONE (stub)
+
+Register stubs that let games initialize the GPU command submission path
+without hanging.  No actual command processing.
+
+| Register              | Offset     | Behaviour                        |
+|-----------------------|-----------|----------------------------------|
+| `PFIFO_INTR_0`       | 0x002100  | Interrupt status (W1C)           |
+| `PFIFO_INTR_EN_0`    | 0x002140  | Interrupt enable                 |
+| `PFIFO_CACHES`       | 0x002500  | Reassign enable (bit 0)          |
+| `PFIFO_MODE`         | 0x002504  | Per-channel DMA/PIO mode         |
+| `CACHE1_PUSH0`       | 0x003200  | Push access enable (bit 0)       |
+| `CACHE1_PUSH1`       | 0x003210  | Channel ID (bits 4:0)            |
+| `CACHE1_DMA_PUSH`    | 0x003220  | DMA pusher enable (bit 0)        |
+| `CACHE1_DMA_PUT`     | 0x003240  | DMA put pointer                  |
+| `CACHE1_DMA_GET`     | 0x003244  | DMA get pointer                  |
+| `CACHE1_PULL0`       | 0x003250  | Pull access enable (bit 0)       |
+| `CACHE1_STATUS`      | 0x003214  | Bit 4 = empty (init: 0x10)       |
+| `PFIFO_RUNOUT_STATUS`| 0x002400  | Bit 4 = empty (init: 0x10)       |
+
+**PGRAPH (3D engine)** ✅ DONE (stub)
+
+Register stubs for the 3D graphics pipeline:
+
+| Register              | Offset     | Behaviour                        |
+|-----------------------|-----------|----------------------------------|
+| `PGRAPH_INTR`        | 0x400100  | Interrupt status (W1C)           |
+| `PGRAPH_INTR_EN`     | 0x400140  | Interrupt enable mask            |
+| `PGRAPH_FIFO`        | 0x400720  | FIFO access enable (bit 0)       |
+| `PGRAPH_CTX_CONTROL` | 0x400170  | Channel context status           |
+
+**PRAMDAC (PLL / video clock)** ✅ DONE (stub)
+
+PLL coefficient registers for clock generation.  Defaults match the Xbox
+retail hardware (crystal reference = 16.667 MHz):
+
+| Register              | Offset     | Default      | Description           |
+|-----------------------|-----------|--------------|-----------------------|
+| `NVPLL_COEFF`        | 0x680500  | 0x00011C01   | GPU core PLL (~233 MHz) |
+| `MPLL_COEFF`         | 0x680504  | 0x00011801   | Memory PLL (~200 MHz)   |
+| `VPLL_COEFF`         | 0x680508  | 0x00031801   | Video pixel PLL (~25 MHz)|
+| `PLL_TEST_COUNTER`   | 0x680514  | 0            | PLL test readback       |
+| `GENERAL_CONTROL`    | 0x680600  | 0x00000101   | DAC control (read-only) |
 
 #### 5.17 APU (Audio Processing Unit)
 **Priority: HIGH for games** — AC97-compatible audio + DSP at `0xFE800000`.
