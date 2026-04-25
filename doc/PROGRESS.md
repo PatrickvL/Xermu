@@ -214,13 +214,25 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 19: PAGE_SIZE/PAGE_MASK named constants (HEAD)
+### Step 19: PAGE_SIZE/PAGE_MASK named constants (86ef544)
 - Added `GUEST_PAGE_SIZE` (0x1000) and `GUEST_PAGE_MASK` (0xFFFFF000) to executor.hpp.
 - Replaced all raw page-size/mask hex literals in executor.cpp (load_guest,
   protect_code_page, invalidate_code_page, translate_va page walks) and
   trace_builder.cpp (translate_va_jit page walks).
 - **Files**: src/executor.hpp, src/executor.cpp, src/trace_builder.cpp
 - **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 20: Fix flaky pfifo test — DMA pusher race condition (HEAD)
+- Root cause: Phases 2 and 3 wrote CACHE1_DMA_PUT before CACHE1_DMA_GET
+  while the DMA pusher thread was still enabled. The thread could wake up
+  between the two writes and process from the old GET through uninitialised
+  memory, double-counting stats and causing assertion failures.
+- Fix: disable DMA_PUSH before reprogramming GET/PUT, re-enable after.
+  Also switched to writing GET before PUT for additional safety.
+- Verified: 50 consecutive runs with zero failures.
+- **Files**: tests/pfifo.asm
+- **Result**: 48/48 pass (pfifo 50/50 stress test)
 - **Status**: DONE
 
 ---
@@ -249,4 +261,5 @@
 | 4b0fdd3 | 48   | 0    | memcpy trace_builder     |
 | 750a582 | 48   | 0    | stale CMP R14,R15 refs   |
 | c55ed9f | 48   | 0    | MSR named constants      |
-| (HEAD)  | 48   | 0    | PAGE_SIZE/MASK constants  |
+| 86ef544 | 48   | 0    | PAGE_SIZE/MASK constants  |
+| (HEAD)  | 48   | 0    | pfifo race fix (50/50)   |
