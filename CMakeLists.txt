@@ -134,6 +134,7 @@ set(TEST_ASM_FILES
     tests/usb_ohci.asm
     tests/flash_cmd.asm
     tests/apu_voice.asm
+    tests/nv2a_pmc.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -169,7 +170,7 @@ if(NASM_EXECUTABLE)
     foreach(asm_file ${TEST_ASM_FILES})
         get_filename_component(test_name ${asm_file} NAME_WE)
         set(bin_file ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_name}.bin)
-        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit" OR test_name STREQUAL "nv2a_timer" OR test_name STREQUAL "pcrtc" OR test_name STREQUAL "smbus" OR test_name STREQUAL "nv2a_gpu" OR test_name STREQUAL "apu" OR test_name STREQUAL "ide" OR test_name STREQUAL "usb" OR test_name STREQUAL "flash" OR test_name STREQUAL "pfifo" OR test_name STREQUAL "ioapic" OR test_name STREQUAL "pci" OR test_name STREQUAL "pvideo" OR test_name STREQUAL "pbus" OR test_name STREQUAL "pramdac" OR test_name STREQUAL "ptimer_alarm" OR test_name STREQUAL "smbus_smc" OR test_name STREQUAL "ide_dma" OR test_name STREQUAL "usb_ohci" OR test_name STREQUAL "flash_cmd" OR test_name STREQUAL "apu_voice")
+        if(test_name STREQUAL "xbox" OR test_name STREQUAL "hle" OR test_name STREQUAL "pic" OR test_name STREQUAL "pit" OR test_name STREQUAL "nv2a_timer" OR test_name STREQUAL "pcrtc" OR test_name STREQUAL "smbus" OR test_name STREQUAL "nv2a_gpu" OR test_name STREQUAL "apu" OR test_name STREQUAL "ide" OR test_name STREQUAL "usb" OR test_name STREQUAL "flash" OR test_name STREQUAL "pfifo" OR test_name STREQUAL "ioapic" OR test_name STREQUAL "pci" OR test_name STREQUAL "pvideo" OR test_name STREQUAL "pbus" OR test_name STREQUAL "pramdac" OR test_name STREQUAL "ptimer_alarm" OR test_name STREQUAL "smbus_smc" OR test_name STREQUAL "ide_dma" OR test_name STREQUAL "usb_ohci" OR test_name STREQUAL "flash_cmd" OR test_name STREQUAL "apu_voice" OR test_name STREQUAL "nv2a_pmc")
             add_test(
                 NAME    ${test_name}
                 COMMAND test_runner --xbox ${bin_file}

@@ -290,6 +290,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/usb_ohci.asm`     | OHCI: frame regs, HCCA, ED ptrs, interrupts (10)| ✅ ALL PASS   |
 | `tests/flash_cmd.asm`    | Flash CFI: ID, status, program, erase (10)      | ✅ ALL PASS   |
 | `tests/apu_voice.asm`    | APU VP voice slots: config, pitch, vol, env (10) | ✅ ALL PASS   |
+| `tests/nv2a_pmc.asm`     | NV2A PMC: ENABLE, INTR_0 aggregation (10)        | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (58 assertions) | ✅ ALL PASS   |
 
 ---
