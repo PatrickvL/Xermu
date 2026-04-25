@@ -162,50 +162,28 @@ to the two-byte `FF /0` / `FF /1` forms.
 
 ### 2.6 Self-Modifying Code Detection
 
-Page-granular version tags (`PageVersions`). Each guest page has a `uint32_t`
-version counter. Every inline fastmem store emits a page-version bump sequence
-(`emit_smc_page_bump`). The C-helper slow path (`write_guest_mem32`) also bumps
-the version. Before executing a cached trace, the run loop compares the trace's
-recorded page version against the current version. On mismatch: invalidate and
-rebuild.
+Page-level write protection + VEH.  When a trace is built for a code page,
+that page is write-protected via `VirtualProtect(PAGE_READONLY)` (Windows) or
+`mprotect(PROT_READ)` (Unix).  If guest code writes to a protected page:
 
-The bump sequence per store (12 or 16 bytes):
-```
-[PUSHFQ]                     ; only when guest insn produces live flags
-PUSH RAX                     ; save guest EAX
-MOV RAX, [R13+120]           ; load page_versions pointer
-SHR R14D, 12                 ; page index from PA in R14
-INC DWORD [RAX+R14*4]        ; bump version
-POP RAX                      ; restore
-[POPFQ]                      ; only when guest insn produces live flags
-```
+1. A page fault is raised (Windows: VEH handler, Unix: SIGSEGV handler).
+2. The handler unprotects the page, allowing the write to proceed.
+3. All traces on that page are invalidated (set `valid = false`, block links
+   patched back to cold fallthrough).
+4. Fault bitmaps for the page are cleared.
+5. Execution continues — the run loop will rebuild traces on next visit.
+
+This approach has **zero per-store overhead** — there is no inline
+page-version bump sequence.  Stores to non-code pages (the common case)
+execute at full speed with a single `[R12 + R14]` fastmem instruction.
+The cost is paid only on the rare SMC event (a VEH fault + trace rebuild).
 
 **EFLAGS handling**: This JIT does **not** use lazy flag evaluation — guest
-instructions execute natively, so guest EFLAGS live in host RFLAGS. The bump's
-SHR+INC clobbers arithmetic flags. Whether PUSHFQ/POPFQ are needed depends on
-the call site:
-
-| Call site             | Guest produces flags? | PUSHFQ/POPFQ? | Bytes |
-|-----------------------|-----------------------|---------------|-------|
-| MOV [mem], reg/imm    | No                    | Skipped       | 12    |
-| ALU [mem] (ADD/SUB…)  | Yes                   | `!save_flags` | 12–16 |
-| SETcc/CMOVcc [mem]    | No (reads only)       | Emitted†      | 16    |
-| PUSH imm/reg          | No                    | Skipped       | 12    |
-| FPU/SSE [mem] store   | No (x86 flags)        | Skipped       | 12    |
-| CALL exit (retaddr)   | N/A (trace exit)      | Skipped       | 12    |
-
-† SETcc/CMOVcc: flags are live (just read by the instruction) and must survive
-  to any subsequent flag-reading instruction in the trace.
-
-For ALU [mem] writes, `preserve_flags = !save_flags`: when the outer flag-save
-bracket is already active (protecting prior live flags from the CMP R14,R15
-clobber), the bump's own PUSHFQ/POPFQ is redundant — the outer POPFQ will
-restore flags anyway. When no outer bracket is present (full flag writers like
-ADD/SUB where prior flags are dead), the bump emits its own PUSHFQ/POPFQ to
-protect the new ALU result from SHR+INC. This avoids nested flag saves.
-
-**CMP/TEST [mem]**: These ALU instructions read memory but don't write back.
-The bump is correctly skipped for them (they are not stores).
+instructions execute natively, so guest EFLAGS live in host RFLAGS.  Memory
+accesses that require MMIO dispatch (slow-path CALL) may clobber arithmetic
+flags.  A backward flag-liveness analysis at trace build time determines which
+instructions need PUSHFQ/POPFQ bracketing — only those where the slow-path
+CALL sits between a flag-producing instruction and a later flag-consuming one.
 
 ---
 
@@ -220,7 +198,7 @@ The bump is correctly skipped for them (they are not stores).
 | `code_cache.hpp`      | 32 MB executable slab allocator                | ✅ Working    |
 | `trace.hpp`           | `Trace` struct, two-level `TraceCache`         | ✅ Working    |
 | `emitter.hpp`         | Byte emitter, EA synthesis, fastmem helpers, generic mem rewriter | ✅ Working    |
-| `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `PageVersions`   | ✅ Working    |
+| `trace_builder.hpp`   | `TraceBuilder`, `TraceArena`, `FaultBitmaps`, `SoftTlb` | ✅ Working    |
 | `insn_dispatch.hpp`   | Two-level O(1) mnemonic dispatch table          | ✅ Working    |
 | `trace_builder.cpp`   | Decode → classify → emit loop (table-driven)   | ✅ Working    |
 | `executor.hpp`        | `Executor` struct, `dispatch_trace` decl       | ✅ Working    |
@@ -1496,7 +1474,7 @@ Rendered as an overlay pass after the guest framebuffer presentation.
 No separate window system dependency — ImGui uses the existing Vulkan
 device/swapchain created for NV2A rendering.
 
-#### 5.18 Other Devices
+#### 5.18 Other Devices ✅ DONE
 
 **8259A PIC (Programmable Interrupt Controller)** ✅ DONE
 
@@ -1705,7 +1683,7 @@ Test runner `--xbox` mode writes HLE stubs to guest RAM and installs the handler
 `tests/hle.asm` exercises 21 kernel calls: memory, interlocked ops, events,
 synchronisation, timers, memory/string utilities, and MMIO mapping stubs.
 
-#### 5.20 Kernel: Dual-Mode (HLE + LLE)
+#### 5.20 Kernel: Dual-Mode (HLE + LLE) ✅ DONE
 
 The executor supports two kernel modes, selectable at launch:
 
@@ -1793,7 +1771,7 @@ JMP rel32** before the cold save-all-GP / write-next-EIP / RET fallback:
 JMP rel32          ; 5 bytes — initially rel32=0 (falls through to cold path)
 ; --- cold exit path ---
 save_all_gp        ; 7× MOV [R13+off], reg
-write_next_eip     ; MOV R14D, imm32 / MOV [R13+40], R14D
+write_next_eip     ; MOV R14D, imm32 / MOV [R13+CTX_NEXT_EIP], R14D
 RET                ; return to dispatch_trace trampoline
 ```
 
@@ -1818,12 +1796,12 @@ directly into the next trace's first instruction.
 
 **Unlinking** on SMC: `unlink_trace(t)` scans all traces in the arena and
 resets any JMP rel32 that targets `t->guest_eip` back to 0 (cold fallthrough).
-This is called before invalidating a trace due to a page-version mismatch.
+This is called by `invalidate_code_page` before setting `valid = false`.
 
-**SMC safety**: traces that contain page-version bumps (`emit_smc_page_bump`)
-set `Emitter::smc_written = true`, which suppresses link-slot creation entirely.
-Additionally, `try_link_trace` validates the target's page version before
-patching, preventing links to stale traces.
+**SMC safety**: When a code page is written, VEH catches the fault,
+`invalidate_code_page` invalidates all traces on that page (sets
+`valid = false`), and `try_link_trace` refuses to link to invalid targets.
+No per-store inline overhead — SMC is detected via page-level write protection.
 
 Link slot layout per trace:
 
@@ -1899,13 +1877,13 @@ The executor provides containment of ring-0 guest code essentially for free:
 
 | Escape Vector | Mitigation |
 |---|---|
-| Raw memory write to host VA | Fastmem window containment; PA >= ram_size (320 MB) → MMIO dispatch |
+| Raw memory write to host VA | 4 GB fastmem window containment; unmapped regions → VEH MMIO dispatch |
 | RDMSR/WRMSR to control host MSRs | All MSR access dispatched through thunk |
 | LGDT/LIDT to install real IDT | Thunk updates `ctx->idtr_base` only |
 | CLI/STI to mask host interrupts | Toggle `ctx->virtual_if` (virtual) |
 | IN/OUT to access host hardware | I/O port dispatch table |
 | INVD / cache poisoning | Thunk is a no-op |
-| Self-modifying code patching thunks | Page-version SMC detection triggers re-scan |
+| Self-modifying code patching thunks | Page write-protection + VEH invalidation |
 | Forged return address from thunk | Thunk stack lives on host RSP, outside fastmem |
 
 Guest code runs in host ring 3. All ring-0 operations are emulated. The guest
