@@ -192,6 +192,67 @@ start:
     ; Count should still be the same (no additional IRQs).
     ASSERT_EQ_MEM timer_count, edx
 
+    ; ================================================================
+    ; Test 6: Mode 3 (square wave) — fires periodically like mode 2,
+    ;         toggling internal output state each half-period.
+    ; ================================================================
+    cli
+    mov dword [timer_count], 0
+
+    ; PIT command: ch0, lo/hi, mode 3, binary.
+    mov al, 0x36        ; 00 11 011 0 = ch0, lo/hi, mode 3, binary
+    out 0x43, al
+    mov al, 10          ; count = 10
+    out 0x40, al
+    mov al, 0
+    out 0x40, al
+
+    sti
+
+    ; Wait for ≥3 IRQs (verify periodic behavior).
+    mov ecx, 200000
+.spin6:
+    cmp dword [timer_count], 3
+    jge .got_sq
+    dec ecx
+    jnz .spin6
+    mov eax, __test_num + 1
+    hlt
+.got_sq:
+    %assign __test_num __test_num + 1
+
+    ; ================================================================
+    ; Test 7: Channel 2 programming (not wired to IRQ).
+    ;         Just verify write/readback — ch2 is the speaker channel.
+    ; ================================================================
+    cli
+
+    ; Program ch2: lo/hi, mode 3, binary.
+    mov al, 0xB6        ; 10 11 011 0 = ch2, lo/hi, mode 3, binary
+    out 0x43, al
+    mov al, 50          ; count lo = 50
+    out 0x42, al
+    mov al, 0           ; count hi = 0
+    out 0x42, al
+
+    ; Latch ch2 and read back.
+    mov al, 0x80        ; 10 00 xxx x = ch2 latch
+    out 0x43, al
+    in al, 0x42
+    movzx ebx, al
+    in al, 0x42
+    movzx eax, al
+    shl eax, 8
+    or ebx, eax
+
+    ; Value should be <= 50 (loaded count).
+    cmp ebx, 50
+    jbe .ch2_ok
+    mov eax, __test_num + 1
+    hlt
+.ch2_ok:
+    %assign __test_num __test_num + 1
+
     PASS
 
 ; ---------------------------------------------------------------------------
