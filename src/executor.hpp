@@ -15,7 +15,7 @@ static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 // within this window.  Unmapped/protected pages fault via VEH.
 static constexpr uint64_t FASTMEM_4GB_SIZE = 0x100000000ULL; // 4 GB
 
-// Legacy 320 MB window size (used as fallback when 4 GB allocation fails).
+// 320 MB window size (fallback when 4 GB allocation fails on this host).
 static constexpr uint32_t FASTMEM_WINDOW_SIZE = 0x14000000u; // 320 MB
 
 // ---------------------------------------------------------------------------
