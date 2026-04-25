@@ -1697,7 +1697,6 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             uint32_t            ram_size,
                             CodeCache&          cc,
                             TraceArena&         arena,
-                            const PageVersions& pv,
                             GuestContext*       ctx,
                             const FaultBitmaps* fb) {
     if (guest_eip >= ram_size) {
@@ -1990,7 +1989,6 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     t->code_pa   = guest_eip;
     t->host_code = emit_buf;
     t->host_size = (uint32_t)e.pos;
-    t->page_ver  = pv.get(guest_eip);
     t->valid     = true;
 
     // Transfer pending link slots from the emitter to the trace.

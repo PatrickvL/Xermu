@@ -15,7 +15,6 @@ struct Trace {
     uint32_t  code_pa     = 0;         // guest physical address of code (for rebuild)
     uint8_t*  host_code   = nullptr;   // pointer into CodeCache slab
     size_t    host_size   = 0;         // emitted host code size in bytes
-    uint32_t  page_ver    = 0;         // page_versions[guest_eip>>12] at build time
     bool      valid       = false;
 
     // Block linking: up to 2 exit edges.

@@ -85,7 +85,6 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         GUEST_RAM_SIZE,
         exec->cc,
         exec->arena,
-        exec->pv,
         &exec->ctx,
         &exec->fb
     );
@@ -362,8 +361,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
             }
         }
     }
-    // Bump page version (for block-linking validation).
-    pv.bump(page);
+
     // Clear the fault bitmap for this page (fresh start on rebuild).
     fb.clear_page(page);
 }
@@ -386,14 +384,6 @@ void Executor::try_link_trace(Trace* t) {
 
         Trace* target = tcache.lookup(lk.target_eip);
         if (!target || !target->valid) continue;
-
-        // Verify the target trace's page is still current.
-        uint32_t target_pa = lk.target_eip;
-        if (paging_enabled()) {
-            target_pa = translate_va(lk.target_eip, /*is_write=*/false);
-            if (target_pa == ~0u) continue;
-        }
-        if (pv.get(target_pa) != target->page_ver) continue;
 
         // Patch the JMP rel32 to jump directly to the target's host_code.
         Emitter::patch_rel32(lk.jmp_rel32, target->host_code);
@@ -1203,7 +1193,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Build if missing.
         if (!t) {
             t = builder.build(code_pa, ram, GUEST_RAM_SIZE,
-                              cc, arena, pv, &ctx, &fb);
+                              cc, arena, &ctx, &fb);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;
