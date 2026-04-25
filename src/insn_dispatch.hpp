@@ -186,7 +186,7 @@ inline constexpr InsnClass INSN_CLASS_TABLE[] = {
     /* IC_MOVZX_MEM  */ { emit_handler_movzx_mem, ICF_HAS_DISPATCH },
     /* IC_MOVSX_MEM  */ { emit_handler_movsx_mem, ICF_HAS_DISPATCH },
     /* IC_FPU_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH },
-    /* IC_SSE_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH }, // same logic
+    /* IC_SSE_MEM    */ { emit_handler_fpu_mem,   ICF_HAS_DISPATCH }, // shares rewrite handler
     /* IC_PUSHFD     */ { emit_handler_pushfd,    ICF_HAS_DISPATCH },
     /* IC_POPFD      */ { emit_handler_popfd,     ICF_HAS_DISPATCH },
     /* IC_STRING     */ { emit_handler_string,    ICF_HAS_DISPATCH },

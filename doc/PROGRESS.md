@@ -141,7 +141,7 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 11: Named REX prefix constants in emitter.hpp (HEAD)
+### Step 11: Named REX prefix constants in emitter.hpp (8418da3)
 - Added `REX_B`, `REX_XB`, `REX_R`, `REX_RB`, `REX_W`, `REX_WB`, `REX_WR`,
   `REX_WRB` constexpr constants replacing ~30 raw hex REX prefix bytes.
 - Replaced all REX prefix hex literals in helper functions: emit_save/load_gp,
@@ -151,6 +151,18 @@
   emit_fastmem_store_imm*, emit_translate_r14.
 - ModRM bytes that coincidentally fall in 0x40-0x4F range left as hex.
 - **Files**: emitter.hpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 12: Fix stale DESIGN.md §5.14 and bug table (HEAD)
+- §5.14: Removed stale 10-line paragraph describing old `emit_smc_page_bump()`
+  per-store approach (removed in Step 5); replaced with reference to §5.13
+  page-protection + VEH.
+- Bug #5: Updated "~6.5 MB (TraceCache, PageVersions)" → "~13 MB (TraceArena,
+  TraceCache)" since PageVersions was removed.
+- §4: Fixed test count "46 suites" → "46 NASM + 2 C++ unit tests (48 total)".
+- insn_dispatch.hpp: Clarified IC_SSE_MEM "same logic" → "shares rewrite handler".
+- **Files**: doc/DESIGN.md, src/insn_dispatch.hpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -172,4 +184,5 @@
 | efaf822 | 48   | 0    | doc fixes                |
 | f72b2ad | 48   | 0    | ram_size dedup           |
 | 57212ea | 48   | 0    | stale comments           |
+| 8418da3 | 48   | 0    | REX constants            |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
