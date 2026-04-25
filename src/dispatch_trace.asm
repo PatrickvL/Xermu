@@ -7,7 +7,7 @@
 ;   R12 = fastmem_base   (callee-saved)
 ;   R13 = GuestContext*   (callee-saved)
 ;   R14 = EA scratch      (callee-saved — we push/pop it ourselves)
-;   R15 = ram_size        (callee-saved)
+;   R15 = unused          (callee-saved — push/pop for ABI compliance)
 ;
 ; Guest GP registers live in host EAX–EDI while a trace runs.
 ; ESP is NOT mapped to host RSP; it stays in ctx->gp[GP_ESP].
@@ -37,7 +37,7 @@ dispatch_trace PROC
     ; Set up pinned executor registers
     mov     r13, rdi                        ; R13 = ctx
     mov     r12, QWORD PTR [r13+48]        ; R12 = ctx->fastmem_base
-    mov     r15d, DWORD PTR [r13+56]       ; R15D = ctx->ram_size
+    ; R15 is no longer used (was ram_size); push/pop for ABI compliance only.
     mov     r14, rsi                        ; Stash host_code in R14
 
     ; Save host FPU/SSE state, load guest FPU/SSE state

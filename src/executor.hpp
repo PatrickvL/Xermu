@@ -10,9 +10,12 @@
 // Maximum guest RAM: 128 MB (e.g. Xbox devkit had 128 MB, retail 64 MB).
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
-// Fastmem window: covers 0x00000000–0x13FFFFFF (320 MB) so that both
-// main RAM (0x00000000) and the NV2A tiling mirror (0x0C000000) are
-// within the fast CMP R14,R15 / OP [R12+R14] path.
+// Fastmem window: covers the full 4 GB guest physical address space.
+// RAM, MMIO pass-through pages, and device register arrays are committed
+// within this window.  Unmapped/protected pages fault via VEH.
+static constexpr uint64_t FASTMEM_4GB_SIZE = 0x100000000ULL; // 4 GB
+
+// Legacy 320 MB window size (used as fallback when 4 GB allocation fails).
 static constexpr uint32_t FASTMEM_WINDOW_SIZE = 0x14000000u; // 320 MB
 
 // ---------------------------------------------------------------------------
@@ -39,7 +42,11 @@ struct Executor {
     TraceArena     arena;
     TraceBuilder   builder;
     PageVersions   pv;
+    FaultBitmaps   fb;               // per-code-page fault bitmaps for VEH rebuild
     SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
+
+    // VEH handle (Windows only) for 4 GB fastmem fault interception.
+    void*          veh_handle_ = nullptr;
 
     // I/O port dispatch table (small fixed table — only a handful needed).
     static constexpr int MAX_IO_PORTS = 64;
