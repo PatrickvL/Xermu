@@ -121,7 +121,7 @@ struct IdeChannel {
     // Task-file register array (indexed by port offset 0-8).
     static constexpr uint32_t REG_COUNT = 9;
     uint8_t regs[REG_COUNT] = {
-        0x00,   // DATA (unused as register; PIO handled separately)
+        0x00,   // DATA (not stored here; PIO transfers use a dedicated helper)
         0x01,   // ERROR
         0x01,   // SECT_COUNT
         0x01,   // LBA_LOW

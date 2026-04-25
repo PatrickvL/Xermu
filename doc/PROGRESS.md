@@ -166,11 +166,18 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 13: Replace reinterpret_cast with memcpy in privileged insn handlers (HEAD)
+### Step 13: Replace reinterpret_cast with memcpy in privileged insn handlers (e39e04b)
 - Replaced 8 `reinterpret_cast<uint16_t*>` / `<uint32_t*>` pointer aliasing
   violations with `memcpy` in LGDT/LIDT/LLDT/LTR/SGDT/SIDT/SLDT/STR handlers.
 - Strict aliasing safe; compiler optimizes memcpy to identical codegen.
 - **Files**: executor.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 14: Fix stale xbox device comments (HEAD)
+- flash.hpp: Clarified MCPX ROM comment ("currently unused, HLE mode only")
+- ide.hpp: Clarified DATA register comment ("not stored here; PIO via helper")
+- **Files**: src/xbox/flash.hpp, src/xbox/ide.hpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -194,4 +201,5 @@
 | 57212ea | 48   | 0    | stale comments           |
 | 8418da3 | 48   | 0    | REX constants            |
 | 180fb7d | 48   | 0    | doc fixes                |
+| e39e04b | 48   | 0    | memcpy aliasing          |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
