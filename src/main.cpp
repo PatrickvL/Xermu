@@ -107,7 +107,7 @@ static bool test_sum_loop() {
 
 // Guest program (load PA = 0x2000):
 //   Verify that EFLAGS set by CMP survive across a memory load whose inline
-//   fastmem dispatch (CMP R14, R15) would clobber ZF without the fix.
+//   fastmem dispatch would clobber ZF without the fix.
 //
 //   mov  eax, 42          ; value A
 //   mov  ecx, 42          ; value B (equal to A)
@@ -122,7 +122,7 @@ static bool test_sum_loop() {
 //   ret
 //
 // Expected: EBX = 1 (JE taken because ZF was preserved)
-// Without fix: EBX = 0 (CMP R14, R15 clears ZF → JE not taken)
+// Without fix: EBX = 0 (memory dispatch clobbers ZF → JE not taken)
 
 static const uint8_t test2_code[] = {
     0xB8, 0x2A, 0x00, 0x00, 0x00,       //  0: mov eax, 42
