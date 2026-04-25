@@ -72,7 +72,7 @@ During trace execution, four host registers are pinned:
 | R12      | `fastmem_base` — host pointer to guest PA 0          |
 | R13      | `GuestContext*` — executor context pointer            |
 | R14      | EA scratch — used for address computation staging     |
-| R15      | (reserved, currently unused — freed from ram_size)    |
+| R15      | (unused — callee-saved, reserved for ABI compliance) |
 
 ### 2.3 Memory Access Dispatch (4 GB Fastmem + VEH)
 
@@ -174,7 +174,7 @@ that page is write-protected via `VirtualProtect(PAGE_READONLY)` (Windows) or
 5. Execution continues — the run loop will rebuild traces on next visit.
 
 This approach has **zero per-store overhead** — there is no inline
-page-version bump sequence.  Stores to non-code pages (the common case)
+version-check sequence.  Stores to non-code pages (the common case)
 execute at full speed with a single `[R12 + R14]` fastmem instruction.
 The cost is paid only on the rare SMC event (a VEH fault + trace rebuild).
 
@@ -297,7 +297,7 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 - [x] JMP direct/indirect/memory trace exit
 - [x] Conditional branch (all Jcc) trace exit with taken/fallthrough paths
 - [x] Trace cache with two-level direct-mapped lookup (O(1), no hashing)
-- [x] SMC page-version validation on trace re-entry
+- [x] SMC page-protection + VEH-based trace invalidation
 - [x] ASM trampoline for both GCC/Clang (inline asm) and MSVC (MASM)
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
@@ -353,8 +353,8 @@ sequence where ZF must survive a memory load).
 #### 5.2 ~~FPU / x87 / MMX / SSE State~~ ✅ DONE (x87 core)
 **Resolved for x87.** Guest FPU/SSE state is saved/restored via FXSAVE/FXRSTOR
 in the dispatch trampoline (both MASM and GCC/Clang inline asm). `GuestContext`
-now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 128) and `host_fpu`
-(offset 640), both 16-byte aligned.
+now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 112) and `host_fpu`
+(offset 624), both 16-byte aligned.
 
 - **Register-only x87 instructions** (FLD1, FADD ST(i), FCOMPP, FNSTSW AX, etc.)
   run natively — verbatim-copied by the trace builder.
@@ -393,7 +393,7 @@ flags through unchanged. Verified by `tests/string.asm` (36 assertions).
 
 #### 5.4 ~~Segment Register Support (FS/GS Overrides)~~ ✅ DONE
 **Resolved.** `emit_ea_to_r14` now handles FS and GS segment overrides.
-`GuestContext` has `fs_base` (offset 108) and `gs_base` (offset 112) fields.
+`GuestContext` has `fs_base` (offset 96) and `gs_base` (offset 100) fields.
 When a memory operand has an FS or GS segment prefix, `emit_ea_to_r14` computes
 the flat EA as usual, then emits `ADD R14D, [R13 + seg_offset]` to add the
 segment base from the context. Works with all addressing modes (disp-only,
@@ -565,12 +565,12 @@ chained interrupts, nested interrupts (ISR calls INT), CLI/STI continuation,
 INT3 dispatch, stack integrity, and EFLAGS (CF) preservation across interrupt.
 
 #### 5.13 ~~SMC Detection~~ ✅ DONE (page protection + VEH)
-**Replaced page-version bumping with page protection.** After trace build, the
+**Page protection + VEH-based trace invalidation.** After trace build, the
 code page is marked read-only via VirtualProtect. Writes to protected pages are
 caught by VEH, which unprotects the page, invalidates all traces on that page
-(including resetting outbound block links), bumps the page version, clears fault
-bitmaps, and continues execution. The next trace lookup rebuilds from the
-modified RAM and re-protects the page.
+(including resetting outbound block links and patching fast-path memory accesses
+back to slow-path dispatches), clears fault bitmaps, and continues execution.
+The next trace lookup rebuilds from the modified RAM and re-protects the page.
 
 #### 5.14 ~~Correctness audit~~ ✅ DONE
 Full codebase audit for correctness, efficiency, and consistency.  Fixes:
@@ -634,7 +634,7 @@ Implemented in `src/xbox/` component files with `xbox_setup()` in `src/xbox/setu
 - **Debug console**: I/O port 0xE9 (bochs-style putchar).
 
 Test runner supports `--xbox` flag to use the full Xbox address map.
-`MAX_IO_PORTS` increased from 16 to 32.
+`MAX_IO_PORTS` increased from 16 to 64.
 
 #### 5.16 NV2A GPU
 **Priority: CRITICAL for games** — 16 MB of MMIO registers at `0xFD000000`.
@@ -661,7 +661,7 @@ the 64-bit nanosecond counter.  PFIFO CALL/RETURN uses the hardware-accurate
 | `PTIMER_DENOMINATOR`| 0x009210 | Read/write clock divider                  |
 | `PTIMER_TIME_0`    | 0x009400  | Low 32 bits of counter (bits [4:0] = 0)   |
 | `PTIMER_TIME_1`    | 0x009410  | High 29 bits of counter (ns >> 32)        |
-| `PTIMER_INTR_0`    | 0x009100  | Interrupt status (stub: always 0)         |
+| `PTIMER_INTR_0`    | 0x009100  | Interrupt status (alarm fires bit 0)  |
 
 This prevents Xbox kernel and game busy-wait loops that spin on PTIMER.
 
@@ -753,7 +753,7 @@ The register file covers:
 
 The state shadow is wired via `Nv2aState::method_handler` so that every
 method dispatched by the PFIFO thread updates the shadow automatically.
-14-assertion C++ unit test (`src/test_pgraph.cpp`) verifies end-to-end:
+58-assertion C++ unit test (`src/test_pgraph.cpp`) verifies end-to-end:
 push buffer commands → PFIFO parse → PGRAPH state capture.
 
 | Register              | Offset     | Behaviour                        |
@@ -837,7 +837,7 @@ identity-mapped offsets — something Vulkan explicitly supports.
 - On resizable-BAR hardware (all current discrete GPUs), the allocation uses
   `HOST_VISIBLE | DEVICE_LOCAL` and is **persistently mapped**.  Guest CPU writes
   from the JIT go directly into GPU memory at cache-line granularity with no
-  driver involvement.  Dirty page tracking uses the page-version system (§2.6).
+  driver involvement.  Dirty page tracking uses the page-protection system (§2.6).
 - On non-BAR hardware, a staging buffer with `vkCmdCopyBuffer` for dirty ranges
   provides the fallback path.
 
@@ -863,7 +863,7 @@ compute shader, no texture pool, no copy of any kind.**
   small CS writes directly into `VkImage` memory (not a separate staging
   buffer).  This CS is triggered only on dirty pages — in the common case the
   `VkImage` view is already valid.
-- **Invalidation:** tracked via the page-version system (§2.6).  When a page
+- **Invalidation:** tracked via the page-protection system (§2.6).  When a page
   containing texture data is written by the guest CPU, the texture is marked
   dirty and re-uploaded (modifier path) or re-deswizzled (fallback) on next GPU
   use.

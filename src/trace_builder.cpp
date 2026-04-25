@@ -3,7 +3,6 @@
 #include "insn_dispatch.hpp"
 #include <cstdio>
 #include <cstring>
-#include <cassert>
 
 // ---------------------------------------------------------------------------
 // C-linkage MMIO slow-path helpers called from JIT code.
