@@ -505,10 +505,10 @@ void Executor::handle_privileged() {
         uint32_t msr = ctx.gp[GP_ECX];
         uint64_t val = 0;
         switch (msr) {
-        case 0x174: val = ctx.sysenter_cs;  break; // IA32_SYSENTER_CS
-        case 0x175: val = ctx.sysenter_esp; break; // IA32_SYSENTER_ESP
-        case 0x176: val = ctx.sysenter_eip; break; // IA32_SYSENTER_EIP
-        case 0x10:  // IA32_TIME_STAMP_COUNTER
+        case MSR_SYSENTER_CS:  val = ctx.sysenter_cs;  break;
+        case MSR_SYSENTER_ESP: val = ctx.sysenter_esp; break;
+        case MSR_SYSENTER_EIP: val = ctx.sysenter_eip; break;
+        case MSR_TSC:
 #if defined(_MSC_VER)
             val = __rdtsc();
 #else
@@ -518,17 +518,17 @@ void Executor::handle_privileged() {
 #endif
             break;
         // MTRR MSRs
-        case 0xFE:  val = ctx.mtrr_def_type; break; // IA32_MTRR_DEF_TYPE
-        case 0x2FF: val = 0x0000000000000508ULL; break; // IA32_MTRRCAP (8 VR, FIX, no WC)
-        case 0x250: val = ctx.mtrr_fix64k; break;       // IA32_MTRR_FIX64K_00000
-        case 0x258: val = ctx.mtrr_fix16k[0]; break;    // IA32_MTRR_FIX16K_80000
-        case 0x259: val = ctx.mtrr_fix16k[1]; break;    // IA32_MTRR_FIX16K_A0000
+        case MSR_MTRR_DEF_TYPE:     val = ctx.mtrr_def_type; break;
+        case MSR_MTRRCAP:           val = 0x0000000000000508ULL; break; // 8 VR, FIX, no WC
+        case MSR_MTRR_FIX64K:       val = ctx.mtrr_fix64k; break;
+        case MSR_MTRR_FIX16K_80000: val = ctx.mtrr_fix16k[0]; break;
+        case MSR_MTRR_FIX16K_A0000: val = ctx.mtrr_fix16k[1]; break;
         default:
-            if (msr >= 0x200 && msr <= 0x20F) {
-                int idx = (msr - 0x200) / 2;
+            if (msr >= MSR_MTRR_PHYSBASE0 && msr <= 0x20F) {
+                int idx = (msr - MSR_MTRR_PHYSBASE0) / 2;
                 val = (msr & 1) ? ctx.mtrr_physmask[idx] : ctx.mtrr_physbase[idx];
-            } else if (msr >= 0x268 && msr <= 0x26F) {
-                val = ctx.mtrr_fix4k[msr - 0x268];
+            } else if (msr >= MSR_MTRR_FIX4K_BASE && msr <= MSR_MTRR_FIX4K_END) {
+                val = ctx.mtrr_fix4k[msr - MSR_MTRR_FIX4K_BASE];
             } else {
                 fprintf(stderr, "[exec] RDMSR ECX=%08X → 0\n", msr);
             }
@@ -544,21 +544,21 @@ void Executor::handle_privileged() {
         uint32_t msr = ctx.gp[GP_ECX];
         uint64_t val = ((uint64_t)ctx.gp[GP_EDX] << 32) | ctx.gp[GP_EAX];
         switch (msr) {
-        case 0x174: ctx.sysenter_cs  = (uint32_t)val; break;
-        case 0x175: ctx.sysenter_esp = (uint32_t)val; break;
-        case 0x176: ctx.sysenter_eip = (uint32_t)val; break;
+        case MSR_SYSENTER_CS:  ctx.sysenter_cs  = (uint32_t)val; break;
+        case MSR_SYSENTER_ESP: ctx.sysenter_esp = (uint32_t)val; break;
+        case MSR_SYSENTER_EIP: ctx.sysenter_eip = (uint32_t)val; break;
         // MTRR MSRs
-        case 0xFE:  ctx.mtrr_def_type = val; break;      // IA32_MTRR_DEF_TYPE
-        case 0x250: ctx.mtrr_fix64k = val; break;         // IA32_MTRR_FIX64K_00000
-        case 0x258: ctx.mtrr_fix16k[0] = val; break;      // IA32_MTRR_FIX16K_80000
-        case 0x259: ctx.mtrr_fix16k[1] = val; break;      // IA32_MTRR_FIX16K_A0000
+        case MSR_MTRR_DEF_TYPE:     ctx.mtrr_def_type = val; break;
+        case MSR_MTRR_FIX64K:       ctx.mtrr_fix64k = val; break;
+        case MSR_MTRR_FIX16K_80000: ctx.mtrr_fix16k[0] = val; break;
+        case MSR_MTRR_FIX16K_A0000: ctx.mtrr_fix16k[1] = val; break;
         default:
-            if (msr >= 0x200 && msr <= 0x20F) {
-                int idx = (msr - 0x200) / 2;
+            if (msr >= MSR_MTRR_PHYSBASE0 && msr <= 0x20F) {
+                int idx = (msr - MSR_MTRR_PHYSBASE0) / 2;
                 if (msr & 1) ctx.mtrr_physmask[idx] = val;
                 else         ctx.mtrr_physbase[idx] = val;
-            } else if (msr >= 0x268 && msr <= 0x26F) {
-                ctx.mtrr_fix4k[msr - 0x268] = val;
+            } else if (msr >= MSR_MTRR_FIX4K_BASE && msr <= MSR_MTRR_FIX4K_END) {
+                ctx.mtrr_fix4k[msr - MSR_MTRR_FIX4K_BASE] = val;
             } else {
                 fprintf(stderr, "[exec] WRMSR ECX=%08X val=%016llX\n", msr,
                         (unsigned long long)val);

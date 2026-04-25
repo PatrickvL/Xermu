@@ -198,11 +198,19 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 17: Fix all stale CMP R14,R15 references (HEAD)
+### Step 17: Fix all stale CMP R14,R15 references (750a582)
 - Removed all remaining references to the old pre-fastmem `CMP R14, R15; JAE`
   bounds-check pattern across the codebase.
 - **Files**: README.md, src/insn_dispatch.hpp, src/trace_builder.cpp,
   src/main.cpp, doc/DESIGN.md
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 18: MSR named constants (HEAD)
+- Added 14 `MSR_*` constants to context.hpp for SYSENTER, TSC, and MTRR MSR indices.
+- Replaced all raw hex MSR indices in executor.cpp RDMSR/WRMSR handlers.
+- Updated GuestContext field comments to reference constant names.
+- **Files**: src/context.hpp, src/executor.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -230,4 +238,5 @@
 | 106c906 | 48   | 0    | xbox comments            |
 | 885eba9 | 48   | 0    | consistency fixes        |
 | 4b0fdd3 | 48   | 0    | memcpy trace_builder     |
-| (HEAD)  | 48   | 0    | stale CMP R14,R15 refs   |
+| 750a582 | 48   | 0    | stale CMP R14,R15 refs   |
+| (HEAD)  | 48   | 0    | MSR named constants      |
