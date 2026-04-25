@@ -120,10 +120,17 @@ PB_BASE equ 0x00060000
     mov dword [PB_BASE + 0x200], PB_HDR_INC(0x300, 0, 1)
     mov dword [PB_BASE + 0x204], 0x42424242
 
+    ; Disable pusher before reprogramming GET/PUT to avoid a race where
+    ; the thread processes from the old GET through uninitialised memory.
+    mov dword [CACHE1_DMA_PUSH], 0
+
     ; Program pusher: GET = PB_BASE+0x100, PUT = PB_BASE+0x208.
     ; The JUMP at 0x100 redirects to 0x200, then 2 dwords (hdr+data) at 0x200.
-    mov dword [CACHE1_DMA_PUT], PB_BASE + 0x208
     mov dword [CACHE1_DMA_GET], PB_BASE + 0x100
+    mov dword [CACHE1_DMA_PUT], PB_BASE + 0x208
+
+    ; Re-enable pusher — thread drains from the correct GET.
+    mov dword [CACHE1_DMA_PUSH], 1
 
     ; Spin until GET == PUT.
     mov ecx, 400000
@@ -172,9 +179,15 @@ PB_BASE equ 0x00060000
     mov dword [PB_BASE + 0x404], 0x88888888
     mov dword [PB_BASE + 0x408], PB_RETURN
 
+    ; Disable pusher before reprogramming (same race avoidance as Phase 2).
+    mov dword [CACHE1_DMA_PUSH], 0
+
     ; Program pusher: GET = 0x300, PUT = 0x30C
-    mov dword [CACHE1_DMA_PUT], PB_BASE + 0x30C
     mov dword [CACHE1_DMA_GET], PB_BASE + 0x300
+    mov dword [CACHE1_DMA_PUT], PB_BASE + 0x30C
+
+    ; Re-enable pusher.
+    mov dword [CACHE1_DMA_PUSH], 1
 
     ; Spin until GET == PUT (PUT = 0x30C, after the post-return method)
     mov ecx, 400000
