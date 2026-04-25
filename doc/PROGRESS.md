@@ -223,7 +223,7 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 20: Fix flaky pfifo test — DMA pusher race condition (HEAD)
+### Step 20: Fix flaky pfifo test — DMA pusher race condition (678128d)
 - Root cause: Phases 2 and 3 wrote CACHE1_DMA_PUT before CACHE1_DMA_GET
   while the DMA pusher thread was still enabled. The thread could wake up
   between the two writes and process from the old GET through uninitialised
@@ -233,6 +233,15 @@
 - Verified: 50 consecutive runs with zero failures.
 - **Files**: tests/pfifo.asm
 - **Result**: 48/48 pass (pfifo 50/50 stress test)
+- **Status**: DONE
+
+### Step 21: Page table bit named constants (HEAD)
+- Added `PTE_PRESENT`, `PTE_RW`, `PTE_ACCESSED`, `PTE_DIRTY`, `PDE_PS`,
+  `PDE_4MB_BASE`, `PDE_4MB_OFF` to executor.hpp.
+- Replaced all raw hex PDE/PTE bit constants in executor.cpp `translate_va()`
+  and trace_builder.cpp `translate_va_jit()`.
+- **Files**: src/executor.hpp, src/executor.cpp, src/trace_builder.cpp
+- **Result**: 48/48 pass
 - **Status**: DONE
 
 ---
@@ -262,4 +271,5 @@
 | 750a582 | 48   | 0    | stale CMP R14,R15 refs   |
 | c55ed9f | 48   | 0    | MSR named constants      |
 | 86ef544 | 48   | 0    | PAGE_SIZE/MASK constants  |
-| (HEAD)  | 48   | 0    | pfifo race fix (50/50)   |
+| 678128d | 48   | 0    | pfifo race fix (50/50)   |
+| (HEAD)  | 48   | 0    | PTE/PDE bit constants    |
