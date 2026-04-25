@@ -20,8 +20,10 @@ enum StopReason : uint32_t {
 // Guest ESP is NOT mapped to host RSP; it lives in ctx->gp[GP_ESP] and is
 // accessed inline by emitted PUSH/POP/CALL/RET sequences.
 
-// IMPORTANT: field offsets are referenced from asm trampolines.
-// Do not reorder without updating executor.cpp and emitter.hpp.
+// IMPORTANT: field offsets are referenced from JIT code and asm trampolines
+// via CTX_* / CTX_ASM_* constants below.  Adding, removing, or reordering
+// fields will shift offsets and break the static_asserts — fix those first,
+// then rebuild.
 struct alignas(16) GuestContext {
     // GP registers [offsets 0..28], in x86 ModRM encoding order.
     uint32_t  gp[8];         // [0]  EAX ECX EDX EBX ESP EBP ESI EDI
@@ -31,11 +33,9 @@ struct alignas(16) GuestContext {
     uint32_t  next_eip;      // [40]  written by every trace exit stub
     uint32_t  stop_reason;   // [44]  StopReason — set by JIT for privileged stops
 
-    uint64_t  fastmem_base;  // [48]  host pointer to guest PA 0
-    uint32_t  _reserved_56;   // [56]  (was ram_size — now unused, kept for layout)
-    uint32_t  _pad1;         // [60]
+    uint64_t  fastmem_base;  // host pointer to guest PA 0
 
-    MmioMap*  mmio;          // [64]  MMIO dispatch table
+    MmioMap*  mmio;          // MMIO dispatch table
 
     // Emulated privileged state (never live in host registers)
     uint32_t  cr0, cr2, cr3, cr4;
@@ -46,12 +46,8 @@ struct alignas(16) GuestContext {
     uint8_t   _pad_vif[2];   // alignment padding
 
     // Segment base addresses (only FS/GS are typically non-zero in protected mode)
-    uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
-    uint32_t  gs_base;        // [112] GS segment base
-
-    // Reserved — was SMC page-version pointer (now handled by VEH).
-    uint32_t  _pad_pv;        // [116] alignment padding
-    uint64_t  _reserved_120;  // [120] (was page_versions — now unused, kept for layout)
+    uint32_t  fs_base;        // FS segment base (kernel KPCR)
+    uint32_t  gs_base;        // GS segment base
 
     // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
@@ -81,13 +77,9 @@ static_assert(offsetof(GuestContext, gp)           ==  0);
 static_assert(offsetof(GuestContext, eip)          == 32);
 static_assert(offsetof(GuestContext, next_eip)     == 40);
 static_assert(offsetof(GuestContext, fastmem_base) == 48);
-static_assert(offsetof(GuestContext, _reserved_56)  == 56);
-static_assert(offsetof(GuestContext, mmio)         == 64);
-static_assert(offsetof(GuestContext, fs_base)      == 108);
-static_assert(offsetof(GuestContext, gs_base)      == 112);
-static_assert(offsetof(GuestContext, _reserved_120) == 120);
-static_assert(offsetof(GuestContext, guest_fpu)    == 128);
-static_assert(offsetof(GuestContext, host_fpu)     == 640);
+static_assert(offsetof(GuestContext, mmio)         == 56);
+static_assert(offsetof(GuestContext, guest_fpu)    == 112);
+static_assert(offsetof(GuestContext, host_fpu)     == 624);
 
 // GP register indices (match x86 ModRM/SIB encoding order)
 enum : int {
@@ -128,8 +120,8 @@ inline constexpr int CTX_HOST_FPU      = (int)offsetof(GuestContext, host_fpu);
 #define CTX_ASM_GP_EDI      28
 #define CTX_ASM_EFLAGS      36
 #define CTX_ASM_FASTMEM_BASE 48
-#define CTX_ASM_GUEST_FPU  128
-#define CTX_ASM_HOST_FPU   640
+#define CTX_ASM_GUEST_FPU  112
+#define CTX_ASM_HOST_FPU   624
 
 static_assert(CTX_ASM_GP_EAX  == (int)offsetof(GuestContext, gp[0]));
 static_assert(CTX_ASM_GP_ECX  == (int)offsetof(GuestContext, gp[1]));
