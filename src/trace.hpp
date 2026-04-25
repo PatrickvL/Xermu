@@ -56,6 +56,14 @@ struct Trace {
                 return mem_sites[i].guest_eip;
         return 0;
     }
+
+    // Lookup host code offset by guest EIP. Returns ~0u on miss.
+    uint32_t lookup_host_offset(uint32_t eip) const {
+        for (int i = 0; i < num_mem_sites; ++i)
+            if (mem_sites[i].guest_eip == eip)
+                return mem_sites[i].host_offset;
+        return ~0u;
+    }
 };
 
 // Two-level direct-mapped trace cache: page_map[eip >> 12][offset >> 1].
