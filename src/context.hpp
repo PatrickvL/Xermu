@@ -11,6 +11,23 @@ enum StopReason : uint32_t {
 };
 
 // Host reserved registers during trace execution:
+
+// IA32 MSR indices used by RDMSR/WRMSR emulation.
+inline constexpr uint32_t MSR_TSC              = 0x10;
+inline constexpr uint32_t MSR_SYSENTER_CS      = 0x174;
+inline constexpr uint32_t MSR_SYSENTER_ESP     = 0x175;
+inline constexpr uint32_t MSR_SYSENTER_EIP     = 0x176;
+inline constexpr uint32_t MSR_MTRR_PHYSBASE0   = 0x200;
+inline constexpr uint32_t MSR_MTRR_PHYSMASK0   = 0x201;
+inline constexpr uint32_t MSR_MTRR_FIX64K      = 0x250;
+inline constexpr uint32_t MSR_MTRR_FIX16K_80000 = 0x258;
+inline constexpr uint32_t MSR_MTRR_FIX16K_A0000 = 0x259;
+inline constexpr uint32_t MSR_MTRR_FIX4K_BASE  = 0x268;
+inline constexpr uint32_t MSR_MTRR_FIX4K_END   = 0x26F;
+inline constexpr uint32_t MSR_MTRR_DEF_TYPE    = 0xFE;
+inline constexpr uint32_t MSR_MTRRCAP          = 0x2FF;
+
+// Host reserved registers during trace execution:
 //   R12 = fastmem_base   (uint8_t* to guest PA 0)
 //   R13 = GuestContext*
 //   R14 = EA scratch     (clobbered freely; not callee-saved within a trace)
@@ -56,17 +73,17 @@ struct alignas(16) GuestContext {
 
     // SYSENTER/SYSEXIT MSRs (IA32_SYSENTER_CS/EIP/ESP)
     // Placed after FPU state to avoid shifting hardcoded offsets.
-    uint32_t  sysenter_cs  = 0;   // MSR 0x174
-    uint32_t  sysenter_esp = 0;   // MSR 0x175
-    uint32_t  sysenter_eip = 0;   // MSR 0x176
+    uint32_t  sysenter_cs  = 0;   // MSR_SYSENTER_CS
+    uint32_t  sysenter_esp = 0;   // MSR_SYSENTER_ESP
+    uint32_t  sysenter_eip = 0;   // MSR_SYSENTER_EIP
 
     // MTRR MSRs — Memory Type Range Registers
-    uint64_t  mtrr_physbase[8] = {};  // MSR 0x200, 0x202, ..., 0x20E
-    uint64_t  mtrr_physmask[8] = {};  // MSR 0x201, 0x203, ..., 0x20F
-    uint64_t  mtrr_fix64k      = 0;   // MSR 0x250
-    uint64_t  mtrr_fix16k[2]   = {};  // MSR 0x258, 0x259
-    uint64_t  mtrr_fix4k[8]    = {};  // MSR 0x268–0x26F
-    uint64_t  mtrr_def_type    = 0x00000006; // MSR 0xFE (default = write-back)
+    uint64_t  mtrr_physbase[8] = {};  // MSR_MTRR_PHYSBASE0 + 2*i
+    uint64_t  mtrr_physmask[8] = {};  // MSR_MTRR_PHYSMASK0 + 2*i
+    uint64_t  mtrr_fix64k      = 0;   // MSR_MTRR_FIX64K
+    uint64_t  mtrr_fix16k[2]   = {};  // MSR_MTRR_FIX16K_80000, _A0000
+    uint64_t  mtrr_fix4k[8]    = {};  // MSR_MTRR_FIX4K_BASE–END
+    uint64_t  mtrr_def_type    = 0x00000006; // MSR_MTRR_DEF_TYPE (default = WB)
 
     // Task register and LDT selector (set by LTR / LLDT, read by STR / SLDT)
     uint16_t  tr_sel   = 0;  // Task Register selector
