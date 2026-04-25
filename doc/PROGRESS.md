@@ -235,12 +235,21 @@
 - **Result**: 48/48 pass (pfifo 50/50 stress test)
 - **Status**: DONE
 
-### Step 21: Page table bit named constants (HEAD)
+### Step 21: Page table bit named constants (eedec47)
 - Added `PTE_PRESENT`, `PTE_RW`, `PTE_ACCESSED`, `PTE_DIRTY`, `PDE_PS`,
   `PDE_4MB_BASE`, `PDE_4MB_OFF` to executor.hpp.
 - Replaced all raw hex PDE/PTE bit constants in executor.cpp `translate_va()`
   and trace_builder.cpp `translate_va_jit()`.
 - **Files**: src/executor.hpp, src/executor.cpp, src/trace_builder.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 22: FPU/SSE init + BUS_FLOAT constants (HEAD)
+- Added `FPU_CW_INIT` (0x037F), `SSE_MXCSR_INIT` (0x1F80) as local constexpr
+  in executor.cpp `init()`, replacing mutable temporaries.
+- Added `MmioMap::BUS_FLOAT` constant (0xFFFFFFFF) in mmio.hpp; replaced
+  raw hex in mmio.hpp `read()` and trace_builder.cpp MMIO fallback paths.
+- **Files**: src/executor.cpp, src/mmio.hpp, src/trace_builder.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -272,4 +281,5 @@
 | c55ed9f | 48   | 0    | MSR named constants      |
 | 86ef544 | 48   | 0    | PAGE_SIZE/MASK constants  |
 | 678128d | 48   | 0    | pfifo race fix (50/50)   |
-| (HEAD)  | 48   | 0    | PTE/PDE bit constants    |
+| eedec47 | 48   | 0    | PTE/PDE bit constants    |
+| (HEAD)  | 48   | 0    | FPU/SSE + BUS_FLOAT      |

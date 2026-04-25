@@ -16,7 +16,7 @@ void mmio_dispatch_read(GuestContext* ctx, uint32_t pa,
                         uint32_t dst_gp_idx, uint32_t size_bytes) {
     ctx->gp[dst_gp_idx] = ctx->mmio
         ? ctx->mmio->read(pa, size_bytes)
-        : 0xFFFF'FFFFu;
+        : MmioMap::BUS_FLOAT;
 }
 
 void mmio_dispatch_write(GuestContext* ctx, uint32_t pa,
@@ -150,7 +150,7 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         uint32_t v; memcpy(&v, base + pa, 4); return v;
     }
-    return ctx->mmio ? ctx->mmio->read(pa, 4) : 0xFFFF'FFFFu;
+    return ctx->mmio ? ctx->mmio->read(pa, 4) : MmioMap::BUS_FLOAT;
 }
 
 // Write a 32-bit value to guest physical memory (or MMIO).
