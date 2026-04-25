@@ -46,10 +46,14 @@
 - **Result**: 46/46 pass (all tests green!)
 - **Status**: DONE
 
-### Step 3: Fix DESIGN.md contradictions
-- **From audit**: duplicate section numbers, stale FPU offsets, test count
-  mismatches, stale instruction status entries, missing test files, etc.
-- **Status**: NOT STARTED
+### Step 3: Fix DESIGN.md contradictions (76833b1)
+- Fixed architecture diagram (malformed line, stale SMC description)
+- Fixed mnemonic counts: x87 27→29, SSE1 36→43
+- Fixed test suite count: 33→46
+- Rewrote §5.13 (SMC) for page-protection approach
+- Rewrote §5.22 (fastmem) for 4GB window + VEH
+- **Result**: 46/46 pass
+- **Status**: DONE
 
 ---
 
@@ -58,4 +62,6 @@
 | Commit  | Pass | Fail | Notes                    |
 |---------|------|------|--------------------------|
 | 0a9e1e5 | 44   | 2    | smc (expected), pfifo    |
-| bd78d89 | 45   | 1    | smc (expected)           || 3ff9331 | 46   | 0    | ALL PASS                 |
+| bd78d89 | 45   | 1    | smc (expected)           |
+| 3ff9331 | 46   | 0    | ALL PASS                 |
+| 76833b1 | 46   | 0    | ALL PASS (doc fixes)     |
