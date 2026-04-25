@@ -91,10 +91,16 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     exec->tcache.insert(new_trace);  // overwrites old slot
     faulting_trace->valid = false;
 
-    // Step 7: Redirect to START of new trace.
-    // The faulting instruction hasn't committed yet, so re-executing
-    // from the beginning is correct.
-    ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
+    // Step 7: Redirect to the faulting instruction's position in the new trace.
+    // The new trace has a slow-path CALL at the same guest EIP; skip there
+    // so that already-executed instructions are not re-executed.
+    uint32_t new_off = new_trace->lookup_host_offset(guest_eip);
+    if (new_off != ~0u) {
+        ctx_regs->Rip = (DWORD64)(uintptr_t)(new_trace->host_code + new_off);
+    } else {
+        // Fallback: start of trace (should not happen).
+        ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
+    }
 
     return EXCEPTION_CONTINUE_EXECUTION;
 }

@@ -538,6 +538,7 @@ static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
         emit_fastmem_op(e, guest_enc, size_bits, is_load);
     } else {
         // Slow path: full MMIO dispatch call.
+        e.add_mem_site(e.fault_eip);
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -569,6 +570,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
         else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
     } else {
         // Slow path: full MMIO dispatch call.
+        e.add_mem_site(e.fault_eip);
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -904,6 +906,7 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         if (save_flags) emit_restore_flags(e);
     } else {
         // Slow path: MMIO not supported for ALU-mem — UD2 trap
+        e.add_mem_site(e.fault_eip);
         e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
     return true;
@@ -971,6 +974,7 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
         if (esp_in_reg) emit_store_r8_to_esp(e);
     } else {
         // Slow path: MMIO not supported for SETcc/CMOVcc — UD2 trap
+        e.add_mem_site(e.fault_eip);
         e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
     return true;
@@ -1044,6 +1048,7 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         if (save_flags) emit_restore_flags(e);
     } else {
         // Slow path: UD2
+        e.add_mem_site(e.fault_eip);
         e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
     return true;
@@ -1066,6 +1071,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
             e.add_mem_site(e.fault_eip);
             emit_fastmem_store_imm32(e, imm);
         } else {
+            e.add_mem_site(e.fault_eip);
             if (save_flags) emit_save_flags(e);
             emit_save_all_gp(e);
             emit_ccall_arg0_ctx(e);
@@ -1105,6 +1111,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
             e.add_mem_site(e.fault_eip);
             emit_fastmem_op(e, reg_enc, 32, false);
         } else {
+            e.add_mem_site(e.fault_eip);
             if (save_flags) emit_save_flags(e);
             emit_save_all_gp(e);
             emit_ccall_arg0_ctx(e);
@@ -1165,6 +1172,7 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
             e.add_mem_site(e.fault_eip);
             emit_fastmem_op(e, reg_enc, 32, true);
         } else {
+            e.add_mem_site(e.fault_eip);
             if (save_flags) emit_save_flags(e);
             emit_save_all_gp(e);
             emit_ccall_arg0_ctx(e);
@@ -1254,6 +1262,7 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
         e.add_mem_site(e.fault_eip);
         emit_fastmem_op(e, GP_EBP, 32, true);
     } else {
+        e.add_mem_site(e.fault_eip);
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -1420,6 +1429,7 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
         if (esp_dst) emit_store_r8_to_esp(e);
     } else {
+        e.add_mem_site(e.fault_eip);
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -1465,6 +1475,7 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
         if (esp_dst) emit_store_r8_to_esp(e);
     } else {
+        e.add_mem_site(e.fault_eip);
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -1508,6 +1519,7 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         if (save_flags) emit_restore_flags(e);
     } else {
         // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
+        e.add_mem_site(e.fault_eip);
         e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
     return true;
