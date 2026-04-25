@@ -552,7 +552,7 @@ inline uint8_t* emit_jmp_fwd(Emitter& e) {
 
 // ---------------------------------------------------------------------------
 // EFLAGS save/restore — wraps memory dispatch sequences so that the inline
-// CMP R14, R15 (and SUB/ADD for ESP management) does not clobber guest flags.
+// SUB/ADD for ESP management does not clobber guest flags.
 //
 // PUSHFQ shifts RSP by 8, breaking 16-byte alignment.  We fix that with
 // LEA RSP, [RSP ± 8] which does NOT affect EFLAGS.

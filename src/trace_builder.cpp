@@ -1202,7 +1202,7 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_push_imm — (unused, PUSH routes through emit_handler_push)
+// emit_handler_push_imm — PUSH imm routes through the general PUSH handler.
 // ---------------------------------------------------------------------------
 bool emit_handler_push_imm(Emitter& e, const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand* ops, const uint8_t* raw,
