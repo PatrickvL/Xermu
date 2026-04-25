@@ -182,6 +182,7 @@ struct Nv2aState {
 
     Nv2aState() {
         pmc_regs[pmc::BOOT_0 / 4]             = 0x02A000A1;  // NV2A chip ID
+        pmc_regs[pmc::ENABLE / 4]             = 0xFFFFFFFF;  // all subsystems enabled
         pbus_regs[pbus::FBIO_RAM / 4]         = 0x00000003;  // DDR SDRAM
         ptimer_regs[ptimer::NUM / 4]           = 1;
         ptimer_regs[ptimer::DEN / 4]           = 1;
@@ -213,8 +214,21 @@ struct Nv2aState {
     }
 
     uint32_t pmc_intr_0() const {
+        // Computed: aggregates pending interrupts from sub-blocks.
+        // Each sub-block's INTR register is non-zero if any interrupt is pending.
+        // PMC_INTR_0 bit assignments (NV2A):
+        //   bit  0 = PFIFO
+        //   bit  1 = PVIDEO
+        //   bit  4 = PTIMER
+        //   bit  8 = PGRAPH  (not yet wired)
+        //   bit 24 = PCRTC
+        //   bit 28 = PBUS
         uint32_t val = 0;
-        if (pcrtc_regs[pcrtc::INTR / 4] & 1) val |= 0x01000000;
+        if (pfifo_regs[pfifo::INTR / 4])   val |= (1u << 0);
+        if (pvideo_regs[pvideo::INTR / 4])  val |= (1u << 1);
+        if (ptimer_regs[ptimer::INTR / 4])  val |= (1u << 4);
+        if (pcrtc_regs[pcrtc::INTR / 4])    val |= (1u << 24);
+        if (pbus_regs[pbus::INTR / 4])      val |= (1u << 28);
         return val;
     }
 
