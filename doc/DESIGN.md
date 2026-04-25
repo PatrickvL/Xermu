@@ -269,7 +269,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC, MAC/video/DVD (12) | ✅ ALL PASS   |
-| `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
+| `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO, PGRAPH, PRAMDAC, PFB, PRAMIN (19) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 | `tests/apu.asm`       | APU: FE/SE/VP/GP/EP registers, idle-voice, FIFOs (20) | ✅ ALL PASS   |
 | `tests/ide.asm`       | IDE ATA/ATAPI: regs, IDENTIFY, PACKET INQUIRY (19) | ✅ ALL PASS   |

@@ -155,6 +155,12 @@ struct Nv2aState {
     uint32_t pcrtc_regs[PCRTC_COUNT]     = {};
     uint32_t pramdac_regs[PRAMDAC_COUNT] = {};
 
+    // PRAMIN: Private Raster Memory (GPU instance memory).
+    // Mapped at NV2A_BASE + 0x700000 (1 MB). Contains RAMHT, RAMFC, RAMRO,
+    // and GPU object instances used by PFIFO and PGRAPH.
+    static constexpr uint32_t PRAMIN_SIZE = 1024 * 1024;  // 1 MB
+    uint8_t pramin[PRAMIN_SIZE] = {};
+
     // PTIMER: 56-bit freerunning nanosecond counter (not a flat register).
     uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;
@@ -399,6 +405,16 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
         if (r / 4 < Nv2aState::PRAMDAC_COUNT) return nv->pramdac_regs[r / 4];
         return 0;
     }
+    // --- PRAMIN (0x700000) ---
+    if (off >= 0x700000 && off < 0x800000) {
+        uint32_t r = off - 0x700000;
+        if (r + 3 < Nv2aState::PRAMIN_SIZE) {
+            uint32_t v;
+            memcpy(&v, nv->pramin + r, 4);
+            return v;
+        }
+        return 0;
+    }
 
     return 0;
 }
@@ -475,6 +491,13 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off >= 0x680000 && off < 0x681000) {
         uint32_t r = off - 0x680000;
         if (r / 4 < Nv2aState::PRAMDAC_COUNT) nv->pramdac_regs[r / 4] = val;
+        return;
+    }
+    // --- PRAMIN (0x700000) ---
+    if (off >= 0x700000 && off < 0x800000) {
+        uint32_t r = off - 0x700000;
+        if (r + 3 < Nv2aState::PRAMIN_SIZE)
+            memcpy(nv->pramin + r, &val, 4);
         return;
     }
 }

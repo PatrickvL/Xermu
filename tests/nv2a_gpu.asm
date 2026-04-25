@@ -1,7 +1,7 @@
 ; ===========================================================================
 ; nv2a_gpu.asm — NV2A GPU register tests (--xbox mode).
 ;
-; Tests PFIFO, PGRAPH, and PRAMDAC register stubs:
+; Tests PFIFO, PGRAPH, PRAMDAC, and PRAMIN register stubs:
 ;   1. PMC_BOOT_0 = NV2A chip ID (0x02A000A1)
 ;   2. PFIFO_CACHES write/read
 ;   3. PFIFO_MODE write/read
@@ -18,6 +18,9 @@
 ;  14. DMA_STATE idle when GET == PUT
 ;  15. DMA pusher: GET advances toward PUT after ticks
 ;  16. CACHE1_STATUS = empty after pusher drains
+;  17. PRAMIN write/read at offset 0
+;  18. PRAMIN write/read at offset 0x100
+;  19. PRAMIN initial value = 0
 ;  12. PRAMDAC VPLL_COEFF default readback
 ;  13. PFB_CFG0 = 0x03070103 (64 MB RAM)
 ; ===========================================================================
@@ -42,6 +45,9 @@ CACHE1_STATUS     equ NV2A + 0x003214
 PGRAPH_INTR       equ NV2A + 0x400100
 PGRAPH_INTR_EN    equ NV2A + 0x400140
 PGRAPH_FIFO       equ NV2A + 0x400720
+
+; PRAMIN
+PRAMIN_BASE       equ NV2A + 0x700000
 
 ; PRAMDAC
 NVPLL_COEFF       equ NV2A + 0x680500
@@ -152,5 +158,19 @@ CACHE1_DMA_STATE  equ NV2A + 0x003228
 ; === 16. CACHE1_STATUS = empty after pusher drains ===
     mov eax, [CACHE1_STATUS]
     ASSERT_EQ eax, 0x10         ; bit 4 = empty
+
+; === 17. PRAMIN write/read ===
+    mov dword [PRAMIN_BASE], 0xDEADBEEF
+    mov eax, [PRAMIN_BASE]
+    ASSERT_EQ eax, 0xDEADBEEF
+
+; === 18. PRAMIN offset 0x100 write/read ===
+    mov dword [PRAMIN_BASE + 0x100], 0x12345678
+    mov eax, [PRAMIN_BASE + 0x100]
+    ASSERT_EQ eax, 0x12345678
+
+; === 19. PRAMIN initial value = 0 ===
+    mov eax, [PRAMIN_BASE + 0x200]
+    ASSERT_EQ eax, 0x00000000
 
     PASS
