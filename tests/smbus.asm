@@ -6,9 +6,14 @@
 ;   2. Read EEPROM serial number byte (offset 0x34) = '0' (0x30)
 ;   3. Read EEPROM language (offset 0xE8) = 0x01 (English)
 ;   4. Read SMC version (device 0x10, command 0x01) = 0xD0
-;   5. Read SMC CPU temperature (device 0x10, command 0x09) = 25
+;   5. Read SMC CPU temperature (device 0x10, command 0x09) = 40
 ;   6. Write EEPROM byte, read it back
 ;   7. Status register W1C (write-1-to-clear)
+;   8. EEPROM MAC address byte 0 (offset 0x40) = 0x00
+;   9. EEPROM MAC address byte 1 (offset 0x41) = 0x50
+;  10. EEPROM video standard (offset 0x58)
+;  11. EEPROM DVD region (offset 0x54) = 0x01
+;  12. EEPROM time zone (offset 0xEC) = 0x00
 ;
 ; SMBus I/O protocol:
 ;   Port+0x04 (ADDRESS): device address byte (7-bit addr << 1 | R/W bit)
@@ -99,5 +104,25 @@ ORG 0x1000
     in  al, dx
     movzx ecx, al
     ASSERT_EQ ecx, 0x00         ; done bit cleared
+
+; === 8. EEPROM MAC address byte 0 (offset 0x40) ===
+    SMBUS_READ 0x54, 0x40
+    ASSERT_EQ eax, 0x00
+
+; === 9. EEPROM MAC address byte 1 (offset 0x41) ===
+    SMBUS_READ 0x54, 0x41
+    ASSERT_EQ eax, 0x50
+
+; === 10. EEPROM video standard (offset 0x58) ===
+    SMBUS_READ 0x54, 0x58
+    ASSERT_EQ eax, 0x00         ; NTSC-M low byte
+
+; === 11. EEPROM DVD region (offset 0x54) ===
+    SMBUS_READ 0x54, 0x54
+    ASSERT_EQ eax, 0x01         ; region 1
+
+; === 12. EEPROM time zone (offset 0xEC) = 0 ===
+    SMBUS_READ 0x54, 0xEC
+    ASSERT_EQ eax, 0x00
 
     PASS
