@@ -95,6 +95,17 @@
 - **Result**: 47/48 pass (pfifo pre-existing flaky)
 - **Status**: DONE
 
+### Step 7: Remove dead reserved fields from GuestContext (HEAD)
+- Removed `_reserved_56` (was ram_size), `_pad1`, `_pad_pv`,
+  `_reserved_120` (was page_versions) — 20 bytes of dead padding.
+  Layout-change-safe thanks to offsetof-based constants from Step 6.
+- Struct shrank: guest_fpu 128→112, host_fpu 640→624.
+- Updated MASM EQU constants and CTX_ASM_* preprocessor macros.
+- Updated static_asserts for new offsets.
+- **Files**: context.hpp, dispatch_trace.asm
+- **Result**: 47/48 pass (pfifo pre-existing flaky)
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -107,4 +118,5 @@
 | 76833b1 | 46   | 0    | ALL PASS (doc fixes)     |
 | (next)  | 48   | 0    | +fastmem, smc_stress     |
 | b89dcac | 47   | 1    | pfifo flaky              |
+| d50fb03 | 47   | 1    | pfifo flaky              |
 | (HEAD)  | 47   | 1    | pfifo flaky              |
