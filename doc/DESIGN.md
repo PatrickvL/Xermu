@@ -329,7 +329,7 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
 - [x] SMC detection via page protection + VEH (write to code page unprotects and invalidates)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 46 suites, CMake integration
+- [x] NASM test infrastructure: 46 NASM suites + 2 C++ unit tests (48 total), CMake integration
 - [x] NV2A PFIFO on dedicated host thread (parallel with guest CPU, CV-driven)
 
 ---
@@ -585,28 +585,13 @@ Full codebase audit for correctness, efficiency, and consistency.  Fixes:
 | `emit_ea_to_r14` with ESP base emits `LEA R14D,[RSP+disp]` | All `[ESP]` / `[ESP+N]` memory accesses use host RSP instead of guest ESP — widespread correctness failure | Load guest ESP from `ctx->gp[GP_ESP]` into R14, then `LEA R14D,[R14+disp]` for displacement |
 | MOV/ALU/LEA with ESP register operand executed natively on host RSP | `SUB ESP,N` / `ADD ESP,N` / `MOV ESP,r32` / `LEA ESP,[r+d]` corrupt host stack or produce wrong guest ESP | MOV ESP: read/write `ctx->gp[GP_ESP]` via `[R13+16]`. ALU ESP: load into R14, re-encode with R14, store back. LEA ESP: `emit_ea_to_r14` + `emit_store_r14_to_esp` |
 | ALU/MOVZX/MOVSX/CMOVcc with ESP in reg field + memory operand | `ADD [mem],ESP` / `ADD ESP,[mem]` / `MOVZX ESP,BYTE [mem]` use host RSP encoding (reg=4 in ModRM) | Load guest ESP into R8D, emit with R8 (REX.R+reg=0), store R8D back if ESP was destination. `MOV ESP,imm32` → `MOV DWORD [R13+16], imm32` |
-**Resolved.** Every inline fastmem store emits `emit_smc_page_bump()` — a
-12-or-16 byte sequence that loads the `page_versions` pointer from `GuestContext`
-(offset 120), right-shifts R14D (PA) by 12, and increments the version counter.
-The PUSHFQ/POPFQ wrapper is conditional: emitted only when the guest instruction
-produces arithmetic flags that may be live (ALU read-modify-write, SETcc/CMOVcc
-stores). Skipped for MOV stores, FPU stores, PUSH, and trace exit paths (12
-bytes). CMP/TEST [mem] are correctly excluded (read-only, no bump needed).
-The C-helper slow path (`write_guest_mem32`) also bumps.
-
-Nine JIT call sites: `emit_fastmem_dispatch`, `emit_fastmem_dispatch_store_imm`,
-`emit_handler_alu_mem`, `emit_handler_flagmem`, `emit_handler_push` (imm/reg),
-`emit_handler_fpu_mem`, `emit_call_exit` (direct/register).
+**Resolved.** SMC detection is now handled entirely by page protection + VEH
+(see §5.13). No per-store overhead; writes to code pages fault and trigger
+trace invalidation. The old `emit_smc_page_bump()` per-store sequence has been
+removed.
 
 Additionally fixed: CALL direct/register clobbered guest ECX via `MOV ECX, retaddr`
 scratch — replaced with `emit_fastmem_store_imm32` (imm-to-mem, no clobber).
-
-> **Design note**: This JIT does not use lazy flag evaluation. Guest instructions
-> run natively, so guest EFLAGS live in host RFLAGS. A `mprotect`/SIGSEGV-based
-> approach (zero per-store cost, fault on actual SMC) would eliminate the bump
-> overhead entirely but adds implementation complexity. The current per-store
-> bump is correct and sufficient; the conditional PUSHFQ/POPFQ avoids the worst
-> overhead on non-flag-producing stores (MOV, PUSH, FPU — the common case).
 
 ---
 
@@ -1864,7 +1849,7 @@ if the 4 GB allocation fails.
 | 2 | DEC ECX silently becomes REX prefix | Short-form INC/DEC `0x40`–`0x4F` are REX in x64 | `emit_clean_insn()` re-encodes as `FF /0` / `FF /1` |
 | 3 | Host RSP clobbers `ctx->gp[ESP]` | `emit_save_all_gp` saved all 8 regs including ESP | Skip `GP_ESP` in save/load loops |
 | 4 | `ctx->gp[EAX]` = return address, not sum | `emit_ret_exit` loaded `[ESP]` into EAX before saving | Save GP regs first, write retaddr directly to `ctx->next_eip` |
-| 5 | Stack overflow on `Executor` construction | ~6.5 MB of embedded arrays (TraceCache, PageVersions) | Heap-allocate via `std::make_unique` |
+| 5 | Stack overflow on `Executor` construction | ~13 MB of embedded arrays (TraceArena, TraceCache) | Heap-allocate via `std::make_unique` |
 | 6 | MSVC: `#error` on `dispatch_trace` | GCC `__attribute__((naked))` not available on MSVC x64 | MASM `.asm` trampoline for MSVC |
 | 7 | MMIO slow-path calls corrupt args on Windows | JIT emitted SysV ABI (RDI/RSI/RDX/RCX) on Windows | Platform-aware `emit_ccall_arg*` helpers + shadow space |
 | 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | Conditional PUSHFQ/POPFQ wrapping gated by backward flag-liveness analysis |
