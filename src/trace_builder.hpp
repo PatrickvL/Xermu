@@ -92,7 +92,6 @@ struct TraceBuilder {
     // Build and emit a trace starting at guest_eip.
     Trace* build(uint32_t           guest_eip,
                  const uint8_t*     ram,
-                 uint32_t           ram_size,
                  CodeCache&         cc,
                  TraceArena&        arena,
                  GuestContext*      ctx,

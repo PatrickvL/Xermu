@@ -82,7 +82,6 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     Trace* new_trace = exec->builder.build(
         faulting_trace->code_pa,
         exec->ram,
-        GUEST_RAM_SIZE,
         exec->cc,
         exec->arena,
         &exec->ctx,
@@ -1192,7 +1191,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
         // Build if missing.
         if (!t) {
-            t = builder.build(code_pa, ram, GUEST_RAM_SIZE,
+            t = builder.build(code_pa, ram,
                               cc, arena, &ctx, &fb);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);

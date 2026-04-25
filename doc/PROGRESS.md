@@ -120,6 +120,27 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 9: Fix stale DESIGN.md references (efaf822)
+- §2.6 rewritten for page-protection + VEH approach
+- §3 file map: PageVersions → FaultBitmaps + SoftTlb
+- §5.18 and §5.20 marked DONE
+- §5.21 SMC safety updated for VEH-based detection
+- §7 Sandbox: 4GB fastmem + VEH invalidation
+- Code example updated: `MOV [R13+40]` → `MOV [R13+CTX_NEXT_EIP]`
+- **Files**: doc/DESIGN.md
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 10: Remove GUEST_RAM_SIZE duplication and ram_size parameter (HEAD)
+- Removed `GUEST_RAM_SIZE_LOCAL` duplicate constant from trace_builder.cpp;
+  added `#include "executor.hpp"` so it uses the canonical `GUEST_RAM_SIZE`.
+- Removed `ram_size` parameter from `TraceBuilder::build()` — all callers
+  always passed `GUEST_RAM_SIZE`.  Replaced with a local `constexpr` alias
+  inside the function body.
+- **Files**: trace_builder.hpp, trace_builder.cpp, executor.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -134,4 +155,6 @@
 | b89dcac | 47   | 1    | pfifo flaky              |
 | d50fb03 | 47   | 1    | pfifo flaky              |
 | 09bb822 | 47   | 1    | pfifo flaky              |
+| (HEAD)  | 48   | 0    | ALL PASS                 |
+| efaf822 | 48   | 0    | doc fixes                |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
