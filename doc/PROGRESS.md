@@ -174,10 +174,19 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 14: Fix stale xbox device comments (HEAD)
+### Step 14: Fix stale xbox device comments (106c906)
 - flash.hpp: Clarified MCPX ROM comment ("currently unused, HLE mode only")
 - ide.hpp: Clarified DATA register comment ("not stored here; PIO via helper")
 - **Files**: src/xbox/flash.hpp, src/xbox/ide.hpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 15: Minor consistency fixes (HEAD)
+- executor.cpp: `0xFFFFFFFF` → `0xFFFFFFFFu` (unsigned suffix consistency)
+- executor.cpp: Fixed stale halt comment ("EIP == 0" → "EIP == 0xFFFFFFFF")
+- trace_builder.cpp: 2× "VEH intercepts faults" → "VEH intercepts faults
+  and sets bitmap" (match header comment)
+- **Files**: executor.cpp, trace_builder.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -202,4 +211,5 @@
 | 8418da3 | 48   | 0    | REX constants            |
 | 180fb7d | 48   | 0    | doc fixes                |
 | e39e04b | 48   | 0    | memcpy aliasing          |
+| 106c906 | 48   | 0    | xbox comments            |
 | (HEAD)  | 48   | 0    | ALL PASS                 |

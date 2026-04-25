@@ -531,7 +531,7 @@ static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
     emit_paging_translate(e, /*is_write=*/!is_load);
 
     if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults.
+        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
         e.add_mem_site(e.fault_eip);
         emit_fastmem_op(e, guest_enc, size_bits, is_load);
     } else {
@@ -561,7 +561,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
     emit_paging_translate(e, /*is_write=*/true);
 
     if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults.
+        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
         e.add_mem_site(e.fault_eip);
         if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
         else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
