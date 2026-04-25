@@ -14,6 +14,15 @@ static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 static constexpr uint32_t GUEST_PAGE_SIZE = 0x1000u;
 static constexpr uint32_t GUEST_PAGE_MASK = ~(GUEST_PAGE_SIZE - 1u); // 0xFFFFF000
 
+// x86 page-table entry (PDE/PTE) bit definitions.
+static constexpr uint32_t PTE_PRESENT  = 0x01u;
+static constexpr uint32_t PTE_RW       = 0x02u;
+static constexpr uint32_t PTE_ACCESSED = 0x20u;
+static constexpr uint32_t PTE_DIRTY    = 0x40u;
+static constexpr uint32_t PDE_PS       = 0x80u;  // Page Size (4 MB when set)
+static constexpr uint32_t PDE_4MB_BASE = 0xFFC00000u;
+static constexpr uint32_t PDE_4MB_OFF  = 0x003FFFFFu;
+
 // Fastmem window: covers the full 4 GB guest physical address space.
 // RAM, MMIO pass-through pages, and device register arrays are committed
 // within this window.  Unmapped/protected pages fault via VEH.

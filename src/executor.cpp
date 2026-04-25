@@ -1090,18 +1090,15 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
     uint32_t pde;
     memcpy(&pde, ram + pde_pa, 4);
 
-    if (!(pde & 1)) goto fault; // not present
+    if (!(pde & PTE_PRESENT)) goto fault;
 
     // 4 MB page (PS=1)?
-    if (pde & 0x80) {
-        // PA = PDE[31:22] << 22 | VA[21:0]
-        uint32_t pa = (pde & 0xFFC00000u) | (va & 0x003FFFFFu);
-        // Check write permission
-        if (is_write && !(pde & 2)) goto fault;
-        // Set accessed + dirty bits
-        if (!(pde & 0x20) || (is_write && !(pde & 0x40))) {
-            pde |= 0x20;  // accessed
-            if (is_write) pde |= 0x40;  // dirty
+    if (pde & PDE_PS) {
+        uint32_t pa = (pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF);
+        if (is_write && !(pde & PTE_RW)) goto fault;
+        if (!(pde & PTE_ACCESSED) || (is_write && !(pde & PTE_DIRTY))) {
+            pde |= PTE_ACCESSED;
+            if (is_write) pde |= PTE_DIRTY;
             memcpy(ram + pde_pa, &pde, 4);
         }
         return pa;
@@ -1114,22 +1111,20 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
 
-        if (!(pte & 1)) goto fault; // not present
-
-        if (is_write && !(pte & 2)) goto fault; // read-only
+        if (!(pte & PTE_PRESENT)) goto fault;
+        if (is_write && !(pte & PTE_RW)) goto fault;
 
         uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
 
-        // Set accessed + dirty bits
-        bool need_pde_update = !(pde & 0x20);
-        bool need_pte_update = !(pte & 0x20) || (is_write && !(pte & 0x40));
+        bool need_pde_update = !(pde & PTE_ACCESSED);
+        bool need_pte_update = !(pte & PTE_ACCESSED) || (is_write && !(pte & PTE_DIRTY));
         if (need_pde_update) {
-            pde |= 0x20;
+            pde |= PTE_ACCESSED;
             memcpy(ram + pde_pa, &pde, 4);
         }
         if (need_pte_update) {
-            pte |= 0x20;
-            if (is_write) pte |= 0x40;
+            pte |= PTE_ACCESSED;
+            if (is_write) pte |= PTE_DIRTY;
             memcpy(ram + pt_pa, &pte, 4);
         }
 
