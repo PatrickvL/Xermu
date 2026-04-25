@@ -240,7 +240,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
 | `xbox/flash.hpp`      | Flash ROM + MCPX: CFI commands, ID/status/erase  | ✅ Working    |
 | `xbox/pci.hpp`        | PCI config space: BARs, IRQs, bridge, all devices | ✅ Working    |
-| `xbox/smbus.hpp`      | SMBus: EEPROM, SMC (smc:: commands), video enc   | ✅ Working    |
+| `xbox/smbus.hpp`      | SMBus: EEPROM (MAC,video,DVD,region), SMC, enc   | ✅ Working    |
 | `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
 | `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
 | `xbox/misc_io.hpp`    | System control port 0x61, debug console 0xE9     | ✅ Working    |
@@ -268,7 +268,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/pit.asm`       | 8254 PIT: rate gen, square wave, one-shot, ch2 (7) | ✅ ALL PASS   |
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
-| `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
+| `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC, MAC/video/DVD (12) | ✅ ALL PASS   |
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 | `tests/apu.asm`       | APU: FE/SE/VP/GP/EP registers, idle-voice, FIFOs (20) | ✅ ALL PASS   |

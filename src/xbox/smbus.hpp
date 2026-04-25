@@ -66,14 +66,45 @@ struct SmbusState {
 
     void init_eeprom() {
         memset(eeprom, 0, sizeof(eeprom));
+
+        // Encrypted section (offsets 0x00-0x2B): HMAC + confounder + HDD key
+        // Left as zeros for emulation (no real encryption needed).
+
+        // Game region (offset 0x2C): 1=NTSC-NA, 2=NTSC-JP, 4=PAL
         eeprom[0x2C] = 0x01;
+
+        // Serial number (12 ASCII chars at offset 0x34)
         const char* serial = "000000000000";
         memcpy(eeprom + 0x34, serial, 12);
+
+        // MAC address (6 bytes at offset 0x40)
         eeprom[0x40] = 0x00; eeprom[0x41] = 0x50; eeprom[0x42] = 0xF2;
         eeprom[0x43] = 0x00; eeprom[0x44] = 0x00; eeprom[0x45] = 0x01;
-        eeprom[0x4C] = 0x00; eeprom[0x4D] = 0x01;
-        eeprom[0x4E] = 0x80; eeprom[0x4F] = 0x00;
+
+        // Online key (16 bytes at offset 0x48) - zeros for emulation
+
+        // Video standard (offset 0x58): 0x00400100 = NTSC-M
+        eeprom[0x58] = 0x00; eeprom[0x59] = 0x01; eeprom[0x5A] = 0x40;
+        eeprom[0x5B] = 0x00;
+
+        // Audio settings (offset 0x4C-0x4F)
+        eeprom[0x4C] = 0x00; eeprom[0x4D] = 0x01;  // stereo
+        eeprom[0x4E] = 0x80; eeprom[0x4F] = 0x00;   // AC3 disabled
+
+        // Parental control (offset 0x50): 0 = no restriction
+        eeprom[0x50] = 0x00;
+
+        // DVD region (offset 0x54): 1 = region 1
+        eeprom[0x54] = 0x01;
+
+        // Language (offset 0xE8): 1 = English
         eeprom[0xE8] = 0x01;
+
+        // Time zone (offset 0xEC-0xEF): 0 = GMT
+        eeprom[0xEC] = 0x00; eeprom[0xED] = 0x00;
+        eeprom[0xEE] = 0x00; eeprom[0xEF] = 0x00;
+
+        // Checksum placeholder (offset 0xFC)
         eeprom[0xFC] = 0x01;
     }
 };
