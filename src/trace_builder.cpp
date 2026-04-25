@@ -1,11 +1,9 @@
 #include "trace_builder.hpp"
+#include "executor.hpp"
 #include "insn_dispatch.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cassert>
-
-// Maximum guest RAM (matches GUEST_RAM_SIZE in executor.hpp).
-static constexpr uint32_t GUEST_RAM_SIZE_LOCAL = 128u * 1024u * 1024u;
 
 // ---------------------------------------------------------------------------
 // C-linkage MMIO slow-path helpers called from JIT code.
@@ -37,7 +35,7 @@ void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
 // Returns PA on success, ~0u on fault (CR2 set to faulting VA).
 uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     auto* ram = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-    uint32_t ram_size = GUEST_RAM_SIZE_LOCAL;
+    uint32_t ram_size = GUEST_RAM_SIZE;
     uint32_t cr3 = ctx->cr3;
 
     uint32_t pdir_pa = cr3 & 0xFFFFF000u;
@@ -99,7 +97,7 @@ static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is
 // Generic guest memory read (handles paging + MMIO).
 static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         switch (size) {
         case 1: return base[pa];
@@ -113,7 +111,7 @@ static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t siz
 // Generic guest memory write (handles paging + MMIO + SMC bump).
 static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         switch (size) {
         case 1: base[pa] = (uint8_t)val;  break;
@@ -131,7 +129,7 @@ void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     uint32_t pa = guest_translate(ctx, esp, true);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = eflags_val;
     }
@@ -143,7 +141,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
     uint32_t esp = ctx->gp[GP_ESP];
     ctx->gp[GP_ESP] = esp + 4;
     uint32_t pa = guest_translate(ctx, esp, false);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return *reinterpret_cast<uint32_t*>(base + pa);
     }
@@ -154,7 +152,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
 // Used by JMP/CALL [mem] handlers.
 uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
     uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return *reinterpret_cast<uint32_t*>(base + pa);
     }
@@ -165,7 +163,7 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
 // Used by PUSH [mem] and CALL [mem] handlers.
 void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
     uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = val;
         return;
@@ -294,7 +292,7 @@ void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
 uint32_t xlatb_helper(GuestContext* ctx) {
     uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
     uint32_t pa = guest_translate(ctx, ea, false);
-    if (pa < GUEST_RAM_SIZE_LOCAL) {
+    if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return base[pa];
     }
@@ -1694,11 +1692,11 @@ static constexpr uint32_t ARITH_FLAGS =
 
 Trace* TraceBuilder::build(uint32_t            guest_eip,
                             const uint8_t*      ram,
-                            uint32_t            ram_size,
                             CodeCache&          cc,
                             TraceArena&         arena,
                             GuestContext*       ctx,
                             const FaultBitmaps* fb) {
+    constexpr uint32_t ram_size = GUEST_RAM_SIZE;
     if (guest_eip >= ram_size) {
         fprintf(stderr, "[trace] EIP %08X outside RAM\n", guest_eip);
         return nullptr;
