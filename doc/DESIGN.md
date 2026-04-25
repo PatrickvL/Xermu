@@ -243,7 +243,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/smbus.hpp`      | SMBus: EEPROM (MAC,video,DVD,region), SMC, enc   | ✅ Working    |
 | `xbox/pic.hpp`        | 8259A PIC pair (master + slave)                  | ✅ Working    |
 | `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
-| `xbox/misc_io.hpp`    | System control port 0x61, debug console 0xE9     | ✅ Working    |
+| `xbox/misc_io.hpp`    | Sysctl 0x61 (toggle), POST 0x80, debug 0xE9      | ✅ Working    |
 | `xbox/setup.hpp`      | XboxHardware struct, tick callback, xbox_setup()  | ✅ Working    |
 | `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
@@ -291,6 +291,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/flash_cmd.asm`    | Flash CFI: ID, status, program, erase (10)      | ✅ ALL PASS   |
 | `tests/apu_voice.asm`    | APU VP voice slots: config, pitch, vol, env (10) | ✅ ALL PASS   |
 | `tests/nv2a_pmc.asm`     | NV2A PMC: ENABLE, INTR_0 aggregation (10)        | ✅ ALL PASS   |
+| `tests/xbox_io.asm`      | Misc I/O: sysctl toggle, POST code, debug (6)   | ✅ ALL PASS   |
 | `test_pgraph.cpp`     | PGRAPH state shadow C++ unit test (58 assertions) | ✅ ALL PASS   |
 
 ---
