@@ -14,7 +14,7 @@ enum StopReason : uint32_t {
 //   R12 = fastmem_base   (uint8_t* to guest PA 0)
 //   R13 = GuestContext*
 //   R14 = EA scratch     (clobbered freely; not callee-saved within a trace)
-//   R15 = ram_size       (32-bit comparison threshold for fastmem check)
+//   R15 = unused          (callee-saved, push/pop for ABI compliance only)
 //
 // Guest general-purpose registers are live in host EAX–EDI throughout the trace.
 // Guest ESP is NOT mapped to host RSP; it lives in ctx->gp[GP_ESP] and is
@@ -32,7 +32,7 @@ struct alignas(16) GuestContext {
     uint32_t  stop_reason;   // [44]  StopReason — set by JIT for privileged stops
 
     uint64_t  fastmem_base;  // [48]  host pointer to guest PA 0
-    uint32_t  ram_size;      // [56]  bytes of directly-accessible RAM
+    uint32_t  _reserved_56;   // [56]  (was ram_size — now unused, kept for layout)
     uint32_t  _pad1;         // [60]
 
     MmioMap*  mmio;          // [64]  MMIO dispatch table
@@ -49,10 +49,9 @@ struct alignas(16) GuestContext {
     uint32_t  fs_base;        // [108] FS segment base (kernel KPCR)
     uint32_t  gs_base;        // [112] GS segment base
 
-    // SMC page-version array — pointer to PageVersions::ver[].
-    // Stores bump ver[pa>>12]++ for self-modifying code detection.
+    // Reserved — was SMC page-version pointer (now handled by VEH).
     uint32_t  _pad_pv;        // [116] alignment padding
-    uint64_t  page_versions;  // [120] uint32_t* stored as uint64_t
+    uint64_t  _reserved_120;  // [120] (was page_versions — now unused, kept for layout)
 
     // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
@@ -82,11 +81,11 @@ static_assert(offsetof(GuestContext, gp)           ==  0);
 static_assert(offsetof(GuestContext, eip)          == 32);
 static_assert(offsetof(GuestContext, next_eip)     == 40);
 static_assert(offsetof(GuestContext, fastmem_base) == 48);
-static_assert(offsetof(GuestContext, ram_size)     == 56);
+static_assert(offsetof(GuestContext, _reserved_56)  == 56);
 static_assert(offsetof(GuestContext, mmio)         == 64);
 static_assert(offsetof(GuestContext, fs_base)      == 108);
 static_assert(offsetof(GuestContext, gs_base)      == 112);
-static_assert(offsetof(GuestContext, page_versions) == 120);
+static_assert(offsetof(GuestContext, _reserved_120) == 120);
 static_assert(offsetof(GuestContext, guest_fpu)    == 128);
 static_assert(offsetof(GuestContext, host_fpu)     == 640);
 

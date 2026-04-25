@@ -255,13 +255,11 @@ bool Executor::init(MmioMap* mmio) {
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.fastmem_base = (uint64_t)(uintptr_t)ram;
-    ctx.ram_size     = GUEST_RAM_SIZE;
     ctx.mmio         = mmio;
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
     ctx.halted       = false;
-    ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // legacy (kept for compat)
     tlb.flush();
 
     // Initialize guest FPU state to clean defaults.
