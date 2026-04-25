@@ -270,6 +270,29 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 24: Out-of-line slow-path stubs + VEH JMP patching (HEAD)
+- **Eliminated full trace rebuilds on VEH faults.** Instead of rebuilding
+  the entire trace when a fastmem op faults, the VEH handler now patches
+  the 5-byte fast-path site with a JMP rel32 to a pre-emitted slow-path
+  stub at the trace tail. No re-decode, no re-analysis, no re-emit.
+- Fast-path sites padded to ≥5 bytes (NOP fill) at emit time so JMP rel32
+  can overwrite in-place.
+- Deferred slow-path stubs emitted at trace tail after epilog: each stub
+  is the full slow-path sequence (save_flags? + save_gp + args + call_abs
+  + load_gp + restore_flags?) followed by JMP rel32 back to the byte after
+  the fast-path site.
+- VEH handler simplified: lookup MemOpSite → lookup stub_offset → write
+  5-byte JMP → redirect RIP → continue. No trace cache insert or invalidation.
+- Updated mmio_dispatch_read/write/write_imm helpers to handle both RAM
+  and MMIO addresses (fault bitmap is per-EIP, not per-PA, so a slow-path
+  site may see either address range on different executions).
+- Added DeferredStub array + stub_offset field to Emitter::MemSite and
+  Trace::MemOpSite.
+- **Files**: src/emitter.hpp, src/trace.hpp, src/trace_builder.cpp,
+  src/executor.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results

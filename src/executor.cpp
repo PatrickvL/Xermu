@@ -75,40 +75,26 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Step 5: Set fault bitmap bit.
-    exec->fb.set(guest_eip);
-
-    // Step 6: Rebuild the trace with bitmap-set slow paths.
-    Trace* new_trace = exec->builder.build(
-        faulting_trace->code_pa,
-        exec->ram,
-        exec->cc,
-        exec->arena,
-        &exec->ctx,
-        &exec->fb
-    );
-
-    if (!new_trace) {
-        fprintf(stderr, "[veh] rebuild failed for trace @%08X\n",
-                faulting_trace->guest_eip);
+    // Step 5: Look up the pre-emitted slow-path stub for this site.
+    uint32_t stub_off = faulting_trace->lookup_stub_offset(rip);
+    if (stub_off == ~0u || stub_off == 0) {
+        // No out-of-line stub (e.g. ALU-mem UD2 case) — fall through to crash.
+        fprintf(stderr, "[veh] FAULT in trace @%08X — no stub for mem site (guest %08X)\n",
+                faulting_trace->guest_eip, guest_eip);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Update trace cache and invalidate old trace.
-    new_trace->guest_eip = faulting_trace->guest_eip;
-    exec->tcache.insert(new_trace);  // overwrites old slot
-    faulting_trace->valid = false;
+    // Step 6: Patch the fast-path site with JMP rel32 to the stub.
+    // The fast-path site is ≥5 bytes (padded at emit time).
+    uint8_t* patch_addr = faulting_trace->host_code +
+                          (uint32_t)(rip - faulting_trace->host_code);
+    uint8_t* stub_addr  = faulting_trace->host_code + stub_off;
+    int32_t  rel = (int32_t)(stub_addr - (patch_addr + 5));
+    patch_addr[0] = 0xE9; // JMP rel32
+    memcpy(patch_addr + 1, &rel, 4);
 
-    // Step 7: Redirect to the faulting instruction's position in the new trace.
-    // The new trace has a slow-path CALL at the same guest EIP; skip there
-    // so that already-executed instructions are not re-executed.
-    uint32_t new_off = new_trace->lookup_host_offset(guest_eip);
-    if (new_off != ~0u) {
-        ctx_regs->Rip = (DWORD64)(uintptr_t)(new_trace->host_code + new_off);
-    } else {
-        // Fallback: start of trace (should not happen).
-        ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
-    }
+    // Step 7: Redirect RIP to the stub for this execution.
+    ctx_regs->Rip = (DWORD64)(uintptr_t)stub_addr;
 
     return EXCEPTION_CONTINUE_EXECUTION;
 }

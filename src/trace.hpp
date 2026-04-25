@@ -34,17 +34,19 @@ struct Trace {
 
     // Memory-op site table: maps host code offset → guest EIP for VEH lookup.
     // Populated during trace build at each memory-op emit site.
+    // stub_offset: offset of out-of-line slow-path stub (0 = no stub / UD2 case).
     static constexpr int MAX_MEM_SITES = 64;
     struct MemOpSite {
         uint32_t host_offset;   // offset from host_code where the mem op starts
         uint32_t guest_eip;     // guest instruction that emitted this memory op
+        uint32_t stub_offset;   // offset of pre-emitted slow-path stub (0 = none)
     };
     MemOpSite mem_sites[MAX_MEM_SITES] = {};
     int       num_mem_sites = 0;
 
-    void add_mem_site(uint32_t host_off, uint32_t geip) {
+    void add_mem_site(uint32_t host_off, uint32_t geip, uint32_t stub_off = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { host_off, geip };
+            mem_sites[num_mem_sites++] = { host_off, geip, stub_off };
     }
 
     // Lookup guest EIP by host code address. Returns 0 on miss.
@@ -61,6 +63,16 @@ struct Trace {
         for (int i = 0; i < num_mem_sites; ++i)
             if (mem_sites[i].guest_eip == eip)
                 return mem_sites[i].host_offset;
+        return ~0u;
+    }
+
+    // Lookup stub offset for the mem site at the given host address.
+    // Returns stub_offset (0 = no stub), or ~0u if no mem site found.
+    uint32_t lookup_stub_offset(const uint8_t* host_addr) const {
+        uint32_t off = (uint32_t)(host_addr - host_code);
+        for (int i = 0; i < num_mem_sites; ++i)
+            if (mem_sites[i].host_offset == off)
+                return mem_sites[i].stub_offset;
         return ~0u;
     }
 };

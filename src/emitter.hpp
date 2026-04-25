@@ -31,6 +31,7 @@ struct Emitter {
     struct MemSite {
         uint32_t host_offset;
         uint32_t guest_eip;
+        uint32_t stub_offset;  // offset of out-of-line slow-path stub (0 = none)
     };
     static constexpr int MAX_MEM_SITES = 64;
     MemSite mem_sites[MAX_MEM_SITES] = {};
@@ -38,7 +39,34 @@ struct Emitter {
 
     void add_mem_site(uint32_t guest_eip_val) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { (uint32_t)pos, guest_eip_val };
+            mem_sites[num_mem_sites++] = { (uint32_t)pos, guest_eip_val, 0 };
+    }
+
+    // Deferred slow-path stubs: recorded during fast-path emit, emitted at trace tail.
+    enum StubKind : uint8_t { STUB_READ, STUB_WRITE, STUB_WRITE_IMM };
+    struct DeferredStub {
+        int      mem_site_idx;   // index into mem_sites[] for this site
+        uint32_t return_offset;  // host offset to JMP back to after stub
+        StubKind kind;
+        uint8_t  gp_idx;        // guest register index (for READ/WRITE)
+        uint8_t  size_bytes;    // 1, 2, or 4
+        uint32_t imm;           // immediate value (for WRITE_IMM)
+        bool     save_flags;
+    };
+    static constexpr int MAX_DEFERRED_STUBS = 64;
+    DeferredStub deferred_stubs[MAX_DEFERRED_STUBS] = {};
+    int num_deferred_stubs = 0;
+
+    // Record a deferred slow-path stub for the most recently added mem_site.
+    void defer_stub(StubKind kind, uint8_t gp_idx, uint8_t size_bytes,
+                    uint32_t imm, bool save_flags) {
+        if (num_deferred_stubs < MAX_DEFERRED_STUBS) {
+            deferred_stubs[num_deferred_stubs++] = {
+                num_mem_sites - 1,   // links to the last add_mem_site
+                (uint32_t)pos,       // return_offset = current pos (byte after fast-path)
+                kind, gp_idx, size_bytes, imm, save_flags
+            };
+        }
     }
 
     void add_pending_link(uint8_t* site, uint32_t target) {
@@ -792,6 +820,56 @@ inline void emit_ccall_arg3_imm(Emitter& e, uint32_t v) {
     // MOV ECX, imm32
     e.emit8(0xB9); e.emit32(v);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-line slow-path stub emission.
+// Called after the trace body + epilog to emit deferred stubs at the tail.
+// Each stub: save_flags? + save_gp + args + call_abs + load_gp + restore_flags?
+//            + JMP rel32 back to the instruction after the fast-path site.
+// ---------------------------------------------------------------------------
+extern "C" void mmio_dispatch_read(GuestContext*, uint32_t, uint32_t, uint32_t);
+extern "C" void mmio_dispatch_write(GuestContext*, uint32_t, uint32_t, uint32_t);
+extern "C" void mmio_dispatch_write_imm(GuestContext*, uint32_t, uint32_t, uint32_t);
+
+inline void emit_deferred_stubs(Emitter& e) {
+    for (int i = 0; i < e.num_deferred_stubs; ++i) {
+        auto& s = e.deferred_stubs[i];
+        // Record the stub offset in the corresponding mem_site.
+        uint32_t stub_off = (uint32_t)e.pos;
+        if (s.mem_site_idx >= 0 && s.mem_site_idx < e.num_mem_sites)
+            e.mem_sites[s.mem_site_idx].stub_offset = stub_off;
+
+        // Emit the slow-path body (identical to current inline slow path).
+        if (s.save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        switch (s.kind) {
+        case Emitter::STUB_READ:
+            emit_ccall_arg2_imm(e, s.gp_idx);
+            emit_ccall_arg3_imm(e, s.size_bytes);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+            break;
+        case Emitter::STUB_WRITE:
+            emit_ccall_arg2_imm(e, s.gp_idx);
+            emit_ccall_arg3_imm(e, s.size_bytes);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
+            break;
+        case Emitter::STUB_WRITE_IMM:
+            emit_ccall_arg2_imm(e, s.imm);
+            emit_ccall_arg3_imm(e, s.size_bytes);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
+            break;
+        }
+        emit_load_all_gp(e);
+        if (s.save_flags) emit_restore_flags(e);
+
+        // JMP rel32 back to the byte after the fast-path site.
+        e.emit8(0xE9);
+        int32_t rel = (int32_t)s.return_offset - (int32_t)(e.pos + 4);
+        e.emit32((uint32_t)rel);
+    }
 }
 
 // ---------------------------------------------------------------------------

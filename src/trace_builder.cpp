@@ -5,29 +5,49 @@
 #include <cstring>
 
 // ---------------------------------------------------------------------------
-// C-linkage MMIO slow-path helpers called from JIT code.
+// C-linkage slow-path helpers called from JIT code.
 // All guest GP regs are saved to GuestContext before the call.
+// These handle BOTH normal RAM accesses and MMIO — the fault bitmap is
+// per-EIP not per-PA, so a slow-path site may see either address range.
 // ---------------------------------------------------------------------------
 
 extern "C" {
 
 void mmio_dispatch_read(GuestContext* ctx, uint32_t pa,
                         uint32_t dst_gp_idx, uint32_t size_bytes) {
-    ctx->gp[dst_gp_idx] = ctx->mmio
-        ? ctx->mmio->read(pa, size_bytes)
-        : MmioMap::BUS_FLOAT;
+    if (pa < GUEST_RAM_SIZE) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        uint32_t v = 0;
+        memcpy(&v, base + pa, size_bytes);
+        ctx->gp[dst_gp_idx] = v;
+    } else {
+        ctx->gp[dst_gp_idx] = ctx->mmio
+            ? ctx->mmio->read(pa, size_bytes)
+            : MmioMap::BUS_FLOAT;
+    }
 }
 
 void mmio_dispatch_write(GuestContext* ctx, uint32_t pa,
                          uint32_t src_gp_idx, uint32_t size_bytes) {
-    if (ctx->mmio)
-        ctx->mmio->write(pa, ctx->gp[src_gp_idx], size_bytes);
+    if (pa < GUEST_RAM_SIZE) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        uint32_t val = ctx->gp[src_gp_idx];
+        memcpy(base + pa, &val, size_bytes);
+    } else {
+        if (ctx->mmio)
+            ctx->mmio->write(pa, ctx->gp[src_gp_idx], size_bytes);
+    }
 }
 
 void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
                              uint32_t value, uint32_t size_bytes) {
-    if (ctx->mmio)
-        ctx->mmio->write(pa, value, size_bytes);
+    if (pa < GUEST_RAM_SIZE) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        memcpy(base + pa, &value, size_bytes);
+    } else {
+        if (ctx->mmio)
+            ctx->mmio->write(pa, value, size_bytes);
+    }
 }
 
 // VA→PA page-table walk called from JIT code when paging is enabled.
@@ -514,34 +534,25 @@ uint8_t TraceBuilder::jcc_short_opcode(ZydisMnemonic m) {
 // `guest_enc` is the register encoding, `size_bits` the operand width,
 // `is_load` true for load, false for store.
 //
-// Two modes based on e.slow_path:
-//   false → emit bare fastmem op; VEH handles faults and sets bitmap bit
-//   true  → emit slow-path MMIO call directly (bitmap was set on prior fault)
+// Always emits the fast-path (bare fastmem op padded to ≥5 bytes).
+// A deferred slow-path stub is recorded for emission at the trace tail.
+// On VEH fault, the 5-byte fast-path site is patched with JMP rel32 to the stub.
 static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
                                    uint8_t guest_enc, unsigned size_bits,
                                    bool is_load, bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/!is_load);
 
-    if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_op(e, guest_enc, size_bits, is_load);
-    } else {
-        // Slow path: full MMIO dispatch call.
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, guest_enc);
-        emit_ccall_arg3_imm(e, size_bits / 8);
-        emit_call_abs(e, is_load
-            ? reinterpret_cast<void*>(mmio_dispatch_read)
-            : reinterpret_cast<void*>(mmio_dispatch_write));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // Fast path: single instruction; VEH intercepts faults and patches to stub.
+    e.add_mem_site(e.fault_eip);
+    size_t before = e.pos;
+    emit_fastmem_op(e, guest_enc, size_bits, is_load);
+    // Pad to 5 bytes so VEH can overwrite with JMP rel32.
+    while (e.pos - before < 5) e.emit8(0x90); // NOP
+
+    // Record deferred slow-path stub.
+    e.defer_stub(is_load ? Emitter::STUB_READ : Emitter::STUB_WRITE,
+                 guest_enc, (uint8_t)(size_bits / 8), 0, save_flags);
     return true;
 }
 
@@ -553,25 +564,18 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/true);
 
-    if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
-        e.add_mem_site(e.fault_eip);
-        if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
-        else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
-        else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
-    } else {
-        // Slow path: full MMIO dispatch call.
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, imm);           // arg2 = value (not gp index)
-        emit_ccall_arg3_imm(e, size_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // Fast path: single instruction; VEH intercepts faults and patches to stub.
+    e.add_mem_site(e.fault_eip);
+    size_t before = e.pos;
+    if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
+    else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
+    else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
+    // Pad to 5 bytes so VEH can overwrite with JMP rel32.
+    while (e.pos - before < 5) e.emit8(0x90); // NOP
+
+    // Record deferred slow-path stub.
+    e.defer_stub(Emitter::STUB_WRITE_IMM, 0, (uint8_t)(size_bits / 8),
+                 imm, save_flags);
     return true;
 }
 
@@ -1052,21 +1056,11 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_store_imm32(e, imm);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, imm);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        e.add_mem_site(e.fault_eip);
+        size_t before = e.pos;
+        emit_fastmem_store_imm32(e, imm);
+        while (e.pos - before < 5) e.emit8(0x90);
+        e.defer_stub(Emitter::STUB_WRITE_IMM, 0, 4, imm, save_flags);
         return true;
     }
 
@@ -1092,21 +1086,11 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_op(e, reg_enc, 32, false);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, reg_enc);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        e.add_mem_site(e.fault_eip);
+        size_t before = e.pos;
+        emit_fastmem_op(e, reg_enc, 32, false);
+        while (e.pos - before < 5) e.emit8(0x90);
+        e.defer_stub(Emitter::STUB_WRITE, reg_enc, 4, 0, save_flags);
         return true;
     }
 
@@ -1153,21 +1137,11 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/false);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_op(e, reg_enc, 32, true);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, reg_enc);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        e.add_mem_site(e.fault_eip);
+        size_t before = e.pos;
+        emit_fastmem_op(e, reg_enc, 32, true);
+        while (e.pos - before < 5) e.emit8(0x90);
+        e.defer_stub(Emitter::STUB_READ, reg_enc, 4, 0, save_flags);
         emit_add_ctx_esp(e, 4);
         return true;
     }
@@ -1243,21 +1217,11 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     emit_load_esp_to_r14(e);
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_op(e, GP_EBP, 32, true);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, GP_EBP);
-        emit_ccall_arg3_imm(e, 4);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    e.add_mem_site(e.fault_eip);
+    size_t before = e.pos;
+    emit_fastmem_op(e, GP_EBP, 32, true);
+    while (e.pos - before < 5) e.emit8(0x90);
+    e.defer_stub(Emitter::STUB_READ, GP_EBP, 4, 0, save_flags);
     emit_add_ctx_esp(e, 4);
     return true;
 }
@@ -1409,22 +1373,13 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
-        if (esp_dst) emit_store_r8_to_esp(e);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, dst_enc);
-        emit_ccall_arg3_imm(e, src_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    e.add_mem_site(e.fault_eip);
+    size_t before = e.pos;
+    emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
+    while (e.pos - before < 5) e.emit8(0x90);
+    e.defer_stub(Emitter::STUB_READ, dst_enc, (uint8_t)(src_bits / 8),
+                 0, save_flags);
     return true;
 }
 
@@ -1455,22 +1410,13 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
-        if (esp_dst) emit_store_r8_to_esp(e);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, dst_enc);
-        emit_ccall_arg3_imm(e, src_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    e.add_mem_site(e.fault_eip);
+    size_t before = e.pos;
+    emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
+    while (e.pos - before < 5) e.emit8(0x90);
+    e.defer_stub(Emitter::STUB_READ, dst_enc, (uint8_t)(src_bits / 8),
+                 0, save_flags);
     return true;
 }
 
@@ -1967,6 +1913,11 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     if (!done_flag)
         emit_epilog_static(e, guest_pc);
 
+    // Emit out-of-line slow-path stubs at the trace tail.
+    // These are pre-emitted so VEH can patch fast-path sites to JMP here
+    // instead of rebuilding the entire trace.
+    emit_deferred_stubs(e);
+
     Trace* t = arena.alloc();
     if (!t) return nullptr;
 
@@ -1989,7 +1940,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     // Transfer memory-op site table from emitter to trace (for VEH lookup).
     t->num_mem_sites = 0;
     for (int i = 0; i < e.num_mem_sites; ++i)
-        t->add_mem_site(e.mem_sites[i].host_offset, e.mem_sites[i].guest_eip);
+        t->add_mem_site(e.mem_sites[i].host_offset, e.mem_sites[i].guest_eip,
+                        e.mem_sites[i].stub_offset);
 
     return t;
 }
