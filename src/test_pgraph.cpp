@@ -25,6 +25,11 @@ static uint32_t pb_inc(uint32_t method, uint32_t subchan, uint32_t count) {
     return (count << 18) | (subchan << 13) | method;
 }
 
+// Build a NON-INCREASING method header (same method repeated).
+static uint32_t pb_ni(uint32_t method, uint32_t subchan, uint32_t count) {
+    return (count << 18) | (subchan << 13) | method | 0x80000000u;
+}
+
 int main() {
     using namespace xbox;
     using namespace xbox::nv097;
@@ -262,6 +267,28 @@ int main() {
     uint32_t specfog = 0x000000C0;
     memcpy(ram + pos, &specfog, 4); pos += 4;
 
+    // === Command 32: VS constant upload: load index 5, then 4 floats ===
+    uint32_t hdr32 = pb_inc(SET_TRANSFORM_CONSTANT_LOAD, 0, 1);
+    memcpy(ram + pos, &hdr32, 4); pos += 4;
+    uint32_t const_idx = 5;
+    memcpy(ram + pos, &const_idx, 4); pos += 4;
+
+    uint32_t hdr32b = pb_ni(SET_TRANSFORM_CONSTANT_START, 0, 4);
+    memcpy(ram + pos, &hdr32b, 4); pos += 4;
+    float c5[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    memcpy(ram + pos, c5, 16); pos += 16;
+
+    // === Command 33: VS program upload: load slot 0, 4 dwords ===
+    uint32_t hdr33 = pb_inc(SET_TRANSFORM_PROGRAM_LOAD, 0, 1);
+    memcpy(ram + pos, &hdr33, 4); pos += 4;
+    uint32_t prog_slot = 0;
+    memcpy(ram + pos, &prog_slot, 4); pos += 4;
+
+    uint32_t hdr33b = pb_ni(SET_TRANSFORM_PROGRAM_START, 0, 4);
+    memcpy(ram + pos, &hdr33b, 4); pos += 4;
+    uint32_t insn[4] = { 0xDEAD0001, 0xBEEF0002, 0xCAFE0003, 0xFACE0004 };
+    memcpy(ram + pos, insn, 16); pos += 16;
+
     // --- Run the DMA pusher ---
     nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] = 1;
     nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] = 1;
@@ -342,6 +369,18 @@ int main() {
     CHECK(pgraph.reg(SET_COMBINER_COLOR_ICW_0)    == 0x08040401, "combiner_color_icw0");
     CHECK(pgraph.reg(SET_COMBINER_COLOR_OCW_0)    == 0x00C00000, "combiner_color_ocw0");
     CHECK(pgraph.reg(SET_COMBINER_SPECULAR_FOG_CW1) == 0x000000C0, "combiner_specfog_cw1");
+
+    // VS constant upload
+    CHECK(pgraph.vs_constants[5][0] == 1.0f, "vs_const[5].x == 1.0");
+    CHECK(pgraph.vs_constants[5][1] == 2.0f, "vs_const[5].y == 2.0");
+    CHECK(pgraph.vs_constants[5][2] == 3.0f, "vs_const[5].z == 3.0");
+    CHECK(pgraph.vs_constants[5][3] == 4.0f, "vs_const[5].w == 4.0");
+
+    // VS program upload
+    CHECK(pgraph.vs_program[0] == 0xDEAD0001, "vs_program[0]");
+    CHECK(pgraph.vs_program[1] == 0xBEEF0002, "vs_program[1]");
+    CHECK(pgraph.vs_program[2] == 0xCAFE0003, "vs_program[2]");
+    CHECK(pgraph.vs_program[3] == 0xFACE0004, "vs_program[3]");
 
     free(ram);
 
