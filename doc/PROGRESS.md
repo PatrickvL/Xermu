@@ -34,13 +34,17 @@
 - **Result**: 45/46 pass (smc expected failure)
 - **Status**: DONE
 
-### Step 2: Fix SMC detection (page protection)
-- **Problem**: Page-version bumps removed; `smc` test fails because
-  self-modifying code isn't detected.
-- **Fix**: Use VirtualProtect to mark code pages read-only.  On write
-  fault (within RAM range), invalidate traces for that page, make page
-  writable, and single-step past the write.
-- **Status**: NOT STARTED
+### Step 2: Fix SMC detection via page protection (3ff9331)
+- **Problem**: Page-version bumps removed; `smc` test failed because
+  self-modifying code wasn't detected.
+- **Fix**: VirtualProtect marks code pages read-only after trace build.
+  VEH catches write faults, unprotects, invalidates traces + outbound
+  block links, bumps page version, clears fault bitmaps, continues.
+  Also fixed: outbound links from invalidated traces not reset (caused
+  stale block-link JMP to old trace code).
+- **Files**: executor.hpp, executor.cpp
+- **Result**: 46/46 pass (all tests green!)
+- **Status**: DONE
 
 ### Step 3: Fix DESIGN.md contradictions
 - **From audit**: duplicate section numbers, stale FPU offsets, test count
@@ -54,4 +58,4 @@
 | Commit  | Pass | Fail | Notes                    |
 |---------|------|------|--------------------------|
 | 0a9e1e5 | 44   | 2    | smc (expected), pfifo    |
-| bd78d89 | 45   | 1    | smc (expected)           |
+| bd78d89 | 45   | 1    | smc (expected)           || 3ff9331 | 46   | 0    | ALL PASS                 |
