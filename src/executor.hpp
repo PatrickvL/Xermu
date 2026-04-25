@@ -10,6 +10,10 @@
 // Maximum guest RAM: 128 MB (e.g. Xbox devkit had 128 MB, retail 64 MB).
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
+// Guest page geometry (4 KB pages, standard x86).
+static constexpr uint32_t GUEST_PAGE_SIZE = 0x1000u;
+static constexpr uint32_t GUEST_PAGE_MASK = ~(GUEST_PAGE_SIZE - 1u); // 0xFFFFF000
+
 // Fastmem window: covers the full 4 GB guest physical address space.
 // RAM, MMIO pass-through pages, and device register arrays are committed
 // within this window.  Unmapped/protected pages fault via VEH.

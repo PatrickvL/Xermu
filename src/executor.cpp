@@ -301,9 +301,9 @@ void Executor::destroy() {
 void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
     assert(pa + size <= GUEST_RAM_SIZE);
     // If loading into a write-protected code page, temporarily unprotect.
-    uint32_t page_start = pa & ~0xFFFu;
-    uint32_t page_end   = (pa + (uint32_t)size + 0xFFF) & ~0xFFFu;
-    for (uint32_t p = page_start; p < page_end; p += 0x1000) {
+    uint32_t page_start = pa & GUEST_PAGE_MASK;
+    uint32_t page_end   = (pa + (uint32_t)size + GUEST_PAGE_SIZE - 1) & GUEST_PAGE_MASK;
+    for (uint32_t p = page_start; p < page_end; p += GUEST_PAGE_SIZE) {
         if (is_code_page(p))
             invalidate_code_page(p);
     }
@@ -315,27 +315,27 @@ void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
 // ---------------------------------------------------------------------------
 
 void Executor::protect_code_page(uint32_t pa) {
-    uint32_t page = pa & ~0xFFFu;
+    uint32_t page = pa & GUEST_PAGE_MASK;
     if (is_code_page(page)) return; // already protected
     set_code_page(page);
 #ifdef _WIN32
     DWORD old_prot;
-    VirtualProtect(ram + page, 0x1000, PAGE_READONLY, &old_prot);
+    VirtualProtect(ram + page, GUEST_PAGE_SIZE, PAGE_READONLY, &old_prot);
 #else
-    mprotect(ram + page, 0x1000, PROT_READ);
+    mprotect(ram + page, GUEST_PAGE_SIZE, PROT_READ);
 #endif
 }
 
 void Executor::invalidate_code_page(uint32_t pa) {
-    uint32_t page = pa & ~0xFFFu;
+    uint32_t page = pa & GUEST_PAGE_MASK;
     if (!is_code_page(page)) return;
     clear_code_page(page);
     // Make the page writable again.
 #ifdef _WIN32
     DWORD old_prot;
-    VirtualProtect(ram + page, 0x1000, PAGE_READWRITE, &old_prot);
+    VirtualProtect(ram + page, GUEST_PAGE_SIZE, PAGE_READWRITE, &old_prot);
 #else
-    mprotect(ram + page, 0x1000, PROT_READ | PROT_WRITE);
+    mprotect(ram + page, GUEST_PAGE_SIZE, PROT_READ | PROT_WRITE);
 #endif
     // Invalidate all traces on this page.
     uint32_t l1 = (page >> 12) & TraceCache::L1_MASK;
@@ -1080,7 +1080,7 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
 // ---------------------------------------------------------------------------
 
 uint32_t Executor::translate_va(uint32_t va, bool is_write) {
-    uint32_t pdir_pa = ctx.cr3 & 0xFFFFF000u;
+    uint32_t pdir_pa = ctx.cr3 & GUEST_PAGE_MASK;
     uint32_t pdi     = (va >> 22) & 0x3FF;
     uint32_t pti     = (va >> 12) & 0x3FF;
 
@@ -1109,7 +1109,7 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
 
     // 4 KB page table
     {
-        uint32_t pt_pa = (pde & 0xFFFFF000u) + pti * 4;
+        uint32_t pt_pa = (pde & GUEST_PAGE_MASK) + pti * 4;
         if (pt_pa + 4 > GUEST_RAM_SIZE) goto fault;
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
@@ -1118,7 +1118,7 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
 
         if (is_write && !(pte & 2)) goto fault; // read-only
 
-        uint32_t pa = (pte & 0xFFFFF000u) | (va & 0xFFF);
+        uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
 
         // Set accessed + dirty bits
         bool need_pde_update = !(pde & 0x20);
