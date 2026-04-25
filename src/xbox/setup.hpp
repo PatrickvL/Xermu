@@ -35,6 +35,7 @@ struct XboxHardware {
     SmbusState  smbus;
     PicPair     pic;
     PitState    pit;
+    MiscIoState misc;
     uint8_t*    ram = nullptr;
     uint32_t    ram_size = 0;
 };
@@ -110,8 +111,9 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.tick_user   = hw;
     exec.tick_period = 1;
 
-    exec.register_io(0x61, sysctl_read, sysctl_write);
-    exec.register_io(0xE9, nullptr, debug_console_write);
+    exec.register_io(0x61, sysctl_read, sysctl_write, &hw->misc);
+    exec.register_io(0x80, post_code_read, post_code_write, &hw->misc);
+    exec.register_io(0xE9, debug_console_read, debug_console_write);
     exec.register_io(0xCF8, pci_io_read_cf8, pci_io_write_cf8, &hw->pci);
     exec.register_io(0xCFC, pci_io_read_cfc, pci_io_write_cfc, &hw->pci);
 
