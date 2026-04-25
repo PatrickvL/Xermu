@@ -141,6 +141,19 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 11: Named REX prefix constants in emitter.hpp (HEAD)
+- Added `REX_B`, `REX_XB`, `REX_R`, `REX_RB`, `REX_W`, `REX_WB`, `REX_WR`,
+  `REX_WRB` constexpr constants replacing ~30 raw hex REX prefix bytes.
+- Replaced all REX prefix hex literals in helper functions: emit_save/load_gp,
+  emit_write_next_eip_imm/gpreg, emit_set_stop_reason, emit_save_eflags,
+  emit_save/restore_flags, emit_call_abs, emit_sub/add_ctx_esp,
+  emit_load/store_esp_to_r14/r8, emit_ccall_arg*, emit_ea_to_r14,
+  emit_fastmem_store_imm*, emit_translate_r14.
+- ModRM bytes that coincidentally fall in 0x40-0x4F range left as hex.
+- **Files**: emitter.hpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -157,4 +170,6 @@
 | 09bb822 | 47   | 1    | pfifo flaky              |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
 | efaf822 | 48   | 0    | doc fixes                |
+| f72b2ad | 48   | 0    | ram_size dedup           |
+| 57212ea | 48   | 0    | stale comments           |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
