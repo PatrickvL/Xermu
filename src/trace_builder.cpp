@@ -1577,9 +1577,9 @@ void TraceBuilder::emit_jmp_exit(Emitter& e,
                 emit_ccall_arg0_ctx(e);
                 emit_ccall_arg1_pa(e);
                 emit_call_abs(e, reinterpret_cast<void*>(read_guest_mem32));
-                // EAX = target. Write directly to ctx->next_eip (offset 40).
-                // MOV [R13+40], EAX : REX.B=0x41, 0x89, mod=01 reg=0 rm=5, disp8=40
-                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(40);
+                // EAX = target. Write directly to ctx->next_eip.
+                // MOV [R13+next_eip], EAX : REX.B=0x41, 0x89, mod=01 reg=0 rm=5
+                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(CTX_NEXT_EIP);
                 // Reload guest regs from ctx (C call clobbered host regs)
                 emit_load_all_gp(e);
                 e.emit8(0xC3); // RET
@@ -1633,8 +1633,8 @@ void TraceBuilder::emit_call_exit(Emitter& e,
                 emit_ccall_arg1_pa(e);
                 emit_ccall_arg2_imm(e, pc_after);
                 emit_call_abs(e, reinterpret_cast<void*>(call_mem_helper));
-                // EAX = target. Write to ctx->next_eip (offset 40).
-                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(40);
+                // EAX = target. Write to ctx->next_eip.
+                e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(CTX_NEXT_EIP);
                 // Reload guest regs from ctx (C call clobbered host regs)
                 emit_load_all_gp(e);
                 e.emit8(0xC3); // RET
@@ -1669,8 +1669,8 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     emit_add_ctx_esp(e, 4);
 
     // Step 6: ctx->next_eip = EAX  (direct write; bypass gpreg slot).
-    //   MOV [R13+40], EAX  →  REX.B=0x41  MOV-store=0x89  ModRM mod=01 reg=0 rm=5=0x45  disp8=40
-    e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(40);
+    //   MOV [R13+next_eip], EAX  →  REX.B=0x41  MOV-store=0x89  ModRM mod=01 reg=0 rm=5=0x45
+    e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(CTX_NEXT_EIP);
 
     // Step 7: restore EAX from ctx->gp[0] (the value saved in Step 1).
     // The trampoline will re-save it, but now it will see the correct value.
@@ -1832,11 +1832,11 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 emit_save_all_gp(e);
                 emit_ccall_arg0_ctx(e);
                 emit_call_abs(e, reinterpret_cast<void*>(iret_helper));
-                // Restore guest EFLAGS into host RFLAGS from ctx->eflags (offset 36).
-                // MOV R14D, [R13+36]  (REX=0x45, MOV r,r/m, mod=01 reg=6 rm=5)
+                // Restore guest EFLAGS into host RFLAGS from ctx->eflags.
+                // MOV R14D, [R13+eflags]  (REX=0x45, MOV r,r/m, mod=01 reg=6 rm=5)
                 e.emit8(0x45); e.emit8(0x8B);
                 e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
-                e.emit8(36);
+                e.emit8(CTX_EFLAGS);
                 e.emit8(0x41); e.emit8(0x56);  // PUSH R14
                 e.emit8(0x9D);                  // POPFQ — set host EFLAGS
                 // Reload GP regs from ctx (C call clobbered EAX/ECX/EDX).
