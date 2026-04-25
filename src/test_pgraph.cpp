@@ -35,7 +35,8 @@ int main() {
     using namespace xbox::nv097;
 
     // Set up NV2A state + PGRAPH state shadow.
-    Nv2aState nv2a;
+    auto* nv2a_ptr = new Nv2aState();
+    auto& nv2a = *nv2a_ptr;
     PgraphState pgraph;
     nv2a.method_handler = pgraph_method_handler;
     nv2a.method_user    = &pgraph;
@@ -383,6 +384,7 @@ int main() {
     CHECK(pgraph.vs_program[3] == 0xFACE0004, "vs_program[3]");
 
     free(ram);
+    delete nv2a_ptr;
 
     printf("PGRAPH state test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
