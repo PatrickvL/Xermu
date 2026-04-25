@@ -33,7 +33,7 @@ handlers. No guard pages, no VEH, no exception handling in the hot path.
     ├── code_cache.hpp           32 MB executable slab allocator
     ├── trace.hpp                Trace struct, TraceCache hash table
     ├── emitter.hpp              Byte emitter, EA synthesis, fastmem helpers
-    ├── trace_builder.hpp        TraceBuilder, TraceArena, PageVersions
+    ├── trace_builder.hpp        TraceBuilder, TraceArena, FaultBitmaps, SoftTlb
     ├── trace_builder.cpp        Decode → classify → emit loop
     ├── executor.hpp             Executor struct, dispatch_trace decl
     ├── executor.cpp             ASM trampoline (GCC/Clang), init, run loop

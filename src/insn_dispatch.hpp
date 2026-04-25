@@ -265,9 +265,9 @@ inline void init_mnemonic_table() {
     }) MNEMONIC_CLASS[m] = IC_ALU_MEM;
 
     // ---- Flag-reading instructions with memory operand forms ----
-    // SETcc/CMOVcc read EFLAGS; the bounds check CMP R14,R15 would clobber
-    // the flags before the instruction executes.  IC_FLAGMEM uses a special
-    // emit pattern that restores EFLAGS between the bounds check and the insn.
+    // SETcc/CMOVcc read EFLAGS; the inline SUB/ADD for guest ESP management
+    // would clobber flags.  IC_FLAGMEM uses a special emit pattern that
+    // saves/restores EFLAGS around the memory dispatch sequence.
     for (auto m : {
         ZYDIS_MNEMONIC_SETB,   ZYDIS_MNEMONIC_SETBE,
         ZYDIS_MNEMONIC_SETL,   ZYDIS_MNEMONIC_SETLE,

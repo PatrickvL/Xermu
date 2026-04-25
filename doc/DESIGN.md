@@ -341,7 +341,7 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 These are needed to execute non-trivial x86-32 programs beyond the self-test.
 
 #### 5.1 ~~EFLAGS Preservation Across Slow Paths~~ ✅ DONE
-**Resolved.** The CMP R14, R15 bounds check in every memory dispatch was
+**Resolved.** Memory dispatch sequences (SUB/ADD for guest ESP management) were
 clobbering guest EFLAGS. Fixed with conditional PUSHFQ/POPFQ wrapping gated by
 a backward flag-liveness analysis: the trace builder pre-scans all instructions
 to extract per-instruction flags-tested/flags-written (from Zydis `cpu_flags`),
@@ -474,8 +474,8 @@ Every guest memory access goes through VA→PA translation when `CR0.PG=1`.
 **Implementation approach: JIT inline translate + C helper page walk**
 
 When `CR0.PG` is set at trace-build time, the emitter inserts an inline
-`translate_va_jit()` C call after EA synthesis (before the CMP R14, R15 bounds
-check). The translate call:
+`translate_va_jit()` C call after EA synthesis (before the fastmem memory
+access). The translate call:
 1. Saves guest RFLAGS and GP regs
 2. Calls `translate_va_jit(ctx, VA, is_write)` — a C-linkage page walker
 3. On success: `R14 = PA`, restores GP regs + RFLAGS, continues to fastmem path
@@ -580,7 +580,7 @@ Full codebase audit for correctness, efficiency, and consistency.  Fixes:
 | `TraceCache::invalidate()` sets slot to EMPTY, breaking open-addressing probe chains for subsequent entries | Stale / duplicate traces after SMC invalidation | Tombstone sentinel (`DELETED = 0xFFFFFFFE`); `lookup` already skips non-matching keys; `insert` now reuses tombstone slots |
 | IRETD exit missing `emit_load_all_gp` after C call | EAX/ECX/EDX corrupted by volatile-register clobber; trampoline saves junk to `ctx->gp[]` | Added `emit_load_all_gp(e)` + EFLAGS restore via `MOV R14D,[R13+36]; PUSH R14; POPFQ` before RET |
 | LOOPE/LOOPNE always branch to `taken_eip` | Incorrect control flow — ZF and ECX conditions ignored | Check original ZF (JNZ/JZ rel32) before DEC ECX; each path decrements ECX and branches correctly |
-| CALL direct/register write return address with no ESP bounds check | Host memory corruption if guest ESP is out of range | Added `CMP R14, R15; JAE` → UD2 guard before `emit_fastmem_store_imm32` |
+| CALL direct/register write return address with no ESP bounds check | Host memory corruption if guest ESP is out of range | Added range guard before `emit_fastmem_store_imm32` |
 | PUSH ESP / POP ESP emit host RSP instead of guest ESP | Host stack corruption; wrong value pushed/popped since ESP lives in `ctx->gp[4]` not a host register | C-helper `push_esp_helper` / `pop_esp_helper` that read/write `ctx->gp[GP_ESP]` directly |
 | `emit_ea_to_r14` with ESP base emits `LEA R14D,[RSP+disp]` | All `[ESP]` / `[ESP+N]` memory accesses use host RSP instead of guest ESP — widespread correctness failure | Load guest ESP from `ctx->gp[GP_ESP]` into R14, then `LEA R14D,[R14+disp]` for displacement |
 | MOV/ALU/LEA with ESP register operand executed natively on host RSP | `SUB ESP,N` / `ADD ESP,N` / `MOV ESP,r32` / `LEA ESP,[r+d]` corrupt host stack or produce wrong guest ESP | MOV ESP: read/write `ctx->gp[GP_ESP]` via `[R13+16]`. ALU ESP: load into R14, re-encode with R14, store back. LEA ESP: `emit_ea_to_r14` + `emit_store_r14_to_esp` |
@@ -1828,8 +1828,8 @@ which unprotects, invalidates traces, and continues execution.
 | Linux          | `memfd_create`           | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
 | macOS / BSD    | `shm_open` + `unlink`   | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
 
-Falls back to 320 MB aliased window (with `CMP R14, R15; JAE` bounds checks)
-if the 4 GB allocation fails.
+Falls back to 320 MB aliased window (then plain allocation) if the 4 GB
+reservation fails.  All paths use the same VEH-based MMIO dispatch.
 
 #### 5.23 ~~Trace Cache Improvements~~ ✅ DONE
 - Two-level direct-mapped cache: `page_map[(eip>>12) & L1_MASK][(eip & 0xFFF) >> 1]`
@@ -1852,7 +1852,7 @@ if the 4 GB allocation fails.
 | 5 | Stack overflow on `Executor` construction | ~13 MB of embedded arrays (TraceArena, TraceCache) | Heap-allocate via `std::make_unique` |
 | 6 | MSVC: `#error` on `dispatch_trace` | GCC `__attribute__((naked))` not available on MSVC x64 | MASM `.asm` trampoline for MSVC |
 | 7 | MMIO slow-path calls corrupt args on Windows | JIT emitted SysV ABI (RDI/RSI/RDX/RCX) on Windows | Platform-aware `emit_ccall_arg*` helpers + shadow space |
-| 8 | Memory dispatch clobbers guest EFLAGS | CMP R14, R15 bounds check + SUB/ADD RSP for ctx ESP management destroy flags | Conditional PUSHFQ/POPFQ wrapping gated by backward flag-liveness analysis |
+| 8 | Memory dispatch clobbers guest EFLAGS | SUB/ADD RSP for guest ESP management destroy flags | Conditional PUSHFQ/POPFQ wrapping gated by backward flag-liveness analysis |
 
 ---
 

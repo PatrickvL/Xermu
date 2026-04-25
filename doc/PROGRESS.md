@@ -190,11 +190,19 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 16: Replace reinterpret_cast with memcpy in trace_builder.cpp (HEAD)
+### Step 16: Replace reinterpret_cast with memcpy in trace_builder.cpp (4b0fdd3)
 - Replaced 5 more `reinterpret_cast<uint32_t*>` / `<uint16_t*>` aliasing
   violations in guest_read, guest_write, popfd_helper, read_guest_mem32,
   write_guest_mem32.
 - **Files**: trace_builder.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 17: Fix all stale CMP R14,R15 references (HEAD)
+- Removed all remaining references to the old pre-fastmem `CMP R14, R15; JAE`
+  bounds-check pattern across the codebase.
+- **Files**: README.md, src/insn_dispatch.hpp, src/trace_builder.cpp,
+  src/main.cpp, doc/DESIGN.md
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -221,4 +229,5 @@
 | e39e04b | 48   | 0    | memcpy aliasing          |
 | 106c906 | 48   | 0    | xbox comments            |
 | 885eba9 | 48   | 0    | consistency fixes        |
-| (HEAD)  | 48   | 0    | ALL PASS                 |
+| 4b0fdd3 | 48   | 0    | memcpy trace_builder     |
+| (HEAD)  | 48   | 0    | stale CMP R14,R15 refs   |

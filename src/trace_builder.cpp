@@ -907,21 +907,15 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 // ---------------------------------------------------------------------------
 // emit_handler_flagmem — SETcc [mem] / CMOVcc r, [mem]
 //
-// These instructions READ EFLAGS *and* access memory.  The fastmem bounds
-// check (CMP R14, R15) clobbers flags, so we must restore them BEFORE the
-// instruction executes:
+// These instructions READ EFLAGS *and* access memory.  The SUB/ADD RSP
+// sequences in save_flags/restore_flags would clobber guest flags, so we
+// must save/restore EFLAGS around the memory dispatch:
 //
 //   EA → R14
 //   PUSHFQ                 ; save guest EFLAGS
-//   CMP  R14, R15          ; bounds check (clobbers flags)
-//   JAE  slow
-//   POPFQ                  ; *** restore EFLAGS before SETcc/CMOVcc ***
+//   <fastmem or slow path> ; memory access (may clobber flags)
+//   POPFQ                  ; restore EFLAGS before SETcc/CMOVcc
 //   <rewritten insn>
-//   JMP  done
-// slow:
-//   POPFQ                  ; balance the stack
-//   UD2                    ; MMIO not supported for SETcc/CMOVcc
-// done:
 // ---------------------------------------------------------------------------
 bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
