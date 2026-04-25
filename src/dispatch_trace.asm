@@ -14,8 +14,22 @@
 ;
 ; FPU/SSE state is saved/restored via FXSAVE/FXRSTOR on entry/exit.
 
-CTX_GUEST_FPU EQU 128
-CTX_HOST_FPU  EQU 640
+; GuestContext field offsets (must match offsetof values in context.hpp)
+CTX_GP_EAX      EQU 0
+CTX_GP_ECX      EQU 4
+CTX_GP_EDX      EQU 8
+CTX_GP_EBX      EQU 12
+CTX_GP_ESP      EQU 16
+CTX_GP_EBP      EQU 20
+CTX_GP_ESI      EQU 24
+CTX_GP_EDI      EQU 28
+CTX_EIP         EQU 32
+CTX_EFLAGS      EQU 36
+CTX_NEXT_EIP    EQU 40
+CTX_STOP_REASON EQU 44
+CTX_FASTMEM_BASE EQU 48
+CTX_GUEST_FPU   EQU 128
+CTX_HOST_FPU    EQU 640
 
 .code
 
@@ -36,7 +50,7 @@ dispatch_trace PROC
 
     ; Set up pinned executor registers
     mov     r13, rdi                        ; R13 = ctx
-    mov     r12, QWORD PTR [r13+48]        ; R12 = ctx->fastmem_base
+    mov     r12, QWORD PTR [r13+CTX_FASTMEM_BASE]  ; R12 = ctx->fastmem_base
     ; R15 is no longer used (was ram_size); push/pop for ABI compliance only.
     mov     r14, rsi                        ; Stash host_code in R14
 
@@ -47,19 +61,19 @@ dispatch_trace PROC
     fxrstor [rax]
 
     ; Load guest GP registers into host registers
-    ; (ESP intentionally skipped — stays in ctx->gp[4])
-    mov     eax, DWORD PTR [r13+0]
-    mov     ecx, DWORD PTR [r13+4]
-    mov     edx, DWORD PTR [r13+8]
-    mov     ebx, DWORD PTR [r13+12]
-    mov     ebp, DWORD PTR [r13+20]
-    mov     esi, DWORD PTR [r13+24]
-    mov     edi, DWORD PTR [r13+28]
+    ; (ESP intentionally skipped — stays in ctx->gp[GP_ESP])
+    mov     eax, DWORD PTR [r13+CTX_GP_EAX]
+    mov     ecx, DWORD PTR [r13+CTX_GP_ECX]
+    mov     edx, DWORD PTR [r13+CTX_GP_EDX]
+    mov     ebx, DWORD PTR [r13+CTX_GP_EBX]
+    mov     ebp, DWORD PTR [r13+CTX_GP_EBP]
+    mov     esi, DWORD PTR [r13+CTX_GP_ESI]
+    mov     edi, DWORD PTR [r13+CTX_GP_EDI]
 
     ; Restore guest EFLAGS into host RFLAGS.
     ; R14 still holds host_code, so use the stack.
     push    r14                             ; save host_code
-    mov     r14d, DWORD PTR [r13+36]        ; R14D = ctx->eflags
+    mov     r14d, DWORD PTR [r13+CTX_EFLAGS] ; R14D = ctx->eflags
     push    r14
     popfq                                   ; load guest EFLAGS
     pop     r14                             ; restore host_code
@@ -70,16 +84,16 @@ dispatch_trace PROC
     ; Save guest EFLAGS from host RFLAGS.
     pushfq
     pop     r14                             ; R14 = guest EFLAGS
-    mov     DWORD PTR [r13+36], r14d        ; ctx->eflags = R14D
+    mov     DWORD PTR [r13+CTX_EFLAGS], r14d ; ctx->eflags = R14D
 
     ; Save guest GP registers back to context
-    mov     DWORD PTR [r13+0],  eax
-    mov     DWORD PTR [r13+4],  ecx
-    mov     DWORD PTR [r13+8],  edx
-    mov     DWORD PTR [r13+12], ebx
-    mov     DWORD PTR [r13+20], ebp
-    mov     DWORD PTR [r13+24], esi
-    mov     DWORD PTR [r13+28], edi
+    mov     DWORD PTR [r13+CTX_GP_EAX],  eax
+    mov     DWORD PTR [r13+CTX_GP_ECX],  ecx
+    mov     DWORD PTR [r13+CTX_GP_EDX],  edx
+    mov     DWORD PTR [r13+CTX_GP_EBX],  ebx
+    mov     DWORD PTR [r13+CTX_GP_EBP],  ebp
+    mov     DWORD PTR [r13+CTX_GP_ESI],  esi
+    mov     DWORD PTR [r13+CTX_GP_EDI],  edi
 
     ; Save guest FPU/SSE state, restore host FPU/SSE state
     lea     rax, [r13 + CTX_GUEST_FPU]

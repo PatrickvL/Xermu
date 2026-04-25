@@ -69,6 +69,32 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 5: Remove dead legacy code (b89dcac)
+- Removed `emit_cmp_r14_r15`, `emit_jae_fwd`, `emit_smc_page_bump` —
+  left over from pre-4GB fastmem CMP/JAE pattern
+- Removed `smc_written` field and its accumulation in `trace_builder.cpp`
+- Updated `executor.hpp` header comment (R15 no longer ram_size)
+- **Files**: emitter.hpp, trace_builder.cpp, executor.hpp, context.hpp
+- **Result**: 47/48 pass (pfifo pre-existing flaky)
+- **Status**: DONE
+
+### Step 6: Replace hardcoded GuestContext offsets with offsetof (HEAD)
+- Defined `CTX_EFLAGS`, `CTX_NEXT_EIP`, `CTX_STOP_REASON`,
+  `CTX_FASTMEM_BASE`, `CTX_FS_BASE`, `CTX_GS_BASE`, `CTX_GUEST_FPU`,
+  `CTX_HOST_FPU` as `inline constexpr int` using `offsetof` in context.hpp
+- Updated `gp_offset()` to use `offsetof(GuestContext, gp)`
+- Replaced all hardcoded numeric offsets in emitter.hpp and
+  trace_builder.cpp with the named constants
+- dispatch_trace.asm: added EQU constants for all GP slots, EFLAGS,
+  fastmem_base; replaced all `[r13+N]` with `[r13+CTX_*]`
+- executor.cpp (GCC naked asm): added `CTX_ASM_*` preprocessor macros
+  with `static_assert` verifying against `offsetof`; replaced all
+  hardcoded offsets via string concatenation
+- **Files**: context.hpp, emitter.hpp, trace_builder.cpp,
+  dispatch_trace.asm, executor.cpp
+- **Result**: 47/48 pass (pfifo pre-existing flaky)
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -80,3 +106,5 @@
 | 3ff9331 | 46   | 0    | ALL PASS                 |
 | 76833b1 | 46   | 0    | ALL PASS (doc fixes)     |
 | (next)  | 48   | 0    | +fastmem, smc_stress     |
+| b89dcac | 47   | 1    | pfifo flaky              |
+| (HEAD)  | 47   | 1    | pfifo flaky              |

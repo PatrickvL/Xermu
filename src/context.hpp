@@ -89,17 +89,57 @@ static_assert(offsetof(GuestContext, _reserved_120) == 120);
 static_assert(offsetof(GuestContext, guest_fpu)    == 128);
 static_assert(offsetof(GuestContext, host_fpu)     == 640);
 
-// Offsets used by asm trampolines (MASM + inline asm)
-inline constexpr int CTX_GUEST_FPU = 128;
-inline constexpr int CTX_HOST_FPU  = 640;
-
 // GP register indices (match x86 ModRM/SIB encoding order)
 enum : int {
     GP_EAX = 0, GP_ECX = 1, GP_EDX = 2, GP_EBX = 3,
     GP_ESP = 4, GP_EBP = 5, GP_ESI = 6, GP_EDI = 7
 };
 
-// Byte offset of gp[i] within GuestContext
+// Byte offset of gp[i] within GuestContext.
 inline constexpr uint8_t gp_offset(int i) {
-    return static_cast<uint8_t>(i * 4);
+    return static_cast<uint8_t>(offsetof(GuestContext, gp) + i * sizeof(uint32_t));
 }
+
+// Named offsets for scalar GuestContext fields accessed from JIT code / asm.
+inline constexpr int CTX_GP            = (int)offsetof(GuestContext, gp);
+inline constexpr int CTX_EIP           = (int)offsetof(GuestContext, eip);
+inline constexpr int CTX_EFLAGS        = (int)offsetof(GuestContext, eflags);
+inline constexpr int CTX_NEXT_EIP      = (int)offsetof(GuestContext, next_eip);
+inline constexpr int CTX_STOP_REASON   = (int)offsetof(GuestContext, stop_reason);
+inline constexpr int CTX_FASTMEM_BASE  = (int)offsetof(GuestContext, fastmem_base);
+inline constexpr int CTX_MMIO          = (int)offsetof(GuestContext, mmio);
+inline constexpr int CTX_FS_BASE       = (int)offsetof(GuestContext, fs_base);
+inline constexpr int CTX_GS_BASE       = (int)offsetof(GuestContext, gs_base);
+inline constexpr int CTX_GUEST_FPU     = (int)offsetof(GuestContext, guest_fpu);
+inline constexpr int CTX_HOST_FPU      = (int)offsetof(GuestContext, host_fpu);
+
+// Stringification helpers for GCC naked inline asm (cannot use C++ constexpr).
+// Values are verified against offsetof by static_assert above.
+#define CTX_XSTR_(x) #x
+#define CTX_STR_(x)  CTX_XSTR_(x)
+
+#define CTX_ASM_GP_EAX       0
+#define CTX_ASM_GP_ECX       4
+#define CTX_ASM_GP_EDX       8
+#define CTX_ASM_GP_EBX      12
+#define CTX_ASM_GP_ESP      16
+#define CTX_ASM_GP_EBP      20
+#define CTX_ASM_GP_ESI      24
+#define CTX_ASM_GP_EDI      28
+#define CTX_ASM_EFLAGS      36
+#define CTX_ASM_FASTMEM_BASE 48
+#define CTX_ASM_GUEST_FPU  128
+#define CTX_ASM_HOST_FPU   640
+
+static_assert(CTX_ASM_GP_EAX  == (int)offsetof(GuestContext, gp[0]));
+static_assert(CTX_ASM_GP_ECX  == (int)offsetof(GuestContext, gp[1]));
+static_assert(CTX_ASM_GP_EDX  == (int)offsetof(GuestContext, gp[2]));
+static_assert(CTX_ASM_GP_EBX  == (int)offsetof(GuestContext, gp[3]));
+static_assert(CTX_ASM_GP_ESP  == (int)offsetof(GuestContext, gp[4]));
+static_assert(CTX_ASM_GP_EBP  == (int)offsetof(GuestContext, gp[5]));
+static_assert(CTX_ASM_GP_ESI  == (int)offsetof(GuestContext, gp[6]));
+static_assert(CTX_ASM_GP_EDI  == (int)offsetof(GuestContext, gp[7]));
+static_assert(CTX_ASM_EFLAGS       == (int)offsetof(GuestContext, eflags));
+static_assert(CTX_ASM_FASTMEM_BASE == (int)offsetof(GuestContext, fastmem_base));
+static_assert(CTX_ASM_GUEST_FPU    == (int)offsetof(GuestContext, guest_fpu));
+static_assert(CTX_ASM_HOST_FPU     == (int)offsetof(GuestContext, host_fpu));

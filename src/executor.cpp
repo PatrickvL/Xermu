@@ -160,31 +160,31 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
 #endif
         // ---- Set up pinned executor registers ----------------------------
         "mov %%rdi, %%r13\n\t"              // R13 = ctx
-        "movq 48(%%r13), %%r12\n\t"         // R12 = ctx->fastmem_base
+        "movq " CTX_STR_(CTX_ASM_FASTMEM_BASE) "(%%r13), %%r12\n\t"  // R12 = ctx->fastmem_base
         // R15 is no longer used (was ram_size); push/pop for ABI compliance only.
         // Stash host_code (RSI) in R14 before we clobber RSI with guest ESI.
         "mov %%rsi, %%r14\n\t"
 
         // ---- Save host FPU/SSE state, load guest FPU/SSE state ----------
-        "lea 640(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "lea " CTX_STR_(CTX_ASM_HOST_FPU) "(%%r13), %%rax\n\t"   // RAX = &ctx->host_fpu
         "fxsave (%%rax)\n\t"
-        "lea 128(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "lea " CTX_STR_(CTX_ASM_GUEST_FPU) "(%%r13), %%rax\n\t"  // RAX = &ctx->guest_fpu
         "fxrstor (%%rax)\n\t"
 
         // ---- Load guest GP registers into host registers -----------------
         // (ESP intentionally skipped — stays in ctx->gp[4])
-        "movl  0(%%r13), %%eax\n\t"
-        "movl  4(%%r13), %%ecx\n\t"
-        "movl  8(%%r13), %%edx\n\t"
-        "movl 12(%%r13), %%ebx\n\t"
-        "movl 20(%%r13), %%ebp\n\t"
-        "movl 24(%%r13), %%esi\n\t"
-        "movl 28(%%r13), %%edi\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_EAX) "(%%r13), %%eax\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_ECX) "(%%r13), %%ecx\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_EDX) "(%%r13), %%edx\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_EBX) "(%%r13), %%ebx\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_EBP) "(%%r13), %%ebp\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_ESI) "(%%r13), %%esi\n\t"
+        "movl " CTX_STR_(CTX_ASM_GP_EDI) "(%%r13), %%edi\n\t"
 
         // Restore guest EFLAGS into host RFLAGS.
         // R14 still holds host_code, so use the stack.
         "push %%r14\n\t"                      // save host_code
-        "movl 36(%%r13), %%r14d\n\t"          // R14D = ctx->eflags
+        "movl " CTX_STR_(CTX_ASM_EFLAGS) "(%%r13), %%r14d\n\t"  // R14D = ctx->eflags
         "push %%r14\n\t"
         "popfq\n\t"                            // load guest EFLAGS
         "pop %%r14\n\t"                        // restore host_code
@@ -196,21 +196,21 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         // ---- Save guest EFLAGS from host RFLAGS -------------------------
         "pushfq\n\t"
         "pop %%r14\n\t"                        // R14 = guest EFLAGS
-        "movl %%r14d, 36(%%r13)\n\t"          // ctx->eflags
+        "movl %%r14d, " CTX_STR_(CTX_ASM_EFLAGS) "(%%r13)\n\t"  // ctx->eflags
 
         // ---- Save guest GP registers back --------------------------------
-        "movl %%eax,  0(%%r13)\n\t"
-        "movl %%ecx,  4(%%r13)\n\t"
-        "movl %%edx,  8(%%r13)\n\t"
-        "movl %%ebx, 12(%%r13)\n\t"
-        "movl %%ebp, 20(%%r13)\n\t"
-        "movl %%esi, 24(%%r13)\n\t"
-        "movl %%edi, 28(%%r13)\n\t"
+        "movl %%eax, " CTX_STR_(CTX_ASM_GP_EAX) "(%%r13)\n\t"
+        "movl %%ecx, " CTX_STR_(CTX_ASM_GP_ECX) "(%%r13)\n\t"
+        "movl %%edx, " CTX_STR_(CTX_ASM_GP_EDX) "(%%r13)\n\t"
+        "movl %%ebx, " CTX_STR_(CTX_ASM_GP_EBX) "(%%r13)\n\t"
+        "movl %%ebp, " CTX_STR_(CTX_ASM_GP_EBP) "(%%r13)\n\t"
+        "movl %%esi, " CTX_STR_(CTX_ASM_GP_ESI) "(%%r13)\n\t"
+        "movl %%edi, " CTX_STR_(CTX_ASM_GP_EDI) "(%%r13)\n\t"
 
         // ---- Save guest FPU/SSE state, restore host FPU/SSE state -------
-        "lea 128(%%r13), %%rax\n\t"         // RAX = &ctx->guest_fpu
+        "lea " CTX_STR_(CTX_ASM_GUEST_FPU) "(%%r13), %%rax\n\t"  // RAX = &ctx->guest_fpu
         "fxsave (%%rax)\n\t"
-        "lea 640(%%r13), %%rax\n\t"         // RAX = &ctx->host_fpu
+        "lea " CTX_STR_(CTX_ASM_HOST_FPU) "(%%r13), %%rax\n\t"   // RAX = &ctx->host_fpu
         "fxrstor (%%rax)\n\t"
 
         // ---- Epilog: restore host registers ------------------------------

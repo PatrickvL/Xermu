@@ -182,7 +182,7 @@ inline void emit_load_all_gp(Emitter& e) {
 
 inline void emit_write_next_eip_imm(Emitter& e, uint32_t eip) {
     e.emit8(0x41); e.emit8(0xBE); e.emit32(eip);          // MOV R14D, imm32
-    e.emit8(0x45); e.emit8(0x89); e.emit8(0x75); e.emit8(40); // MOV [R13+40], R14D
+    e.emit8(0x45); e.emit8(0x89); e.emit8(0x75); e.emit8(CTX_NEXT_EIP); // MOV [R13+next_eip], R14D
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ inline void emit_write_next_eip_imm(Emitter& e, uint32_t eip) {
 // ---------------------------------------------------------------------------
 
 inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
-    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45); e.emit8(44);
+    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45); e.emit8(CTX_STOP_REASON);
     e.emit32(reason);
 }
 
@@ -208,10 +208,10 @@ inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
 inline void emit_save_eflags(Emitter& e) {
     e.emit8(0x9C);                              // PUSHFQ
     e.emit8(0x41); e.emit8(0x5E);               // POP R14
-    // MOV DWORD [R13+36], R14D — REX=0x45 (R14.R + R13.B)
+    // MOV DWORD [R13+eflags], R14D — REX=0x45 (R14.R + R13.B)
     e.emit8(0x45); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));   // mod=01 reg=6(R14) rm=5(R13)
-    e.emit8(36);                                // disp8 = offsetof(eflags)
+    e.emit8(CTX_EFLAGS);                        // disp8 = offsetof(eflags)
 }
 
 // Write ctx->next_eip from a guest register already in ctx (via its gp index).
@@ -228,10 +228,10 @@ inline void emit_write_next_eip_gpreg(Emitter& e, uint8_t gp_idx) {
     e.emit8(0x45); e.emit8(0x8B);                              // REX.RB + MOV r,r/m
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
     e.emit8(gp_offset(gp_idx));
-    // MOV DWORD [R13 + 40], R14D
+    // MOV DWORD [R13 + next_eip], R14D
     e.emit8(0x45); e.emit8(0x89);                              // REX.RB + MOV r/m,r
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
-    e.emit8(40);                                                // disp8 = offsetof(next_eip)
+    e.emit8(CTX_NEXT_EIP);                                      // disp8 = offsetof(next_eip)
 }
 
 // ---------------------------------------------------------------------------
@@ -333,9 +333,9 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
     // Determine segment base offset (FS/GS add ctx field; DS/SS/NONE = 0)
     int seg_ctx_offset = -1; // -1 = no segment base adjustment needed
     if (m.segment == ZYDIS_REGISTER_FS) {
-        seg_ctx_offset = (int)offsetof(GuestContext, fs_base); // 108
+        seg_ctx_offset = CTX_FS_BASE;
     } else if (m.segment == ZYDIS_REGISTER_GS) {
-        seg_ctx_offset = (int)offsetof(GuestContext, gs_base); // 112
+        seg_ctx_offset = CTX_GS_BASE;
     } else if (m.segment != ZYDIS_REGISTER_NONE &&
                m.segment != ZYDIS_REGISTER_DS   &&
                m.segment != ZYDIS_REGISTER_SS) {
@@ -821,13 +821,13 @@ inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
     e.emit8(0x00); // placeholder
 
     // Fault path: store STOP_PAGE_FAULT, fault_eip, then exit trace.
-    // MOV DWORD [R13 + 44], STOP_PAGE_FAULT (2)
+    // MOV DWORD [R13 + stop_reason], STOP_PAGE_FAULT (2)
     e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
-    e.emit8(44);   // stop_reason offset
+    e.emit8(CTX_STOP_REASON);
     e.emit32(STOP_PAGE_FAULT);
-    // MOV DWORD [R13 + 40], fault_eip
+    // MOV DWORD [R13 + next_eip], fault_eip
     e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
-    e.emit8(40);   // next_eip offset
+    e.emit8(CTX_NEXT_EIP);
     e.emit32(fault_eip);
     // Restore GP regs + RFLAGS, then RET (clean stack: only PUSHFQ on it)
     emit_load_all_gp(e);
