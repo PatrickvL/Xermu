@@ -14,6 +14,7 @@ struct MmioRegion {
 
 struct MmioMap {
     static constexpr int MAX = 32;
+    static constexpr uint32_t BUS_FLOAT = 0xFFFF'FFFFu; // unmapped read returns all-ones
     MmioRegion regions[MAX];
     int        count = 0;
 
@@ -29,7 +30,7 @@ struct MmioMap {
             if (pa >= r.base && pa < r.base + r.size)
                 return r.read(pa, size, r.user);
         }
-        return 0xFFFF'FFFF; // bus float
+        return BUS_FLOAT;
     }
 
     void write(uint32_t pa, uint32_t val, unsigned size) const {

@@ -261,12 +261,10 @@ bool Executor::init(MmioMap* mmio) {
     tlb.flush();
 
     // Initialize guest FPU state to clean defaults.
-    // FCW = 0x037F: all x87 exceptions masked, double precision, round-nearest
-    uint16_t fcw = 0x037F;
-    memcpy(ctx.guest_fpu + 0, &fcw, 2);
-    // MXCSR = 0x1F80: all SSE exceptions masked, round-nearest
-    uint32_t mxcsr = 0x1F80;
-    memcpy(ctx.guest_fpu + 24, &mxcsr, 4);
+    static constexpr uint16_t FPU_CW_INIT  = 0x037F; // all exceptions masked, double precision, round-nearest
+    static constexpr uint32_t SSE_MXCSR_INIT = 0x1F80; // all exceptions masked, round-nearest
+    memcpy(ctx.guest_fpu + 0, &FPU_CW_INIT, 2);
+    memcpy(ctx.guest_fpu + 24, &SSE_MXCSR_INIT, 4);
 
     // Install VEH for 4 GB fastmem faults.
 #ifdef _WIN32
