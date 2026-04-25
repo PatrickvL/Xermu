@@ -35,6 +35,10 @@ static constexpr uint8_t ERASE_CONFIRM=0xD0; // block erase confirm
 static constexpr uint8_t SR_READY    = 0x80; // device ready (1=ready)
 static constexpr uint8_t SR_ERASE_ERR= 0x20; // erase error
 static constexpr uint8_t SR_PROG_ERR = 0x10; // program error
+
+// SST49LF040 chip identification
+static constexpr uint8_t MFG_SST         = 0xBF; // SST manufacturer ID
+static constexpr uint8_t DEV_SST49LF040  = 0x52; // SST49LF040 device ID
 } // namespace flash_cmd
 
 struct FlashState {
@@ -120,8 +124,8 @@ static uint32_t flash_read(uint32_t pa, unsigned size, void* user) {
     if (f->mode == 1) {
         // ID mode: manufacturer/device at offsets 0,1
         uint32_t off = (pa - FLASH_BASE) & (FLASH_SIZE - 1);
-        if ((off & 0xFFFF) == 0) return 0xBF;  // SST manufacturer ID
-        if ((off & 0xFFFF) == 1) return 0x52;  // SST49LF040 device ID
+        if ((off & 0xFFFF) == 0) return flash_cmd::MFG_SST;
+        if ((off & 0xFFFF) == 1) return flash_cmd::DEV_SST49LF040;
         return 0;
     }
 
