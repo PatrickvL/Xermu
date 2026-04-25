@@ -253,6 +253,23 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 23: DESIGN.md accuracy audit — stale page-version, offsets, counts (HEAD)
+- Removed all stale "page-version" references; replaced with VEH-based
+  page-protection + trace invalidation descriptions (§2.6, §4, §5.13).
+- §5.13: rewritten to describe VEH fast→slow path patching, not version bumps.
+- §5.16a: "page-version system (§2.6)" → "page-protection system (§2.6)" (×2).
+- §4 checklist: "SMC page-version validation" → "SMC page-protection + VEH-based
+  trace invalidation".
+- §2.2: R15 description → "(unused — callee-saved, reserved for ABI compliance)".
+- §5.2: guest_fpu offset 128→112, host_fpu offset 640→624.
+- §5.4: fs_base offset 108→96, gs_base offset 112→100.
+- §5.15: MAX_IO_PORTS "increased to 32" → "increased to 64".
+- §5.16: "14-assertion" → "58-assertion" for test_pgraph.cpp.
+- PTIMER_INTR_0: "stub: always 0" → "alarm fires bit 0".
+- **Files**: doc/DESIGN.md
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
