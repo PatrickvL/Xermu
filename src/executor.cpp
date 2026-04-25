@@ -28,6 +28,16 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     if (fault_addr < base || fault_addr >= base + 0x100000000ULL)
         return EXCEPTION_CONTINUE_SEARCH;
 
+    // Step 1b: SMC detection — write to a protected code page in RAM.
+    // ExceptionInformation[0]: 0=read, 1=write, 8=DEP
+    auto access_type = ep->ExceptionRecord->ExceptionInformation[0];
+    uint32_t guest_pa = (uint32_t)(fault_addr - base);
+    if (access_type == 1 && guest_pa < GUEST_RAM_SIZE &&
+        exec->is_code_page(guest_pa)) {
+        exec->invalidate_code_page(guest_pa);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     // Step 2: Is the faulting RIP within our code cache?
     auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
     if (!exec->cc.contains(rip))
@@ -294,7 +304,70 @@ void Executor::destroy() {
 
 void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
     assert(pa + size <= GUEST_RAM_SIZE);
+    // If loading into a write-protected code page, temporarily unprotect.
+    uint32_t page_start = pa & ~0xFFFu;
+    uint32_t page_end   = (pa + (uint32_t)size + 0xFFF) & ~0xFFFu;
+    for (uint32_t p = page_start; p < page_end; p += 0x1000) {
+        if (is_code_page(p))
+            invalidate_code_page(p);
+    }
     memcpy(ram + pa, src, size);
+}
+
+// ---------------------------------------------------------------------------
+// SMC page protection — mark code pages read-only, invalidate on write.
+// ---------------------------------------------------------------------------
+
+void Executor::protect_code_page(uint32_t pa) {
+    uint32_t page = pa & ~0xFFFu;
+    if (is_code_page(page)) return; // already protected
+    set_code_page(page);
+#ifdef _WIN32
+    DWORD old_prot;
+    VirtualProtect(ram + page, 0x1000, PAGE_READONLY, &old_prot);
+#else
+    mprotect(ram + page, 0x1000, PROT_READ);
+#endif
+}
+
+void Executor::invalidate_code_page(uint32_t pa) {
+    uint32_t page = pa & ~0xFFFu;
+    if (!is_code_page(page)) return;
+    clear_code_page(page);
+    // Make the page writable again.
+#ifdef _WIN32
+    DWORD old_prot;
+    VirtualProtect(ram + page, 0x1000, PAGE_READWRITE, &old_prot);
+#else
+    mprotect(ram + page, 0x1000, PROT_READ | PROT_WRITE);
+#endif
+    // Invalidate all traces on this page.
+    uint32_t l1 = (page >> 12) & TraceCache::L1_MASK;
+    auto* pt = tcache.page_map[l1];
+    if (pt) {
+        for (size_t s = 0; s < TraceCache::L2_SIZE; ++s) {
+            Trace* t = pt->slots[s];
+            if (t && t->valid && (t->code_pa & ~0xFFFu) == page) {
+                unlink_trace(t);
+                // Also reset this trace's OWN outbound links — the currently
+                // executing trace may have a block-linked JMP to another trace
+                // on the same page that is about to be invalidated.
+                for (int j = 0; j < t->num_links; ++j) {
+                    auto& lk = t->links[j];
+                    if (lk.linked) {
+                        int32_t zero = 0;
+                        memcpy(lk.jmp_rel32, &zero, 4);
+                        lk.linked = false;
+                    }
+                }
+                t->valid = false;
+            }
+        }
+    }
+    // Bump page version (for block-linking validation).
+    pv.bump(page);
+    // Clear the fault bitmap for this page (fresh start on rebuild).
+    fb.clear_page(page);
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1213,9 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             // Override guest_eip to store the VA (for cache lookup).
             t->guest_eip = eip;
             tcache.insert(t);
+
+            // Protect code page for SMC detection — write faults invalidate traces.
+            protect_code_page(code_pa);
         }
 
         // Block linking: eagerly link this trace's exits to existing targets,

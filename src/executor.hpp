@@ -45,6 +45,25 @@ struct Executor {
     FaultBitmaps   fb;               // per-code-page fault bitmaps for VEH rebuild
     SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
 
+    // Per-page bitmap: tracks which RAM pages are write-protected for SMC detection.
+    // When a trace is built for a page, the page is marked read-only.
+    // Writes to protected pages fault via VEH, which invalidates traces and unprotects.
+    static constexpr size_t CODE_PAGE_BITMAP_SIZE = GUEST_RAM_SIZE / 4096 / 8;
+    uint8_t code_page_bitmap[CODE_PAGE_BITMAP_SIZE] = {};
+
+    bool is_code_page(uint32_t pa) const {
+        uint32_t page = pa >> 12;
+        return (code_page_bitmap[page / 8] >> (page % 8)) & 1;
+    }
+    void set_code_page(uint32_t pa) {
+        uint32_t page = pa >> 12;
+        code_page_bitmap[page / 8] |= (1u << (page % 8));
+    }
+    void clear_code_page(uint32_t pa) {
+        uint32_t page = pa >> 12;
+        code_page_bitmap[page / 8] &= ~(1u << (page % 8));
+    }
+
     // VEH handle (Windows only) for 4 GB fastmem fault interception.
     void*          veh_handle_ = nullptr;
 
@@ -90,6 +109,10 @@ struct Executor {
     // Run the executor loop until halted or `max_steps`
     // traces have been dispatched (0 = unlimited).
     void run(uint32_t entry_eip, uint64_t max_steps = 0);
+
+    // SMC: protect a code page as read-only, invalidate traces on write.
+    void protect_code_page(uint32_t pa);
+    void invalidate_code_page(uint32_t pa);
 
     // Register an I/O port handler (read and/or write callback).
     void register_io(uint16_t port, IoReadFn read, IoWriteFn write,

@@ -22,20 +22,17 @@
 
 ## Remaining Steps
 
-### Step 1: Fix VEH restart-to-start bug (pfifo regression)
-- **Problem**: VEH redirects RIP to start of rebuilt trace, causing all
-  preceding instructions to re-execute.  For MMIO writes with side effects
-  (e.g. PFIFO DMA_PUT), this causes double processing.
-- **Root cause**: When trace has multiple MMIO writes, each fault triggers
-  a full restart.  DMA_PUT gets written before DMA_GET is set, causing
-  the PFIFO thread to process with stale GET from a previous phase.
+### Step 1: Fix VEH restart-to-start bug — pfifo regression (bd78d89)
+- **Problem**: VEH redirected RIP to start of rebuilt trace, replaying
+  side-effecting MMIO writes (DMA_PUT before DMA_GET), causing PFIFO
+  thread to double-count JUMP commands.
 - **Fix**: After rebuilding, redirect RIP to the faulting instruction's
-  position in the new trace (not the start).  Requires:
-  1. Add `e.add_mem_site()` to slow-path branches (so rebuilt traces have
-     offset mappings for all mem ops, not just fast-path ones)
-  2. Add `Trace::lookup_host_offset(guest_eip)` method
-  3. VEH handler: redirect to `new_trace->host_code + offset`
-- **Status**: NOT STARTED
+  position in the new trace via `lookup_host_offset()`.  Added
+  `e.add_mem_site()` to all slow-path branches so rebuilt traces have
+  offset mappings.
+- **Files**: trace.hpp, trace_builder.cpp, executor.cpp
+- **Result**: 45/46 pass (smc expected failure)
+- **Status**: DONE
 
 ### Step 2: Fix SMC detection (page protection)
 - **Problem**: Page-version bumps removed; `smc` test fails because
@@ -57,3 +54,4 @@
 | Commit  | Pass | Fail | Notes                    |
 |---------|------|------|--------------------------|
 | 0a9e1e5 | 44   | 2    | smc (expected), pfifo    |
+| bd78d89 | 45   | 1    | smc (expected)           |
