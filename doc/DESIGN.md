@@ -42,8 +42,8 @@ Guest EIP
          │ orchestrated by
          ▼
 ┌────────────────┐
-|│  Executor        │  Run loop: lookup → validate → build → dispatch → repeat
-│  (executor      │  SMC detection via page-version tags
+│  Executor       │  Run loop: lookup → build → dispatch → repeat
+│  (executor      │  SMC detection via page protection + VEH
 │   .hpp/.cpp)    │
 └─────────────────┘
 ```
@@ -136,8 +136,8 @@ Class IDs and their handlers:
 | IC_LEAVE      | LEAVE                                    | `emit_handler_leave`   |
 | IC_MOVZX_MEM  | MOVZX                                    | `emit_handler_movzx_mem` |
 | IC_MOVSX_MEM  | MOVSX                                    | `emit_handler_movsx_mem` |
-| IC_FPU_MEM    | FLD/FST/FISTP/FADD/FSUB/FMUL/FDIV/FCOM/FLDCW/... (27 x87 mnemonics) | `emit_handler_fpu_mem` |
-| IC_SSE_MEM    | MOVAPS/ADDPS/MULPS/XORPS/SHUFPS/... (36 SSE1 + 37 MMX; SSE2 gated) | `emit_handler_fpu_mem` (shared) |
+| IC_FPU_MEM    | FLD/FST/FISTP/FADD/FSUB/FMUL/FDIV/FCOM/FLDCW/... (29 x87 mnemonics) | `emit_handler_fpu_mem` |
+| IC_SSE_MEM    | MOVAPS/ADDPS/MULPS/XORPS/SHUFPS/... (43 SSE1 + 37 MMX; SSE2 gated) | `emit_handler_fpu_mem` (shared) |
 | IC_PUSHFD     | PUSHFD                                   | `emit_handler_pushfd`  |
 | IC_POPFD      | POPFD                                    | `emit_handler_popfd`   |
 | IC_STRING     | MOVSB/W/D, STOSB/W/D, LODSB/W/D, CMPSB/W/D, SCASB/W/D (15 mnemonics) | `emit_handler_string` |
@@ -324,7 +324,7 @@ The bump is correctly skipped for them (they are not stores).
 - [x] Shadow space / calling convention handling for Windows x64 JIT→C calls
 - [x] EFLAGS preservation across memory dispatch (PUSHFQ/POPFQ, liveness-gated)
 - [x] Self-tests pass: sum loop, EFLAGS preservation, LEA/PUSH/POP/MOV[mem]imm, x87 reg ops, x87 mem store
-- [x] SSE1/MMX memory-operand dispatch (36 SSE1 + 37 MMX mnemonics, `IC_SSE_MEM`)
+- [x] SSE1/MMX memory-operand dispatch (43 SSE1 + 37 MMX mnemonics, `IC_SSE_MEM`)
 - [x] SSE2+ mnemonics conditionally compiled (`TARGET_SSE` flag)
 - [x] PUSHFD/POPFD guest-stack handlers (`IC_PUSHFD`/`IC_POPFD`)
 - [x] LOOP/LOOPE/LOOPNE terminator handling (DEC ECX + conditional exit)
@@ -349,9 +349,9 @@ The bump is correctly skipped for them (they are not stores).
 - [x] ENTER imm16, imm8 stack frame creation via C helper (IC_ENTER)
 - [x] XLATB table lookup [EBX+AL] via C helper (IC_XLATB)
 - [x] INT/INT3/INT1/INTO software interrupt traps (IC_PRIVILEGED stubs)
-- [x] SMC write-side page-version bumping (inline per store + C-helper slow path)
+- [x] SMC detection via page protection + VEH (write to code page unprotects and invalidates)
 - [x] CALL direct/register: return address stored via imm-to-mem (no ECX clobber)
-- [x] NASM test infrastructure: 33 suites, CMake integration
+- [x] NASM test infrastructure: 46 suites, CMake integration
 - [x] NV2A PFIFO on dedicated host thread (parallel with guest CPU, CV-driven)
 
 ---
@@ -382,13 +382,13 @@ now contains two 512-byte FXSAVE areas: `guest_fpu` (offset 128) and `host_fpu`
   run natively — verbatim-copied by the trace builder.
 - **Memory-operand x87 instructions** (FLD [mem], FSTP [mem], FISTP [mem], FLDCW
   [mem], etc.) use the generic `emit_rewrite_mem_to_fastmem()` rewriter which
-  reconstructs any instruction to use `[R12+R14]` addressing. 27 x87 mnemonics
+  reconstructs any instruction to use `[R12+R14]` addressing. 29 x87 mnemonics
   registered in the dispatch table under `IC_FPU_MEM`.
 - **Guest FPU defaults**: FCW = 0x037F (all exceptions masked, double precision),
   MXCSR = 0x1F80 (all SSE exceptions masked).
 - Verified by Test 4 (FLD1+FADDP+FCOMPP+FNSTSW AX) and Test 5 (FISTP [mem]).
 
-**SSE1/MMX now registered.** 36 SSE1 single-precision mnemonics (MOVAPS, ADDPS,
+**SSE1/MMX now registered.** 43 SSE1 single-precision mnemonics (MOVAPS, ADDPS,
 MULPS, SHUFPS, COMISS, CVTSI2SS, LDMXCSR, etc.) and 37 MMX mnemonics (PADDB,
 PSHUFW, MASKMOVQ, etc.) are registered under `IC_SSE_MEM` and share the same
 `emit_handler_fpu_mem` handler (generic rewriter for memory forms, verbatim copy
@@ -586,7 +586,13 @@ Test suite: `tests/interrupt.asm` — 9 assertions covering INT→ISR→IRETD ro
 chained interrupts, nested interrupts (ISR calls INT), CLI/STI continuation,
 INT3 dispatch, stack integrity, and EFLAGS (CF) preservation across interrupt.
 
-#### 5.13 ~~SMC Write-Side Version Bumping~~ ✅ DONE
+#### 5.13 ~~SMC Detection~~ ✅ DONE (page protection + VEH)
+**Replaced page-version bumping with page protection.** After trace build, the
+code page is marked read-only via VirtualProtect. Writes to protected pages are
+caught by VEH, which unprotects the page, invalidates all traces on that page
+(including resetting outbound block links), bumps the page version, clears fault
+bitmaps, and continues execution. The next trace lookup rebuilds from the
+modified RAM and re-protects the page.
 
 #### 5.14 ~~Correctness audit~~ ✅ DONE
 Full codebase audit for correctness, efficiency, and consistency.  Fixes:
@@ -1827,20 +1833,15 @@ Link slot layout per trace:
 | `target_eip`| `uint32_t`| Guest EIP this exit targets              |
 | `linked`    | `bool`    | `true` if patched to a real target trace |
 
-#### 5.22 Fastmem Aliased Window ✅ DONE
+#### 5.22 Fastmem: 4 GB Window + VEH ✅ DONE
 
-The original design rejected a 4 GB guard-page / VEH-based fastmem window
-(§2.3 — "No Guard Pages").  The inline `CMP R14, R15; JAE slow_path` pattern
-remains the correct approach.  However, the NV2A tiling mirror region at
-PA `0x0C000000`–`0x13FFFFFF` aliases main RAM, and with `R15 = GUEST_RAM_SIZE`
-(128 MB = `0x08000000`), every mirror access fell through to the MMIO slow path —
-a significant penalty for framebuffer / texture operations.
-
-**Solution: Aliased fastmem window (320 MB).**
-
-The fastmem window is enlarged to `FASTMEM_WINDOW_SIZE = 0x14000000` (320 MB) and
-backed by platform memory aliasing so the mirror region maps to the same physical
-pages as main RAM with zero overhead:
+A 4 GB virtual memory window reserves the full 32-bit guest physical address
+space.  RAM and mirrors are section-mapped; the remaining ~3.7 GB stays as
+`PAGE_NOACCESS`.  Memory accesses use a single `[R12 + R14]` instruction with
+no bounds check.  Faults from unmapped pages (MMIO) are caught by a Windows
+Vectored Exception Handler (VEH) which sets a per-instruction fault bitmap bit,
+rebuilds the trace with slow-path CALL sequences, and redirects RIP to the
+rebuilt instruction.
 
 ```
 Offset          Size     Contents
@@ -1849,12 +1850,12 @@ Offset          Size     Contents
 0x08000000       64 MB   Gap (committed zero-fill, no devices)
 0x0C000000       64 MB   Mirror alias #1 → backing[0, 64 MB)
 0x10000000       64 MB   Mirror alias #2 → backing[0, 64 MB)
+0x14000000     ~3.7 GB   PAGE_NOACCESS (VEH handles faults)
 ```
 
-`R15 = FASTMEM_WINDOW_SIZE` (320 MB) so `CMP R14, R15` passes for both main RAM
-and mirror accesses, resolving to `OP [R12 + R14]` — a direct host dereference
-with ~3 cycle overhead.  Addresses above 320 MB (NV2A MMIO at `0xFD000000`,
-APU at `0xFE800000`, etc.) correctly take the MMIO slow path.
+R15 is freed (no longer holds `ram_size`).  Code pages are write-protected via
+`VirtualProtect` for SMC detection: writes to protected pages fault via VEH,
+which unprotects, invalidates traces, and continues execution.
 
 **Platform implementation** (`platform.hpp`):
 
@@ -1864,9 +1865,8 @@ APU at `0xFE800000`, etc.) correctly take the MMIO slow path.
 | Linux          | `memfd_create`           | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
 | macOS / BSD    | `shm_open` + `unlink`   | `mmap MAP_SHARED|MAP_FIXED` at multiple offsets         |
 
-Windows APIs are resolved at runtime via `GetProcAddress` (from `kernelbase.dll`)
-so the emulator links against plain `kernel32.lib` and gracefully falls back to
-a plain `VirtualAlloc` allocation (with MMIO mirror dispatch) on older Windows.
+Falls back to 320 MB aliased window (with `CMP R14, R15; JAE` bounds checks)
+if the 4 GB allocation fails.
 
 #### 5.23 ~~Trace Cache Improvements~~ ✅ DONE
 - Two-level direct-mapped cache: `page_map[(eip>>12) & L1_MASK][(eip & 0xFFF) >> 1]`
