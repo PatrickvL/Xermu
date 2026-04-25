@@ -55,6 +55,20 @@
 - **Result**: 46/46 pass
 - **Status**: DONE
 
+### Step 4: Fastmem + SMC stress tests
+- **tests/fastmem.asm** (--xbox, 20 assertions): VEH MMIO dispatch,
+  multi-fault trace rebuild, mirror aliasing, interleaved RAM+MMIO,
+  flags preservation across rebuild, repeated MMIO (slow-path cache),
+  two MMIO devices in one trace, store-immediate and register-store
+  to MMIO
+- **tests/smc_stress.asm** (non-xbox, 24 assertions): multiple
+  subroutines on same page, rapid-fire 10× same-instruction patch,
+  cross-page SMC, data+code mixed on same page, NOP→instruction
+  patching, conditional-branch-displacement patching, re-protect
+  after invalidation (3× cycle), multi-trace same-page invalidation
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -65,3 +79,4 @@
 | bd78d89 | 45   | 1    | smc (expected)           |
 | 3ff9331 | 46   | 0    | ALL PASS                 |
 | 76833b1 | 46   | 0    | ALL PASS (doc fixes)     |
+| (next)  | 48   | 0    | +fastmem, smc_stress     |
