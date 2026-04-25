@@ -4,6 +4,9 @@
 #include <cstring>
 #include <cassert>
 
+// Maximum guest RAM (matches GUEST_RAM_SIZE in executor.hpp).
+static constexpr uint32_t GUEST_RAM_SIZE_LOCAL = 128u * 1024u * 1024u;
+
 // ---------------------------------------------------------------------------
 // C-linkage MMIO slow-path helpers called from JIT code.
 // All guest GP regs are saved to GuestContext before the call.
@@ -34,7 +37,7 @@ void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
 // Returns PA on success, ~0u on fault (CR2 set to faulting VA).
 uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     auto* ram = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-    uint32_t ram_size = (uint32_t)ctx->ram_size;
+    uint32_t ram_size = GUEST_RAM_SIZE_LOCAL;
     uint32_t cr3 = ctx->cr3;
 
     uint32_t pdir_pa = cr3 & 0xFFFFF000u;
@@ -96,7 +99,7 @@ static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is
 // Generic guest memory read (handles paging + MMIO).
 static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         switch (size) {
         case 1: return base[pa];
@@ -110,15 +113,13 @@ static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t siz
 // Generic guest memory write (handles paging + MMIO + SMC bump).
 static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         switch (size) {
         case 1: base[pa] = (uint8_t)val;  break;
         case 2: *reinterpret_cast<uint16_t*>(base + pa) = (uint16_t)val; break;
         case 4: *reinterpret_cast<uint32_t*>(base + pa) = val;            break;
         }
-        auto* pv = reinterpret_cast<uint32_t*>(ctx->page_versions);
-        if (pv) pv[pa >> 12]++;
         return;
     }
     if (ctx->mmio) ctx->mmio->write(pa, val, size);
@@ -130,7 +131,7 @@ void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     uint32_t pa = guest_translate(ctx, esp, true);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = eflags_val;
     }
@@ -142,7 +143,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
     uint32_t esp = ctx->gp[GP_ESP];
     ctx->gp[GP_ESP] = esp + 4;
     uint32_t pa = guest_translate(ctx, esp, false);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return *reinterpret_cast<uint32_t*>(base + pa);
     }
@@ -153,7 +154,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
 // Used by JMP/CALL [mem] handlers.
 uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
     uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return *reinterpret_cast<uint32_t*>(base + pa);
     }
@@ -162,15 +163,11 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
 
 // Write a 32-bit value to guest physical memory (or MMIO).
 // Used by PUSH [mem] and CALL [mem] handlers.
-// Also bumps the SMC page version for the target page.
 void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
     uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         *reinterpret_cast<uint32_t*>(base + pa) = val;
-        // Bump SMC page version
-        auto* pv = reinterpret_cast<uint32_t*>(ctx->page_versions);
-        if (pv) pv[pa >> 12]++;
         return;
     }
     if (ctx->mmio) ctx->mmio->write(pa, val, 4);
@@ -297,7 +294,7 @@ void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
 uint32_t xlatb_helper(GuestContext* ctx) {
     uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
     uint32_t pa = guest_translate(ctx, ea, false);
-    if (pa < ctx->ram_size) {
+    if (pa < GUEST_RAM_SIZE_LOCAL) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return base[pa];
     }
@@ -525,31 +522,34 @@ uint8_t TraceBuilder::jcc_short_opcode(ZydisMnemonic m) {
 // Shared: emit inline fastmem dispatch for a reg/mem MOV-like instruction.
 // `guest_enc` is the register encoding, `size_bits` the operand width,
 // `is_load` true for load, false for store.
+//
+// Two modes based on e.slow_path:
+//   false → emit bare fastmem op; VEH handles faults and sets bitmap bit
+//   true  → emit slow-path MMIO call directly (bitmap was set on prior fault)
 static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
                                    uint8_t guest_enc, unsigned size_bits,
                                    bool is_load, bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/!is_load);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_op(e, guest_enc, size_bits, is_load);
-    if (!is_load) emit_smc_page_bump(e, false);  // SMC: MOV doesn't produce flags
-    uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, guest_enc);
-    emit_ccall_arg3_imm(e, size_bits / 8);
-    emit_call_abs(e, is_load
-        ? reinterpret_cast<void*>(mmio_dispatch_read)
-        : reinterpret_cast<void*>(mmio_dispatch_write));
-    emit_load_all_gp(e);
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
+    if (!e.slow_path) {
+        // Fast path: single instruction; VEH intercepts faults.
+        e.add_mem_site(e.fault_eip);
+        emit_fastmem_op(e, guest_enc, size_bits, is_load);
+    } else {
+        // Slow path: full MMIO dispatch call.
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, guest_enc);
+        emit_ccall_arg3_imm(e, size_bits / 8);
+        emit_call_abs(e, is_load
+            ? reinterpret_cast<void*>(mmio_dispatch_read)
+            : reinterpret_cast<void*>(mmio_dispatch_write));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+    }
     return true;
 }
 
@@ -560,27 +560,25 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
                                              bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/true);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    // fast: store immediate to [R12+R14]
-    if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
-    else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
-    else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
-    emit_smc_page_bump(e, false);  // SMC: MOV doesn't produce flags
-    uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, imm);           // arg2 = value (not gp index)
-    emit_ccall_arg3_imm(e, size_bits / 8);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-    emit_load_all_gp(e);
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
+    if (!e.slow_path) {
+        // Fast path: single instruction; VEH intercepts faults.
+        e.add_mem_site(e.fault_eip);
+        if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
+        else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
+        else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
+    } else {
+        // Slow path: full MMIO dispatch call.
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, imm);           // arg2 = value (not gp index)
+        emit_ccall_arg3_imm(e, size_bits / 8);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+    }
     return true;
 }
 
@@ -897,33 +895,17 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
     if (esp_in_reg) emit_load_esp_to_r8(e);
 
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-
-    // Fast path: rewrite the instruction to use [R12+R14]
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
-    // Store R8D back to ctx->gp[GP_ESP] if ESP was the destination.
-    if (esp_is_dst_mem) emit_store_r8_to_esp(e);
-    // SMC: bump page version if memory is the destination (write-back).
-    // CMP and TEST read memory but don't write back — skip bump for them.
-    // preserve_flags = !save_flags: when the outer bracket is active it will
-    // restore flags at the end anyway, so the bump's own PUSHFQ/POPFQ would
-    // be redundant.  When no outer bracket, the bump must protect the ALU
-    // result flags from SHR+INC clobber.
-    if (mem_idx == 0 &&
-        insn.mnemonic != ZYDIS_MNEMONIC_CMP &&
-        insn.mnemonic != ZYDIS_MNEMONIC_TEST) {
-        emit_smc_page_bump(e, /*preserve_flags=*/!save_flags);
+    if (!e.slow_path) {
+        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
+        if (save_flags) emit_save_flags(e);
+        e.add_mem_site(e.fault_eip);
+        if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+        if (esp_is_dst_mem) emit_store_r8_to_esp(e);
+        if (save_flags) emit_restore_flags(e);
+    } else {
+        // Slow path: MMIO not supported for ALU-mem — UD2 trap
+        e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
-    uint8_t* done_site = emit_jmp_fwd(e);
-
-    // Slow path: MMIO not supported for ALU-mem — UD2 trap
-    Emitter::patch_rel32(slow_site, e.cur());
-    e.emit8(0x0F); e.emit8(0x0B); // UD2
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -982,25 +964,15 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
     if (esp_in_reg) emit_load_esp_to_r8(e);
 
-    emit_save_flags(e);                         // PUSHFQ (with alignment fix)
-    emit_cmp_r14_r15(e);                        // CMP R14, R15
-    uint8_t* slow_site = emit_jae_fwd(e);       // JAE slow
-
-    // Fast path: restore flags, then execute instruction
-    emit_restore_flags(e);                      // POPFQ
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
-    if (esp_in_reg) emit_store_r8_to_esp(e);    // always store back (CMOVcc may or may not write)
-    // SMC: SETcc [mem] writes to memory.  Flags are still live here
-    // (SETcc/CMOVcc read but don't write EFLAGS), so preserve_flags=true.
-    if (mem_idx == 0) emit_smc_page_bump(e);  // preserve_flags=true (default)
-    uint8_t* done_site = emit_jmp_fwd(e);       // JMP done
-
-    // Slow path: balance PUSHFQ then UD2
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_restore_flags(e);                      // POPFQ (balance)
-    e.emit8(0x0F); e.emit8(0x0B);              // UD2
-
-    Emitter::patch_rel32(done_site, e.cur());
+    if (!e.slow_path) {
+        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
+        e.add_mem_site(e.fault_eip);
+        if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+        if (esp_in_reg) emit_store_r8_to_esp(e);
+    } else {
+        // Slow path: MMIO not supported for SETcc/CMOVcc — UD2 trap
+        e.emit8(0x0F); e.emit8(0x0B); // UD2
+    }
     return true;
 }
 
@@ -1060,23 +1032,20 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         return true;
     }
 
-    // Memory form: compute EA, bounds check, rewrite for fastmem
+    // Memory form: compute EA, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/false);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
 
-    // Fast path: rewrite the instruction to use [R12+R14]
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
-    uint8_t* done_site = emit_jmp_fwd(e);
-
-    // Slow path: UD2
-    Emitter::patch_rel32(slow_site, e.cur());
-    e.emit8(0x0F); e.emit8(0x0B); // UD2
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
+    if (!e.slow_path) {
+        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
+        if (save_flags) emit_save_flags(e);
+        e.add_mem_site(e.fault_eip);
+        if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+        if (save_flags) emit_restore_flags(e);
+    } else {
+        // Slow path: UD2
+        e.emit8(0x0F); e.emit8(0x0B); // UD2
+    }
     return true;
 }
 
@@ -1092,24 +1061,21 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_sub_ctx_esp(e, 4);
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
-        if (save_flags) emit_save_flags(e);
-        emit_cmp_r14_r15(e);
-        uint8_t* slow_site = emit_jae_fwd(e);
-        emit_fastmem_store_imm32(e, imm);
-        emit_smc_page_bump(e, false);  // PUSH doesn't produce flags
-        uint8_t* done_site = emit_jmp_fwd(e);
 
-        Emitter::patch_rel32(slow_site, e.cur());
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, imm);
-        emit_ccall_arg3_imm(e, 4);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-        emit_load_all_gp(e);
-
-        Emitter::patch_rel32(done_site, e.cur());
-        if (save_flags) emit_restore_flags(e);
+        if (!e.slow_path) {
+            e.add_mem_site(e.fault_eip);
+            emit_fastmem_store_imm32(e, imm);
+        } else {
+            if (save_flags) emit_save_flags(e);
+            emit_save_all_gp(e);
+            emit_ccall_arg0_ctx(e);
+            emit_ccall_arg1_pa(e);
+            emit_ccall_arg2_imm(e, imm);
+            emit_ccall_arg3_imm(e, 4);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
+            emit_load_all_gp(e);
+            if (save_flags) emit_restore_flags(e);
+        }
         return true;
     }
 
@@ -1134,24 +1100,21 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_sub_ctx_esp(e, 4);
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
-        if (save_flags) emit_save_flags(e);
-        emit_cmp_r14_r15(e);
-        uint8_t* slow_site = emit_jae_fwd(e);
-        emit_fastmem_op(e, reg_enc, 32, false);
-        emit_smc_page_bump(e, false);  // PUSH doesn't produce flags
-        uint8_t* done_site = emit_jmp_fwd(e);
 
-        Emitter::patch_rel32(slow_site, e.cur());
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, reg_enc);
-        emit_ccall_arg3_imm(e, 4);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
-        emit_load_all_gp(e);
-
-        Emitter::patch_rel32(done_site, e.cur());
-        if (save_flags) emit_restore_flags(e);
+        if (!e.slow_path) {
+            e.add_mem_site(e.fault_eip);
+            emit_fastmem_op(e, reg_enc, 32, false);
+        } else {
+            if (save_flags) emit_save_flags(e);
+            emit_save_all_gp(e);
+            emit_ccall_arg0_ctx(e);
+            emit_ccall_arg1_pa(e);
+            emit_ccall_arg2_imm(e, reg_enc);
+            emit_ccall_arg3_imm(e, 4);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
+            emit_load_all_gp(e);
+            if (save_flags) emit_restore_flags(e);
+        }
         return true;
     }
 
@@ -1197,24 +1160,22 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/false);
-        if (save_flags) emit_save_flags(e);
-        emit_cmp_r14_r15(e);
-        uint8_t* slow_site = emit_jae_fwd(e);
-        emit_fastmem_op(e, reg_enc, 32, true);
-        uint8_t* done_site = emit_jmp_fwd(e);
 
-        Emitter::patch_rel32(slow_site, e.cur());
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, reg_enc);
-        emit_ccall_arg3_imm(e, 4);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-
-        Emitter::patch_rel32(done_site, e.cur());
+        if (!e.slow_path) {
+            e.add_mem_site(e.fault_eip);
+            emit_fastmem_op(e, reg_enc, 32, true);
+        } else {
+            if (save_flags) emit_save_flags(e);
+            emit_save_all_gp(e);
+            emit_ccall_arg0_ctx(e);
+            emit_ccall_arg1_pa(e);
+            emit_ccall_arg2_imm(e, reg_enc);
+            emit_ccall_arg3_imm(e, 4);
+            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+            emit_load_all_gp(e);
+            if (save_flags) emit_restore_flags(e);
+        }
         emit_add_ctx_esp(e, 4);
-        if (save_flags) emit_restore_flags(e);
         return true;
     }
 
@@ -1288,24 +1249,22 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     // Step 2: POP EBP — read dword from [ESP], write to EBP, ESP += 4
     emit_load_esp_to_r14(e);
     emit_paging_translate(e, /*is_write=*/false);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_op(e, GP_EBP, 32, true);
-    uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, GP_EBP);
-    emit_ccall_arg3_imm(e, 4);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-    emit_load_all_gp(e);
-
-    Emitter::patch_rel32(done_site, e.cur());
+    if (!e.slow_path) {
+        e.add_mem_site(e.fault_eip);
+        emit_fastmem_op(e, GP_EBP, 32, true);
+    } else {
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, GP_EBP);
+        emit_ccall_arg3_imm(e, 4);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+    }
     emit_add_ctx_esp(e, 4);
-    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -1455,24 +1414,22 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
-    if (esp_dst) emit_store_r8_to_esp(e);
-    uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, dst_enc);
-    emit_ccall_arg3_imm(e, src_bits / 8);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-    emit_load_all_gp(e);
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
+    if (!e.slow_path) {
+        e.add_mem_site(e.fault_eip);
+        emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
+        if (esp_dst) emit_store_r8_to_esp(e);
+    } else {
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, dst_enc);
+        emit_ccall_arg3_imm(e, src_bits / 8);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+    }
     return true;
 }
 
@@ -1502,24 +1459,22 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
-    emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
-    if (esp_dst) emit_store_r8_to_esp(e);
-    uint8_t* done_site = emit_jmp_fwd(e);
 
-    Emitter::patch_rel32(slow_site, e.cur());
-    emit_save_all_gp(e);
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, dst_enc);
-    emit_ccall_arg3_imm(e, src_bits / 8);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-    emit_load_all_gp(e);
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
+    if (!e.slow_path) {
+        e.add_mem_site(e.fault_eip);
+        emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
+        if (esp_dst) emit_store_r8_to_esp(e);
+    } else {
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, dst_enc);
+        emit_ccall_arg3_imm(e, src_bits / 8);
+        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+    }
     return true;
 }
 
@@ -1542,24 +1497,19 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     // Memory form: compute EA, bounds check, rewrite for fastmem
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/mem_idx == 0);
-    if (save_flags) emit_save_flags(e);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow_site = emit_jae_fwd(e);
 
-    // Fast path: rewrite the instruction to use [R12+R14]
-    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) {
-        return false;
+    if (!e.slow_path) {
+        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
+        if (save_flags) emit_save_flags(e);
+        e.add_mem_site(e.fault_eip);
+        if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) {
+            return false;
+        }
+        if (save_flags) emit_restore_flags(e);
+    } else {
+        // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
+        e.emit8(0x0F); e.emit8(0x0B); // UD2
     }
-    // SMC: bump page version if memory is the destination (FPU store)
-    if (mem_idx == 0) emit_smc_page_bump(e, false);  // FPU doesn't produce x86 flags
-    uint8_t* done_site = emit_jmp_fwd(e);
-
-    // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
-    Emitter::patch_rel32(slow_site, e.cur());
-    e.emit8(0x0F); e.emit8(0x0B); // UD2
-
-    Emitter::patch_rel32(done_site, e.cur());
-    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -1645,13 +1595,9 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
             emit_paging_translate(e, /*is_write=*/true);
-            emit_cmp_r14_r15(e);
-            uint8_t* oob = emit_jae_fwd(e);
+            e.add_mem_site(e.fault_eip);
             emit_fastmem_store_imm32(e, pc_after);
-            emit_smc_page_bump(e, false);
             emit_epilog_static(e, target);  // ends with RET
-            Emitter::patch_rel32(oob, e.cur());
-            e.emit8(0x0F); e.emit8(0x0B);  // UD2 — stack OOB
             return;
         }
         if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -1660,13 +1606,9 @@ void TraceBuilder::emit_call_exit(Emitter& e,
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
                 emit_paging_translate(e, /*is_write=*/true);
-                emit_cmp_r14_r15(e);
-                uint8_t* oob = emit_jae_fwd(e);
+                e.add_mem_site(e.fault_eip);
                 emit_fastmem_store_imm32(e, pc_after);
-                emit_smc_page_bump(e, false);
                 emit_epilog_dynamic(e, enc);  // ends with RET
-                Emitter::patch_rel32(oob, e.cur());
-                e.emit8(0x0F); e.emit8(0x0B);  // UD2 — stack OOB
                 return;
             }
         }
@@ -1704,28 +1646,14 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     // Step 2: R14D = ctx->esp (ESP was never in a host register; read from ctx).
     emit_load_esp_to_r14(e);
 
-    // Step 3: fastmem check.
+    // Step 3: fastmem load.
     emit_paging_translate(e, /*is_write=*/false);
-    emit_cmp_r14_r15(e);
-    uint8_t* slow = emit_jae_fwd(e);
-
-    // Step 4a (fast): EAX = [R12 + R14]  — return address from guest stack.
+    // EAX = [R12 + R14]  — return address from guest stack.
+    // VEH handles any fault (stack in unmapped page — shouldn't happen in practice).
+    e.add_mem_site(e.fault_eip);
     emit_fastmem_op(e, GP_EAX, 32, true);
-    uint8_t* done = emit_jmp_fwd(e);
 
-    // Step 4b (slow / MMIO): call mmio_dispatch_read; result lands in ctx->gp[EAX].
-    // Then reload EAX from ctx so both paths converge: EAX = return address.
-    Emitter::patch_rel32(slow, e.cur());
-    emit_ccall_arg0_ctx(e);
-    emit_ccall_arg1_pa(e);
-    emit_ccall_arg2_imm(e, GP_EAX);
-    emit_ccall_arg3_imm(e, 4);
-    emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-    emit_load_gp(e, GP_EAX, gp_offset(GP_EAX));   // EAX = ctx->gp[EAX] (retaddr)
-
-    Emitter::patch_rel32(done, e.cur());
-
-    // Step 5: ctx->esp += 4.
+    // Step 4: ctx->esp += 4.
     emit_add_ctx_esp(e, 4);
 
     // Step 6: ctx->next_eip = EAX  (direct write; bypass gpreg slot).
@@ -1746,8 +1674,8 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
 static constexpr size_t MAX_TRACE_BYTES = 8192;
 static constexpr size_t MAX_INSN_COUNT  = 512;
 
-// Arithmetic flags clobbered by the inline CMP R14,R15 bounds check and
-// SUB/ADD ctx->gp[ESP] in memory dispatch sequences.
+// Arithmetic flags clobbered by the inline SUB/ADD ctx->gp[ESP] in
+// PUSH/POP sequences and by slow-path MMIO CALL sequences.
 static constexpr uint32_t ARITH_FLAGS =
     ZYDIS_CPUFLAG_CF | ZYDIS_CPUFLAG_PF | ZYDIS_CPUFLAG_AF |
     ZYDIS_CPUFLAG_ZF | ZYDIS_CPUFLAG_SF | ZYDIS_CPUFLAG_OF;
@@ -1758,7 +1686,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             CodeCache&          cc,
                             TraceArena&         arena,
                             const PageVersions& pv,
-                            GuestContext*       ctx) {
+                            GuestContext*       ctx,
+                            const FaultBitmaps* fb) {
     if (guest_eip >= ram_size) {
         fprintf(stderr, "[trace] EIP %08X outside RAM\n", guest_eip);
         return nullptr;
@@ -1803,7 +1732,10 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             }
 
             InsnClassFlags icf = lookup_flags(insn.mnemonic);
-            bool dispatch = (icf & ICF_HAS_DISPATCH) != 0;
+            // In the 4GB fastmem model, bare fastmem ops don't clobber flags.
+            // Only slow-path CALL sequences (bitmap-set instructions) do.
+            bool dispatch = (icf & ICF_HAS_DISPATCH) != 0 &&
+                            fb && fb->test(scan_guest_pc);
 
             meta[n_insns++] = { insn.length, tested, written, dispatch, false };
 
@@ -1869,6 +1801,9 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         uint32_t pc_after = guest_pc + insn.length;
         e.fault_eip = guest_pc; // for paging fault exit stubs
+        // Set slow_path flag: if the bitmap says this guest PA faulted before,
+        // the handler will emit a full MMIO CALL instead of a bare fastmem op.
+        e.slow_path = fb && fb->test(guest_pc);
 
         // Look up the instruction's class via O(1) dispatch table
         InsnClassFlags icf = lookup_flags(insn.mnemonic);
@@ -2040,21 +1975,26 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     if (!t) return nullptr;
 
     t->guest_eip = guest_eip;
+    t->code_pa   = guest_eip;
     t->host_code = emit_buf;
+    t->host_size = (uint32_t)e.pos;
     t->page_ver  = pv.get(guest_eip);
     t->valid     = true;
 
     // Transfer pending link slots from the emitter to the trace.
-    // If the trace contains SMC writes (page version bumps), don't link —
-    // the write may invalidate the target trace during execution.
     t->num_links = 0;
-    if (!e.smc_written) {
+    {
         int start = (e.num_pending_links > Trace::MAX_LINKS)
                   ? e.num_pending_links - Trace::MAX_LINKS : 0;
         for (int i = start; i < e.num_pending_links; ++i)
             t->add_link(e.pending_links[i].patch_site,
                          e.pending_links[i].target_eip);
     }
+
+    // Transfer memory-op site table from emitter to trace (for VEH lookup).
+    t->num_mem_sites = 0;
+    for (int i = 0; i < e.num_mem_sites; ++i)
+        t->add_mem_site(e.mem_sites[i].host_offset, e.mem_sites[i].guest_eip);
 
     return t;
 }

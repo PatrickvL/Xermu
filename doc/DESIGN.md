@@ -72,38 +72,39 @@ During trace execution, four host registers are pinned:
 | R12      | `fastmem_base` — host pointer to guest PA 0          |
 | R13      | `GuestContext*` — executor context pointer            |
 | R14      | EA scratch — used for address computation staging     |
-| R15      | `ram_size` — fastmem window size (320 MB with aliasing, 128 MB fallback) |
+| R15      | (reserved, currently unused — freed from ram_size)    |
 
-This eliminates bounds-check overhead: every memory access is a CMP + conditional
-branch to a slow path, with the fast path being a single `[R12 + R14]` dereference.
+### 2.3 Memory Access Dispatch (4 GB Fastmem + VEH)
 
-### 2.3 Memory Access Dispatch (No Guard Pages)
-
-Every memory instruction is decoded and rewritten *before* execution. No VEH, no
-SIGSEGV, no exception handling in the hot path:
+A 4 GB virtual memory window is reserved at startup, covering the full 32-bit
+guest physical address space. RAM and mirrors are section-mapped; the remaining
+~3.7 GB stays as `PAGE_NOACCESS`. Memory instructions are rewritten to use a
+single `[R12 + R14]` dereference with no bounds check:
 
 ```
 Synthesize EA → R14D
-[PUSHFQ + LEA RSP,-8]  (only if backward liveness says arithmetic flags are live)
-CMP R14, R15           (PA < ram_size?)
-JAE slow_path          (predicted not-taken)
-OP reg, [R12 + R14]    ← fastmem: direct host dereference, ~3 cycle overhead
-JMP done
-slow_path:
-  save GP regs → ctx
-  call mmio_dispatch_{read,write}(ctx, PA, gp_idx, size)
-  load GP regs ← ctx
-done:
-[LEA RSP,+8 + POPFQ]  (only if saved above)
+[emit_paging_translate]  (if CR0.PG=1: CALL translate_va_jit)
+OP reg, [R12 + R14]      ← single fastmem instruction
 ```
 
-The PUSHFQ/POPFQ wrapping ensures that the CMP R14, R15 bounds check does not
-clobber guest EFLAGS when they are live. The wrapping is conditional: a backward
-flag-liveness analysis during trace building determines which dispatch sites
-actually need it. A flag is "live" if it was set by a prior guest instruction
-and will be tested by a later instruction (Jcc, CMOVcc, SETcc, etc.) before
-being overwritten. Dispatches where no arithmetic flags are live skip the
-PUSHFQ/POPFQ entirely, saving ~22 bytes and two stack round-trips per site.
+Accesses to unmapped pages (MMIO regions) trigger a Windows VEH
+(Vectored Exception Handler). The handler:
+1. Verifies the fault is within the 4 GB window and the code cache.
+2. Finds the faulting trace and looks up the guest EIP via MemOpSite table.
+3. Sets a per-instruction bit in the **fault bitmap**.
+4. Rebuilds the trace — bitmap-set instructions now emit slow-path CALL
+   sequences (save GP → call mmio_dispatch → load GP) instead of bare
+   fastmem ops.
+5. Redirects RIP to the start of the new trace and continues execution.
+
+This gives zero overhead for RAM accesses (the common case) and one-time VEH
+cost for MMIO addresses. Subsequent executions of the same instruction go
+through the slow-path CALL directly, without faulting again.
+
+Flag-liveness analysis is still performed: slow-path CALL sequences clobber
+arithmetic flags, so PUSHFQ/POPFQ wrapping is added only when flags are live.
+Bare fastmem ops never clobber flags, so fast-path instructions skip the
+wrapping entirely.
 
 ### 2.4 Instruction Dispatch Table (`insn_dispatch.hpp`)
 
@@ -115,7 +116,7 @@ All instruction classification is driven by a **two-level O(1) dispatch table**:
 
 - **Level 2**: `InsnClass INSN_CLASS_TABLE[IC_MAX]` — maps `InsnClassId` to an
   `{EmitHandler, InsnClassFlags}` pair. `InsnClassFlags` encode properties:
-  - `ICF_HAS_DISPATCH` — the handler emits CMP R14,R15 (may clobber EFLAGS)
+  - `ICF_HAS_DISPATCH` — the handler emits a fastmem op (may need slow-path CALL if bitmap-set)
   - `ICF_CLEAN_COPY` — verbatim copy or re-encode, no memory access
   - `ICF_TERMINATOR` — trace exit (branch/call/ret)
   - `ICF_PRIVILEGED` — privileged instruction (trap/UD2)

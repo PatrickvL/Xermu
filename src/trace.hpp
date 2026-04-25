@@ -12,7 +12,9 @@
 // directly to the target's host_code, bypassing the run loop.
 struct Trace {
     uint32_t  guest_eip   = 0;
+    uint32_t  code_pa     = 0;         // guest physical address of code (for rebuild)
     uint8_t*  host_code   = nullptr;   // pointer into CodeCache slab
+    size_t    host_size   = 0;         // emitted host code size in bytes
     uint32_t  page_ver    = 0;         // page_versions[guest_eip>>12] at build time
     bool      valid       = false;
 
@@ -29,6 +31,30 @@ struct Trace {
     void add_link(uint8_t* patch_site, uint32_t target) {
         if (num_links < MAX_LINKS)
             links[num_links++] = { patch_site, target, false };
+    }
+
+    // Memory-op site table: maps host code offset → guest EIP for VEH lookup.
+    // Populated during trace build at each memory-op emit site.
+    static constexpr int MAX_MEM_SITES = 64;
+    struct MemOpSite {
+        uint32_t host_offset;   // offset from host_code where the mem op starts
+        uint32_t guest_eip;     // guest instruction that emitted this memory op
+    };
+    MemOpSite mem_sites[MAX_MEM_SITES] = {};
+    int       num_mem_sites = 0;
+
+    void add_mem_site(uint32_t host_off, uint32_t geip) {
+        if (num_mem_sites < MAX_MEM_SITES)
+            mem_sites[num_mem_sites++] = { host_off, geip };
+    }
+
+    // Lookup guest EIP by host code address. Returns 0 on miss.
+    uint32_t lookup_guest_eip(const uint8_t* host_addr) const {
+        uint32_t off = (uint32_t)(host_addr - host_code);
+        for (int i = 0; i < num_mem_sites; ++i)
+            if (mem_sites[i].host_offset == off)
+                return mem_sites[i].guest_eip;
+        return 0;
     }
 };
 

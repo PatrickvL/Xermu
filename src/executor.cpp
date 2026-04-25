@@ -1,4 +1,5 @@
 #include "executor.hpp"
+#include "fault_handler.hpp"
 #include <Zydis/Zydis.h>
 #include <cstdio>
 #include <cstring>
@@ -6,6 +7,98 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+
+// ---------------------------------------------------------------------------
+// VEH handler for 4 GB fastmem faults (Windows only).
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
+    if (!g_active_executor) return EXCEPTION_CONTINUE_SEARCH;
+
+    // Only handle access violations.
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    auto* ctx_regs = ep->ContextRecord;
+    auto  fault_addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    auto* exec = g_active_executor;
+
+    // Step 1: Is the fault within the fastmem window?
+    auto base = (uintptr_t)exec->ctx.fastmem_base;
+    if (fault_addr < base || fault_addr >= base + 0x100000000ULL)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Step 2: Is the faulting RIP within our code cache?
+    auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
+    if (!exec->cc.contains(rip))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Step 3: Find the trace containing RIP (linear scan — VEH is rare).
+    Trace* faulting_trace = nullptr;
+    {
+        auto& tcache = exec->tcache;
+        for (size_t p = 0; p < TraceCache::L1_SIZE; ++p) {
+            auto* page = tcache.page_map[p];
+            if (!page) continue;
+            for (size_t s = 0; s < TraceCache::L2_SIZE; ++s) {
+                Trace* t = page->slots[s];
+                if (!t || !t->valid || !t->host_code) continue;
+                if (rip >= t->host_code && rip < t->host_code + t->host_size) {
+                    faulting_trace = t;
+                    break;
+                }
+            }
+            if (faulting_trace) break;
+        }
+    }
+
+    if (!faulting_trace) {
+        fprintf(stderr, "[veh] FAULT at RIP=%p — no matching trace\n", (void*)rip);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Step 4: Look up guest EIP from MemOpSite table.
+    uint32_t guest_eip = faulting_trace->lookup_guest_eip(rip);
+    if (!guest_eip) {
+        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP\n",
+                faulting_trace->guest_eip);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Step 5: Set fault bitmap bit.
+    exec->fb.set(guest_eip);
+
+    // Step 6: Rebuild the trace with bitmap-set slow paths.
+    Trace* new_trace = exec->builder.build(
+        faulting_trace->code_pa,
+        exec->ram,
+        GUEST_RAM_SIZE,
+        exec->cc,
+        exec->arena,
+        exec->pv,
+        &exec->ctx,
+        &exec->fb
+    );
+
+    if (!new_trace) {
+        fprintf(stderr, "[veh] rebuild failed for trace @%08X\n",
+                faulting_trace->guest_eip);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Update trace cache and invalidate old trace.
+    new_trace->guest_eip = faulting_trace->guest_eip;
+    exec->tcache.insert(new_trace);  // overwrites old slot
+    faulting_trace->valid = false;
+
+    // Step 7: Redirect to START of new trace.
+    // The faulting instruction hasn't committed yet, so re-executing
+    // from the beginning is correct.
+    ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
+
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // dispatch_trace — naked asm trampoline (GCC / Clang, x86-64)
@@ -18,7 +111,7 @@
 //   R12 = fastmem_base   (callee-saved — preserved across the call)
 //   R13 = GuestContext*  (callee-saved)
 //   R14 = EA scratch     (callee-saved — we push/pop it ourselves)
-//   R15 = ram_size       (callee-saved)
+//   R15 = unused         (callee-saved — push/pop for ABI compliance)
 //
 // Guest GP registers live in host EAX–EDI while a trace runs.
 // ESP is NOT mapped to host RSP; it stays in ctx->gp[GP_ESP] and is
@@ -52,7 +145,7 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         // ---- Set up pinned executor registers ----------------------------
         "mov %%rdi, %%r13\n\t"              // R13 = ctx
         "movq 48(%%r13), %%r12\n\t"         // R12 = ctx->fastmem_base
-        "movl 56(%%r13), %%r15d\n\t"        // R15D = ctx->ram_size
+        // R15 is no longer used (was ram_size); push/pop for ABI compliance only.
         // Stash host_code (RSI) in R14 before we clobber RSI with guest ESI.
         "mov %%rsi, %%r14\n\t"
 
@@ -126,9 +219,13 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
 // ---------------------------------------------------------------------------
 
 bool Executor::init(MmioMap* mmio) {
-    // Try aliased fastmem window: main RAM at offset 0, mirror at 0x0C000000.
-    fastmem_window = platform::alloc_fastmem_window(FASTMEM_WINDOW_SIZE,
-                                                     GUEST_RAM_SIZE);
+    // Try 4 GB fastmem window first (enables VEH-based MMIO handling).
+    fastmem_window = platform::alloc_4gb_window(GUEST_RAM_SIZE);
+    if (!fastmem_window.base) {
+        // Fallback: 320 MB aliased window.
+        fastmem_window = platform::alloc_fastmem_window(FASTMEM_WINDOW_SIZE,
+                                                         GUEST_RAM_SIZE);
+    }
     if (fastmem_window.base) {
         ram = static_cast<uint8_t*>(fastmem_window.base);
     } else {
@@ -142,15 +239,13 @@ bool Executor::init(MmioMap* mmio) {
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.fastmem_base = (uint64_t)(uintptr_t)ram;
-    // If aliased window is active, ram_size covers the full window (including mirror).
-    // Otherwise, only the plain RAM size.
-    ctx.ram_size     = fastmem_window.base ? FASTMEM_WINDOW_SIZE : GUEST_RAM_SIZE;
+    ctx.ram_size     = GUEST_RAM_SIZE;
     ctx.mmio         = mmio;
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
     ctx.halted       = false;
-    ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // SMC write-side
+    ctx.page_versions = (uint64_t)(uintptr_t)pv.ver;  // legacy (kept for compat)
     tlb.flush();
 
     // Initialize guest FPU state to clean defaults.
@@ -161,13 +256,30 @@ bool Executor::init(MmioMap* mmio) {
     uint32_t mxcsr = 0x1F80;
     memcpy(ctx.guest_fpu + 24, &mxcsr, 4);
 
+    // Install VEH for 4 GB fastmem faults.
+#ifdef _WIN32
+    g_active_executor = this;
+    veh_handle_ = AddVectoredExceptionHandler(1 /*first*/, fastmem_veh_handler);
+#endif
+
     return true;
 }
 
 void Executor::destroy() {
+#ifdef _WIN32
+    if (veh_handle_) {
+        RemoveVectoredExceptionHandler(veh_handle_);
+        veh_handle_ = nullptr;
+    }
+    g_active_executor = nullptr;
+#endif
+
     cc.destroy();
     if (fastmem_window.base) {
-        platform::free_fastmem_window(fastmem_window);
+        if (fastmem_window.window_size >= 0x100000000ULL)
+            platform::free_4gb_window(fastmem_window);
+        else
+            platform::free_fastmem_window(fastmem_window);
     } else if (ram) {
         platform::free_ram(ram, GUEST_RAM_SIZE);
     }
@@ -1009,29 +1121,18 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Lookup trace in cache.
         Trace* t = tcache.lookup(eip);
 
-        // Validate: check page version for SMC.
-        if (t && t->valid) {
-            if (pv.get(code_pa) != t->page_ver) {
-                unlink_trace(t);      // remove incoming links before invalidation
-                tcache.invalidate(eip);
-                t = nullptr;
-                prev_trace = nullptr; // chain broken by invalidation
-            }
-        } else {
-            t = nullptr;
-        }
+        if (t && !t->valid) t = nullptr;
 
         // Build if missing.
         if (!t) {
             t = builder.build(code_pa, ram, GUEST_RAM_SIZE,
-                              cc, arena, pv, &ctx);
+                              cc, arena, pv, &ctx, &fb);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;
             }
             // Override guest_eip to store the VA (for cache lookup).
             t->guest_eip = eip;
-            t->page_ver  = pv.get(code_pa);
             tcache.insert(t);
         }
 

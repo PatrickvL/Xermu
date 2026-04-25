@@ -33,4 +33,9 @@ struct CodeCache {
     }
 
     void reset() { used = 0; }
+
+    // Check if a host address is within the code cache slab.
+    bool contains(const uint8_t* addr) const {
+        return addr >= base && addr < base + cap;
+    }
 };

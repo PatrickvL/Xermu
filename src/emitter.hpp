@@ -15,6 +15,7 @@ struct Emitter {
     size_t   cap;
     bool     paging   = false; // true when CR0.PG is set at build time
     uint32_t fault_eip = 0;    // guest EIP for #PF exit on translate fault
+    bool     slow_path = false; // true when fault bitmap says this insn needs MMIO slow path
 
     // Pending link slots collected during trace emission.
     // Transferred to the Trace after building.
@@ -26,6 +27,20 @@ struct Emitter {
     PendingLink pending_links[MAX_PENDING_LINKS] = {};
     int num_pending_links = 0;
     bool smc_written = false; // set when trace bumps a page version (SMC)
+
+    // Memory-op site table: accumulated during emit, transferred to Trace.
+    struct MemSite {
+        uint32_t host_offset;
+        uint32_t guest_eip;
+    };
+    static constexpr int MAX_MEM_SITES = 64;
+    MemSite mem_sites[MAX_MEM_SITES] = {};
+    int num_mem_sites = 0;
+
+    void add_mem_site(uint32_t guest_eip_val) {
+        if (num_mem_sites < MAX_MEM_SITES)
+            mem_sites[num_mem_sites++] = { (uint32_t)pos, guest_eip_val };
+    }
 
     void add_pending_link(uint8_t* site, uint32_t target) {
         if (num_pending_links < MAX_PENDING_LINKS)
