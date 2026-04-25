@@ -234,7 +234,7 @@ The bump is correctly skipped for them (they are not stores).
 | `xbox/nv2a_thread.hpp` | NV2A PFIFO dedicated host thread (CV-driven)    | ✅ Working    |
 | `xbox/pgraph.hpp`     | PGRAPH state shadow (NV097 method → state)       | ✅ Working    |
 | `xbox/apu.hpp`        | APU register stubs (VP/GP/EP)                    | ✅ Working    |
-| `xbox/ide.hpp`        | IDE ATA: PIO sector read/write + IDENTIFY data   | ✅ Working    |
+| `xbox/ide.hpp`        | IDE ATA/ATAPI: PIO, IDENTIFY, PACKET (INQUIRY)   | ✅ Working    |
 | `xbox/usb.hpp`        | USB OHCI controller stubs (2 ports each)         | ✅ Working    |
 | `xbox/ioapic.hpp`     | I/O APIC: indirect regs, redir entries, RO bits  | ✅ Working    |
 | `xbox/ram_mirror.hpp` | RAM mirror (0x0C000000) read/write               | ✅ Working    |
@@ -272,7 +272,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/nv2a_gpu.asm`  | NV2A GPU: PFIFO+DMA pusher, PGRAPH, PRAMDAC, PFB (16) | ✅ ALL PASS   |
 | `tests/esp_mem.asm`    | ESP+mem: ALU/MOVZX/MOVSX/MOV ESP with memory (11) | ✅ ALL PASS   |
 | `tests/apu.asm`       | APU: FE/SE/VP/GP/EP registers, idle-voice, FIFOs (20) | ✅ ALL PASS   |
-| `tests/ide.asm`       | IDE ATA: register defaults, IDENTIFY data, PIO (16) | ✅ ALL PASS   |
+| `tests/ide.asm`       | IDE ATA/ATAPI: regs, IDENTIFY, PACKET INQUIRY (19) | ✅ ALL PASS   |
 | `tests/usb.asm`       | USB OHCI: register defaults, reset, PCI (12)     | ✅ ALL PASS   |
 | `tests/mtrr.asm`      | MTRR MSRs: variable + fixed range read/write (8) | ✅ ALL PASS   |
 | `tests/gdt_tss.asm`   | GDT/TSS: LLDT/LTR/SLDT/STR/SGDT/SIDT (10)       | ✅ ALL PASS   |
@@ -1571,7 +1571,7 @@ master = "XBOX DVD" (ATAPI CD-ROM).  Both report ATA-6, LBA capable.
 **Software reset:** Writing SRST (bit 2) to control register resets
 task-file to post-reset defaults (status = 0x50, error = 0x01).
 
-**Test:** `tests/ide.asm` — 16 assertions covering init status, task-file
+**Test:** `tests/ide.asm` — 19 assertions covering init status, task-file
 R/W, IDENTIFY with data port transfer (word 0 + full 256-word drain),
 SET FEATURES, unknown command error, alternate status, and software reset.
 

@@ -77,6 +77,7 @@ struct IdeChannel {
         0x00,   // CONTROL
     };
     bool     present    = false;
+    bool     is_atapi   = false;
     uint8_t  identify[512] = {};
 
     // PIO data transfer state
@@ -84,6 +85,11 @@ struct IdeChannel {
     uint16_t data_pos      = 0;   // byte offset into data_buf
     uint16_t data_len      = 0;   // bytes remaining in current transfer
     uint8_t  sectors_left  = 0;   // sectors remaining for multi-sector commands
+
+    // ATAPI packet command state
+    uint8_t  packet_buf[12] = {}; // 12-byte command packet
+    uint8_t  packet_pos     = 0;  // bytes received so far
+    bool     awaiting_packet = false;
 
     // Bus Master DMA state
     uint8_t  bm_cmd     = 0;     // command register
@@ -138,8 +144,12 @@ struct IdeState {
     IdeState() {
         primary.present   = true;
         init_hdd_identify(primary);
-        secondary.present = true;
+        secondary.present  = true;
+        secondary.is_atapi = true;
         init_dvd_identify(secondary);
+        // Set ATAPI signature on secondary (LBA_MID=0x14, LBA_HIGH=0xEB)
+        secondary.regs[ide_tf::LBA_MID]    = 0x14;
+        secondary.regs[ide_tf::LBA_HIGH]   = 0xEB;
     }
 
     static void init_hdd_identify(IdeChannel& ch) {
@@ -244,7 +254,58 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
     uint8_t v = (uint8_t)val;
     switch (reg) {
     case 0: {
-        // Data port — 16-bit PIO write to data_buf.
+        // Data port — 16-bit PIO write to data_buf or ATAPI packet.
+        if (ch->awaiting_packet) {
+            uint16_t w = (uint16_t)(val & 0xFFFF);
+            if (ch->packet_pos + 1 < 12) {
+                ch->packet_buf[ch->packet_pos]     = (uint8_t)(w & 0xFF);
+                ch->packet_buf[ch->packet_pos + 1] = (uint8_t)(w >> 8);
+            }
+            ch->packet_pos += 2;
+            if (ch->packet_pos >= 12) {
+                ch->awaiting_packet = false;
+                // Execute ATAPI command
+                uint8_t scsi_op = ch->packet_buf[0];
+                switch (scsi_op) {
+                case 0x00:  // TEST UNIT READY
+                    ch->regs[ide_tf::STAT_CMD] = 0x50;
+                    ch->regs[ide_tf::ERR_FEAT] = 0;
+                    break;
+                case 0x12: { // INQUIRY
+                    memset(ch->data_buf, 0, 36);
+                    ch->data_buf[0] = 0x05;  // CD-ROM device
+                    ch->data_buf[1] = 0x80;  // removable
+                    ch->data_buf[2] = 0x00;  // version
+                    ch->data_buf[3] = 0x21;  // response format
+                    ch->data_buf[4] = 31;    // additional length
+                    memcpy(ch->data_buf + 8,  "XBOX    ", 8);  // vendor
+                    memcpy(ch->data_buf + 16, "DVD             ", 16); // product
+                    memcpy(ch->data_buf + 32, "1.00", 4);     // revision
+                    ch->data_pos = 0;
+                    ch->data_len = 36;
+                    ch->regs[ide_tf::STAT_CMD] = 0x58; // DRQ
+                    ch->regs[ide_tf::ERR_FEAT] = 0;
+                    break;
+                }
+                case 0x5A: { // MODE SENSE (10)
+                    // Return minimal header: 8 bytes
+                    memset(ch->data_buf, 0, 8);
+                    ch->data_buf[1] = 6;  // mode data length - 1
+                    ch->data_pos = 0;
+                    ch->data_len = 8;
+                    ch->regs[ide_tf::STAT_CMD] = 0x58;
+                    ch->regs[ide_tf::ERR_FEAT] = 0;
+                    break;
+                }
+                default:
+                    // Unknown SCSI op — set error (ABRT)
+                    ch->regs[ide_tf::STAT_CMD] = 0x51;
+                    ch->regs[ide_tf::ERR_FEAT] = 0x04;
+                    break;
+                }
+            }
+            break;
+        }
         if (ch->data_len == 0) break;
         uint16_t w = (uint16_t)(val & 0xFFFF);
         if (ch->data_pos + 1 < IdeChannel::SECTOR_SIZE)
@@ -292,6 +353,20 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
             ch->regs[ide_tf::STAT_CMD] = 0x58;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
+        case 0xA0:  // PACKET (ATAPI)
+            if (!ch->is_atapi) {
+                ch->regs[ide_tf::STAT_CMD] = 0x51;
+                ch->regs[ide_tf::ERR_FEAT] = 0x04;
+                break;
+            }
+            ch->awaiting_packet = true;
+            ch->packet_pos = 0;
+            memset(ch->packet_buf, 0, 12);
+            ch->regs[ide_tf::STAT_CMD] = 0x58; // DRQ — ready for packet
+            ch->regs[ide_tf::ERR_FEAT] = 0;
+            // Set byte count (LBA_MID/HIGH) to indicate packet size
+            ch->regs[ide_tf::SECT_COUNT] = 0x01; // C/D=1, I/O=0 = command
+            break;
         case 0x20: {  // READ SECTORS (PIO, LBA28)
             uint8_t count = ch->regs[ide_tf::SECT_COUNT];
             if (count == 0) count = 1;
@@ -334,13 +409,19 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
     case 8:
         ch->regs[ide_tf::ALT_CTL] = v;
         if (v & 0x04) {
-            ch->regs[ide_tf::STAT_CMD]     = 0x50;
-            ch->regs[ide_tf::ERR_FEAT]      = 0x01;
+            ch->regs[ide_tf::STAT_CMD]  = 0x50;
+            ch->regs[ide_tf::ERR_FEAT]  = 0x01;
             ch->regs[ide_tf::SECT_COUNT] = 0x01;
-            ch->regs[ide_tf::LBA_LOW]    = 0x01;
-            ch->regs[ide_tf::LBA_MID]    = 0x00;
-            ch->regs[ide_tf::LBA_HIGH]   = 0x00;
-            ch->regs[ide_tf::DEVICE]     = 0x00;
+            ch->regs[ide_tf::LBA_LOW]   = 0x01;
+            if (ch->is_atapi) {
+                ch->regs[ide_tf::LBA_MID]  = 0x14;
+                ch->regs[ide_tf::LBA_HIGH] = 0xEB;
+            } else {
+                ch->regs[ide_tf::LBA_MID]  = 0x00;
+                ch->regs[ide_tf::LBA_HIGH] = 0x00;
+            }
+            ch->regs[ide_tf::DEVICE]    = 0x00;
+            ch->awaiting_packet = false;
         }
         break;
     }
