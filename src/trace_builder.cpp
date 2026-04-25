@@ -38,7 +38,7 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     uint32_t ram_size = GUEST_RAM_SIZE;
     uint32_t cr3 = ctx->cr3;
 
-    uint32_t pdir_pa = cr3 & 0xFFFFF000u;
+    uint32_t pdir_pa = cr3 & GUEST_PAGE_MASK;
     uint32_t pdi     = (va >> 22) & 0x3FF;
     uint32_t pti     = (va >> 12) & 0x3FF;
 
@@ -63,13 +63,13 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
 
     // 4 KB page table
     {
-        uint32_t pt_pa = (pde & 0xFFFFF000u) + pti * 4;
+        uint32_t pt_pa = (pde & GUEST_PAGE_MASK) + pti * 4;
         if (pt_pa + 4 > ram_size) goto fault;
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
         if (!(pte & 1)) goto fault;
         if (is_write && !(pte & 2)) goto fault;
-        uint32_t pa = (pte & 0xFFFFF000u) | (va & 0xFFF);
+        uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
         bool need_pde_update = !(pde & 0x20);
         bool need_pte_update = !(pte & 0x20) || (is_write && !(pte & 0x40));
         if (need_pde_update) { pde |= 0x20; memcpy(ram + pde_pa, &pde, 4); }

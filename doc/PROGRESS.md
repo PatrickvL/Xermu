@@ -206,11 +206,20 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 18: MSR named constants (HEAD)
+### Step 18: MSR named constants (c55ed9f)
 - Added 14 `MSR_*` constants to context.hpp for SYSENTER, TSC, and MTRR MSR indices.
 - Replaced all raw hex MSR indices in executor.cpp RDMSR/WRMSR handlers.
 - Updated GuestContext field comments to reference constant names.
 - **Files**: src/context.hpp, src/executor.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 19: PAGE_SIZE/PAGE_MASK named constants (HEAD)
+- Added `GUEST_PAGE_SIZE` (0x1000) and `GUEST_PAGE_MASK` (0xFFFFF000) to executor.hpp.
+- Replaced all raw page-size/mask hex literals in executor.cpp (load_guest,
+  protect_code_page, invalidate_code_page, translate_va page walks) and
+  trace_builder.cpp (translate_va_jit page walks).
+- **Files**: src/executor.hpp, src/executor.cpp, src/trace_builder.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -239,4 +248,5 @@
 | 885eba9 | 48   | 0    | consistency fixes        |
 | 4b0fdd3 | 48   | 0    | memcpy trace_builder     |
 | 750a582 | 48   | 0    | stale CMP R14,R15 refs   |
-| (HEAD)  | 48   | 0    | MSR named constants      |
+| c55ed9f | 48   | 0    | MSR named constants      |
+| (HEAD)  | 48   | 0    | PAGE_SIZE/MASK constants  |
