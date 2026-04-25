@@ -582,8 +582,8 @@ void Executor::handle_privileged() {
                     ea += ctx.gp[enc];
             }
             if (ea + 6 <= GUEST_RAM_SIZE) {
-                ctx.gdtr_limit = *reinterpret_cast<uint16_t*>(ram + ea);
-                ctx.gdtr_base  = *reinterpret_cast<uint32_t*>(ram + ea + 2);
+                memcpy(&ctx.gdtr_limit, ram + ea, 2);
+                memcpy(&ctx.gdtr_base,  ram + ea + 2, 4);
             }
         }
         ctx.eip += insn.length;
@@ -601,8 +601,8 @@ void Executor::handle_privileged() {
                     ea += ctx.gp[enc];
             }
             if (ea + 6 <= GUEST_RAM_SIZE) {
-                ctx.idtr_limit = *reinterpret_cast<uint16_t*>(ram + ea);
-                ctx.idtr_base  = *reinterpret_cast<uint32_t*>(ram + ea + 2);
+                memcpy(&ctx.idtr_limit, ram + ea, 2);
+                memcpy(&ctx.idtr_base,  ram + ea + 2, 4);
             }
         }
         ctx.eip += insn.length;
@@ -625,8 +625,9 @@ void Executor::handle_privileged() {
                 if (reg32_enc(ops[0].mem.base, enc))
                     ea += ctx.gp[enc];
             }
-            if (ea + 2 <= GUEST_RAM_SIZE)
-                sel = *reinterpret_cast<uint16_t*>(ram + ea);
+            if (ea + 2 <= GUEST_RAM_SIZE) {
+                memcpy(&sel, ram + ea, 2);
+            }
         }
         ctx.ldtr_sel = sel;
         ctx.eip += insn.length;
@@ -649,8 +650,9 @@ void Executor::handle_privileged() {
                 if (reg32_enc(ops[0].mem.base, enc))
                     ea += ctx.gp[enc];
             }
-            if (ea + 2 <= GUEST_RAM_SIZE)
-                sel = *reinterpret_cast<uint16_t*>(ram + ea);
+            if (ea + 2 <= GUEST_RAM_SIZE) {
+                memcpy(&sel, ram + ea, 2);
+            }
         }
         ctx.tr_sel = sel;
         ctx.eip += insn.length;
@@ -672,8 +674,10 @@ void Executor::handle_privileged() {
                 if (reg32_enc(ops[0].mem.base, enc))
                     ea += ctx.gp[enc];
             }
-            if (ea + 2 <= GUEST_RAM_SIZE)
-                *reinterpret_cast<uint16_t*>(ram + ea) = ctx.ldtr_sel;
+            if (ea + 2 <= GUEST_RAM_SIZE) {
+                uint16_t v = ctx.ldtr_sel;
+                memcpy(ram + ea, &v, 2);
+            }
         }
         ctx.eip += insn.length;
         return;
@@ -694,8 +698,10 @@ void Executor::handle_privileged() {
                 if (reg32_enc(ops[0].mem.base, enc))
                     ea += ctx.gp[enc];
             }
-            if (ea + 2 <= GUEST_RAM_SIZE)
-                *reinterpret_cast<uint16_t*>(ram + ea) = ctx.tr_sel;
+            if (ea + 2 <= GUEST_RAM_SIZE) {
+                uint16_t v = ctx.tr_sel;
+                memcpy(ram + ea, &v, 2);
+            }
         }
         ctx.eip += insn.length;
         return;
@@ -713,8 +719,8 @@ void Executor::handle_privileged() {
                     ea += ctx.gp[enc];
             }
             if (ea + 6 <= GUEST_RAM_SIZE) {
-                *reinterpret_cast<uint16_t*>(ram + ea)     = ctx.gdtr_limit;
-                *reinterpret_cast<uint32_t*>(ram + ea + 2) = ctx.gdtr_base;
+                memcpy(ram + ea, &ctx.gdtr_limit, 2);
+                memcpy(ram + ea + 2, &ctx.gdtr_base, 4);
             }
         }
         ctx.eip += insn.length;
@@ -733,8 +739,8 @@ void Executor::handle_privileged() {
                     ea += ctx.gp[enc];
             }
             if (ea + 6 <= GUEST_RAM_SIZE) {
-                *reinterpret_cast<uint16_t*>(ram + ea)     = ctx.idtr_limit;
-                *reinterpret_cast<uint32_t*>(ram + ea + 2) = ctx.idtr_base;
+                memcpy(ram + ea, &ctx.idtr_limit, 2);
+                memcpy(ram + ea + 2, &ctx.idtr_base, 4);
             }
         }
         ctx.eip += insn.length;

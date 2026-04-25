@@ -154,7 +154,7 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 12: Fix stale DESIGN.md §5.14 and bug table (HEAD)
+### Step 12: Fix stale DESIGN.md §5.14 and bug table (180fb7d)
 - §5.14: Removed stale 10-line paragraph describing old `emit_smc_page_bump()`
   per-store approach (removed in Step 5); replaced with reference to §5.13
   page-protection + VEH.
@@ -163,6 +163,14 @@
 - §4: Fixed test count "46 suites" → "46 NASM + 2 C++ unit tests (48 total)".
 - insn_dispatch.hpp: Clarified IC_SSE_MEM "same logic" → "shares rewrite handler".
 - **Files**: doc/DESIGN.md, src/insn_dispatch.hpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 13: Replace reinterpret_cast with memcpy in privileged insn handlers (HEAD)
+- Replaced 8 `reinterpret_cast<uint16_t*>` / `<uint32_t*>` pointer aliasing
+  violations with `memcpy` in LGDT/LIDT/LLDT/LTR/SGDT/SIDT/SLDT/STR handlers.
+- Strict aliasing safe; compiler optimizes memcpy to identical codegen.
+- **Files**: executor.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -185,4 +193,5 @@
 | f72b2ad | 48   | 0    | ram_size dedup           |
 | 57212ea | 48   | 0    | stale comments           |
 | 8418da3 | 48   | 0    | REX constants            |
+| 180fb7d | 48   | 0    | doc fixes                |
 | (HEAD)  | 48   | 0    | ALL PASS                 |
