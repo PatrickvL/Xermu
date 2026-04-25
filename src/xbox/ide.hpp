@@ -39,6 +39,61 @@ static constexpr uint32_t STAT_CMD   = 7;   // read: status; write: command disp
 static constexpr uint32_t ALT_CTL    = 8;   // alternate status / device control
 } // namespace ide_tf
 
+// ===================== ATA Status Register Bits ============================
+namespace ata_status {
+static constexpr uint8_t ERR   = 0x01;  // error occurred
+static constexpr uint8_t DRQ   = 0x08;  // data request
+static constexpr uint8_t DSC   = 0x10;  // device seek complete
+static constexpr uint8_t DRDY  = 0x40;  // device ready
+static constexpr uint8_t BSY   = 0x80;  // busy
+// Common composites
+static constexpr uint8_t DRDY_DSC      = DRDY | DSC;         // 0x50
+static constexpr uint8_t DRDY_DSC_DRQ  = DRDY | DSC | DRQ;   // 0x58
+static constexpr uint8_t DRDY_DSC_ERR  = DRDY | DSC | ERR;   // 0x51
+} // namespace ata_status
+
+// ===================== ATA Error Register Bits =============================
+namespace ata_err {
+static constexpr uint8_t AMNF  = 0x01;  // address mark not found
+static constexpr uint8_t ABRT  = 0x04;  // aborted command
+static constexpr uint8_t IDNF  = 0x10;  // ID not found
+static constexpr uint8_t UNC   = 0x40;  // uncorrectable data error
+} // namespace ata_err
+
+// ===================== ATA Command Codes ===================================
+namespace ata_cmd {
+static constexpr uint8_t READ_SECTORS      = 0x20;
+static constexpr uint8_t WRITE_SECTORS     = 0x30;
+static constexpr uint8_t INIT_DEV_PARAMS   = 0x91;
+static constexpr uint8_t PACKET            = 0xA0;  // ATAPI packet command
+static constexpr uint8_t IDENTIFY_PACKET   = 0xA1;  // IDENTIFY PACKET DEVICE
+static constexpr uint8_t SET_FEATURES      = 0xEF;
+static constexpr uint8_t FLUSH_CACHE       = 0xE7;
+static constexpr uint8_t IDENTIFY_DEVICE   = 0xEC;
+} // namespace ata_cmd
+
+// ===================== ATA Device Control Bits =============================
+namespace ata_ctl {
+static constexpr uint8_t NIEN = 0x02;  // disable interrupts
+static constexpr uint8_t SRST = 0x04;  // software reset
+} // namespace ata_ctl
+
+// ===================== ATAPI Signature =====================================
+namespace atapi {
+static constexpr uint8_t SIGNATURE_MID  = 0x14;  // LBA_MID after reset
+static constexpr uint8_t SIGNATURE_HIGH = 0xEB;  // LBA_HIGH after reset
+} // namespace atapi
+
+// ===================== SCSI Command Codes ==================================
+namespace scsi {
+static constexpr uint8_t TEST_UNIT_READY = 0x00;
+static constexpr uint8_t INQUIRY         = 0x12;
+static constexpr uint8_t MODE_SENSE_10   = 0x5A;
+// INQUIRY response device types
+static constexpr uint8_t INQ_TYPE_CDROM  = 0x05;
+static constexpr uint8_t INQ_REMOVABLE   = 0x80;
+} // namespace scsi
+
 // ===================== Bus Master DMA Offsets ==============================
 // PCI BAR4 offsets for primary (0x00-0x07) and secondary (0x08-0x0F) channels.
 // Each channel has 3 regs at offsets +0, +2, +4 (command, status, PRDT addr).
@@ -73,7 +128,7 @@ struct IdeChannel {
         0x00,   // LBA_MID
         0x00,   // LBA_HIGH
         0x00,   // DEVICE
-        0x50,   // STATUS (DRDY | DSC)
+        ata_status::DRDY_DSC,  // STATUS
         0x00,   // CONTROL
     };
     bool     present    = false;
@@ -93,7 +148,7 @@ struct IdeChannel {
 
     // Bus Master DMA state
     uint8_t  bm_cmd     = 0;     // command register
-    uint8_t  bm_status  = 0x60;  // status: drive 0+1 DMA capable by default
+    uint8_t  bm_status  = ide_bm::STAT_DMA0_CAP | ide_bm::STAT_DMA1_CAP;
     uint32_t bm_prdt    = 0;     // PRDT base address
 
     // Backing disk image (raw sector image, no header).
@@ -106,7 +161,7 @@ struct IdeChannel {
         return (uint32_t)regs[ide_tf::LBA_LOW] |
                ((uint32_t)regs[ide_tf::LBA_MID]  << 8) |
                ((uint32_t)regs[ide_tf::LBA_HIGH] << 16) |
-               ((uint32_t)(regs[ide_tf::DEVICE] & 0x0F) << 24);
+               ((uint32_t)(regs[ide_tf::DEVICE] & 0x0Fu) << 24);
     }
 
     void load_sector(uint32_t lba) {
@@ -147,9 +202,9 @@ struct IdeState {
         secondary.present  = true;
         secondary.is_atapi = true;
         init_dvd_identify(secondary);
-        // Set ATAPI signature on secondary (LBA_MID=0x14, LBA_HIGH=0xEB)
-        secondary.regs[ide_tf::LBA_MID]    = 0x14;
-        secondary.regs[ide_tf::LBA_HIGH]   = 0xEB;
+        // Set ATAPI signature on secondary channel
+        secondary.regs[ide_tf::LBA_MID]    = atapi::SIGNATURE_MID;
+        secondary.regs[ide_tf::LBA_HIGH]   = atapi::SIGNATURE_HIGH;
     }
 
     static void init_hdd_identify(IdeChannel& ch) {
@@ -221,12 +276,12 @@ static uint32_t ide_io_read(uint16_t port, unsigned size, void* user) {
                 if (ch->sectors_left > 0) {
                     ch->advance_sector();
                     ch->load_sector(ch->lba28());
-                    ch->regs[ide_tf::STAT_CMD] = 0x58;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
                 } else {
-                    ch->regs[ide_tf::STAT_CMD] = 0x50;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
                 }
             } else {
-                ch->regs[ide_tf::STAT_CMD] = 0x50;
+                ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
             }
         }
         return w;
@@ -267,14 +322,14 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
                 // Execute ATAPI command
                 uint8_t scsi_op = ch->packet_buf[0];
                 switch (scsi_op) {
-                case 0x00:  // TEST UNIT READY
-                    ch->regs[ide_tf::STAT_CMD] = 0x50;
+                case scsi::TEST_UNIT_READY:
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
                     ch->regs[ide_tf::ERR_FEAT] = 0;
                     break;
-                case 0x12: { // INQUIRY
+                case scsi::INQUIRY: {
                     memset(ch->data_buf, 0, 36);
-                    ch->data_buf[0] = 0x05;  // CD-ROM device
-                    ch->data_buf[1] = 0x80;  // removable
+                    ch->data_buf[0] = scsi::INQ_TYPE_CDROM;
+                    ch->data_buf[1] = scsi::INQ_REMOVABLE;
                     ch->data_buf[2] = 0x00;  // version
                     ch->data_buf[3] = 0x21;  // response format
                     ch->data_buf[4] = 31;    // additional length
@@ -283,24 +338,24 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
                     memcpy(ch->data_buf + 32, "1.00", 4);     // revision
                     ch->data_pos = 0;
                     ch->data_len = 36;
-                    ch->regs[ide_tf::STAT_CMD] = 0x58; // DRQ
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
                     ch->regs[ide_tf::ERR_FEAT] = 0;
                     break;
                 }
-                case 0x5A: { // MODE SENSE (10)
+                case scsi::MODE_SENSE_10: {
                     // Return minimal header: 8 bytes
                     memset(ch->data_buf, 0, 8);
                     ch->data_buf[1] = 6;  // mode data length - 1
                     ch->data_pos = 0;
                     ch->data_len = 8;
-                    ch->regs[ide_tf::STAT_CMD] = 0x58;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
                     ch->regs[ide_tf::ERR_FEAT] = 0;
                     break;
                 }
                 default:
                     // Unknown SCSI op — set error (ABRT)
-                    ch->regs[ide_tf::STAT_CMD] = 0x51;
-                    ch->regs[ide_tf::ERR_FEAT] = 0x04;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_ERR;
+                    ch->regs[ide_tf::ERR_FEAT] = ata_err::ABRT;
                     break;
                 }
             }
@@ -321,12 +376,12 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
                     memset(ch->data_buf, 0, IdeChannel::SECTOR_SIZE);
                     ch->data_pos = 0;
                     ch->data_len = IdeChannel::SECTOR_SIZE;
-                    ch->regs[ide_tf::STAT_CMD] = 0x58;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
                 } else {
-                    ch->regs[ide_tf::STAT_CMD] = 0x50;
+                    ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
                 }
             } else {
-                ch->regs[ide_tf::STAT_CMD] = 0x50;
+                ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
             }
         }
         break;
@@ -337,85 +392,85 @@ static void ide_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void* u
     case 7:
         // Command dispatch — features value lives in regs[ERROR] slot.
         switch (v) {
-        case 0xEC:  // IDENTIFY DEVICE
+        case ata_cmd::IDENTIFY_DEVICE:
             memcpy(ch->data_buf, ch->identify, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
             ch->sectors_left = 0;
-            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
-        case 0xA1:  // IDENTIFY PACKET DEVICE
+        case ata_cmd::IDENTIFY_PACKET:
             memcpy(ch->data_buf, ch->identify, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
             ch->sectors_left = 0;
-            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
-        case 0xA0:  // PACKET (ATAPI)
+        case ata_cmd::PACKET:
             if (!ch->is_atapi) {
-                ch->regs[ide_tf::STAT_CMD] = 0x51;
-                ch->regs[ide_tf::ERR_FEAT] = 0x04;
+                ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_ERR;
+                ch->regs[ide_tf::ERR_FEAT] = ata_err::ABRT;
                 break;
             }
             ch->awaiting_packet = true;
             ch->packet_pos = 0;
             memset(ch->packet_buf, 0, 12);
-            ch->regs[ide_tf::STAT_CMD] = 0x58; // DRQ — ready for packet
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             // Set byte count (LBA_MID/HIGH) to indicate packet size
             ch->regs[ide_tf::SECT_COUNT] = 0x01; // C/D=1, I/O=0 = command
             break;
-        case 0x20: {  // READ SECTORS (PIO, LBA28)
+        case ata_cmd::READ_SECTORS: {
             uint8_t count = ch->regs[ide_tf::SECT_COUNT];
             if (count == 0) count = 1;
             ch->sectors_left = count;
             ch->load_sector(ch->lba28());
             ch->sectors_left--;
-            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         }
-        case 0x30: {  // WRITE SECTORS (PIO, LBA28)
+        case ata_cmd::WRITE_SECTORS: {
             uint8_t count = ch->regs[ide_tf::SECT_COUNT];
             if (count == 0) count = 1;
             ch->sectors_left = count;
             memset(ch->data_buf, 0, IdeChannel::SECTOR_SIZE);
             ch->data_pos = 0;
             ch->data_len = IdeChannel::SECTOR_SIZE;
-            ch->regs[ide_tf::STAT_CMD] = 0x58;
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_DRQ;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         }
-        case 0xEF:  // SET FEATURES
-            ch->regs[ide_tf::STAT_CMD] = 0x50;
+        case ata_cmd::SET_FEATURES:
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
-        case 0x91:  // INIT DEV PARAMS
-            ch->regs[ide_tf::STAT_CMD] = 0x50;
+        case ata_cmd::INIT_DEV_PARAMS:
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
-        case 0xE7:  // FLUSH CACHE
-            ch->regs[ide_tf::STAT_CMD] = 0x50;
+        case ata_cmd::FLUSH_CACHE:
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC;
             ch->regs[ide_tf::ERR_FEAT] = 0;
             break;
         default:
-            ch->regs[ide_tf::STAT_CMD] = 0x51;
-            ch->regs[ide_tf::ERR_FEAT] = 0x04;
+            ch->regs[ide_tf::STAT_CMD] = ata_status::DRDY_DSC_ERR;
+            ch->regs[ide_tf::ERR_FEAT] = ata_err::ABRT;
             break;
         }
         break;
     case 8:
         ch->regs[ide_tf::ALT_CTL] = v;
-        if (v & 0x04) {
-            ch->regs[ide_tf::STAT_CMD]  = 0x50;
+        if (v & ata_ctl::SRST) {
+            ch->regs[ide_tf::STAT_CMD]  = ata_status::DRDY_DSC;
             ch->regs[ide_tf::ERR_FEAT]  = 0x01;
             ch->regs[ide_tf::SECT_COUNT] = 0x01;
             ch->regs[ide_tf::LBA_LOW]   = 0x01;
             if (ch->is_atapi) {
-                ch->regs[ide_tf::LBA_MID]  = 0x14;
-                ch->regs[ide_tf::LBA_HIGH] = 0xEB;
+                ch->regs[ide_tf::LBA_MID]  = atapi::SIGNATURE_MID;
+                ch->regs[ide_tf::LBA_HIGH] = atapi::SIGNATURE_HIGH;
             } else {
                 ch->regs[ide_tf::LBA_MID]  = 0x00;
                 ch->regs[ide_tf::LBA_HIGH] = 0x00;
@@ -464,7 +519,8 @@ static void ide_bm_write(uint16_t port, uint32_t val, unsigned size, void* user)
         uint8_t w1c = (uint8_t)(val & (ide_bm::STAT_ERROR | ide_bm::STAT_IRQ));
         ch->bm_status &= ~w1c;
         // Bits 5,6 writable
-        ch->bm_status = (ch->bm_status & ~0x60) | (uint8_t)(val & 0x60);
+        constexpr uint8_t dma_cap = ide_bm::STAT_DMA0_CAP | ide_bm::STAT_DMA1_CAP;
+        ch->bm_status = (ch->bm_status & ~dma_cap) | (uint8_t)(val & dma_cap);
         break;
     }
     case ide_bm::PRDT_ADDR:

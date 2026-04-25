@@ -23,6 +23,13 @@ static constexpr uint32_t ARB      = 0x02;  // arbitration ID (bits [27:24])
 static constexpr uint32_t REDIR_BASE = 0x10;
 static constexpr uint32_t MAX_IRQS   = 24;
 static constexpr uint32_t REG_COUNT  = REDIR_BASE + MAX_IRQS * 2;  // 0x10 + 48 = 64
+
+// Register field values
+static constexpr uint32_t VERSION_82093AA    = 0x00170011;  // version 0x11, max redir 23
+static constexpr uint32_t ENTRY_MASKED       = 0x00010000;  // mask bit (bit 16) set
+static constexpr uint32_t ID_FIELD_MASK      = 0x0F000000;  // ID bits [27:24]
+static constexpr uint32_t ENTRY_DEST_MASK    = 0xFF000000;  // destination bits [31:24]
+static constexpr uint32_t ENTRY_RO_MASK      = (1u << 12) | (1u << 14);  // delivery_status + remote_irr
 } // namespace ioapic
 
 struct IoApicState {
@@ -31,12 +38,11 @@ struct IoApicState {
 
     IoApicState() {
         regs[ioapic::ID]  = 0;
-        // Version: 82093AA = 0x11, max redirection entry = 23 (bits [23:16])
-        regs[ioapic::VER] = 0x00170011;
+        regs[ioapic::VER] = ioapic::VERSION_82093AA;
         regs[ioapic::ARB] = 0;
         // Default all redirection entries to masked (bit 16 = 1).
         for (uint32_t i = 0; i < ioapic::MAX_IRQS; ++i)
-            regs[ioapic::REDIR_BASE + i * 2] = 0x00010000;
+            regs[ioapic::REDIR_BASE + i * 2] = ioapic::ENTRY_MASKED;
     }
 };
 
@@ -56,7 +62,7 @@ static void ioapic_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* use
         uint32_t idx = s->ioregsel;
         if (idx >= ioapic::REG_COUNT) return;
         // ID: only bits [27:24] writable.
-        if (idx == ioapic::ID) { s->regs[idx] = val & 0x0F000000; return; }
+        if (idx == ioapic::ID) { s->regs[idx] = val & ioapic::ID_FIELD_MASK; return; }
         // VER and ARB are read-only.
         if (idx == ioapic::VER || idx == ioapic::ARB) return;
         // Redirection entry low: vector[7:0], delivery[10:8], dest_mode[11],
@@ -66,11 +72,10 @@ static void ioapic_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* use
             uint32_t entry_off = idx - ioapic::REDIR_BASE;
             if (entry_off % 2 == 0) {
                 // Low dword: mask writable bits (RO: delivery_status[12], remote_irr[14])
-                uint32_t ro_mask = (1u << 12) | (1u << 14);
-                s->regs[idx] = (val & ~ro_mask) | (s->regs[idx] & ro_mask);
+                s->regs[idx] = (val & ~ioapic::ENTRY_RO_MASK) | (s->regs[idx] & ioapic::ENTRY_RO_MASK);
             } else {
                 // High dword: destination[31:24], rest reserved.
-                s->regs[idx] = val & 0xFF000000;
+                s->regs[idx] = val & ioapic::ENTRY_DEST_MASK;
             }
             return;
         }

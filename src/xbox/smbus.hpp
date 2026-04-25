@@ -18,6 +18,16 @@ static constexpr uint32_t CONTROL = 0x02;   // transaction trigger
 static constexpr uint32_t ADDRESS = 0x04;   // target device address + R/W bit
 static constexpr uint32_t DATA    = 0x06;   // data byte
 static constexpr uint32_t COMMAND = 0x08;   // SMBus command byte
+
+// STATUS register bits
+static constexpr uint8_t  STAT_DONE = 0x10; // transaction complete (W1C)
+
+// Well-known SMBus device addresses (7-bit)
+static constexpr uint8_t  DEV_SMC       = 0x10;  // PIC16LC system management controller
+static constexpr uint8_t  DEV_EEPROM    = 0x54;  // 256-byte configuration EEPROM
+static constexpr uint8_t  DEV_VIDENC_TV = 0x45;  // TV encoder (Conexant/Focus)
+static constexpr uint8_t  DEV_TEMP_SENS = 0x4C;  // ADM1032 temperature sensor
+static constexpr uint8_t  DEV_VIDENC_XC = 0x6A;  // Xcalibur video encoder (1.6)
 } // namespace smbus
 
 // ======================== SMC Command Bytes ================================
@@ -35,6 +45,13 @@ static constexpr uint8_t CPU_TEMP         = 0x09;  // read: CPU temperature (°C
 static constexpr uint8_t MB_TEMP          = 0x0A;  // read: motherboard temp (°C)
 static constexpr uint8_t TRAY_EJECT       = 0x0C;  // write: eject/close tray
 static constexpr uint8_t SCRATCH          = 0x0E;  // read/write: scratch register
+
+// SMC response values
+static constexpr uint8_t FW_VERSION_1_0   = 0xD0;  // v1.0 retail firmware
+static constexpr uint8_t TRAY_CLOSED      = 0x60;  // tray closed, no media
+static constexpr uint8_t AVPACK_HDTV      = 0x07;  // HDTV A/V pack
+static constexpr uint8_t AVTYPE_COMPOSITE = 0x05;  // composite video output
+
 static constexpr uint8_t CHALLENGE_0      = 0x1C;  // read: boot challenge byte 0
 static constexpr uint8_t CHALLENGE_1      = 0x1D;  // read: boot challenge byte 1
 static constexpr uint8_t CHALLENGE_2      = 0x1E;  // read: boot challenge byte 2
@@ -129,27 +146,27 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
         return;
     case smbus::CONTROL: {
         s->regs[r] = (uint8_t)val;
-        s->regs[smbus::STATUS] |= 0x10; // transaction complete
+        s->regs[smbus::STATUS] |= smbus::STAT_DONE;
         uint8_t dev_addr = s->regs[smbus::ADDRESS] >> 1;
         bool is_read = (s->regs[smbus::ADDRESS] & 1) != 0;
         uint8_t cmd = s->regs[smbus::COMMAND];
 
-        if (dev_addr == 0x54) {
+        if (dev_addr == smbus::DEV_EEPROM) {
             if (is_read && cmd < sizeof(s->eeprom))
                 s->regs[smbus::DATA] = s->eeprom[cmd];
             else if (!is_read && cmd < sizeof(s->eeprom))
                 s->eeprom[cmd] = s->regs[smbus::DATA];
-        } else if (dev_addr == 0x10) {
+        } else if (dev_addr == smbus::DEV_SMC) {
             if (is_read) {
                 switch (cmd) {
-                case smc::SMC_VERSION:      s->regs[smbus::DATA] = 0xD0; break;  // v1.0 retail
-                case smc::TRAY_STATE:       s->regs[smbus::DATA] = 0x60; break;  // closed, no media
-                case smc::AV_PACK:          s->regs[smbus::DATA] = 0x07; break;  // HDTV pack
+                case smc::SMC_VERSION:      s->regs[smbus::DATA] = smc::FW_VERSION_1_0; break;
+                case smc::TRAY_STATE:       s->regs[smbus::DATA] = smc::TRAY_CLOSED; break;
+                case smc::AV_PACK:          s->regs[smbus::DATA] = smc::AVPACK_HDTV; break;
                 case smc::FAN_SPEED:        s->regs[smbus::DATA] = s->smc_fan_speed; break;
                 case smc::CPU_TEMP:         s->regs[smbus::DATA] = 40;   break;  // 40°C
                 case smc::MB_TEMP:          s->regs[smbus::DATA] = 35;   break;  // 35°C
                 case smc::SCRATCH:          s->regs[smbus::DATA] = s->smc_scratch; break;
-                case smc::AV_TYPE:          s->regs[smbus::DATA] = 0x05; break;  // composite
+                case smc::AV_TYPE:          s->regs[smbus::DATA] = smc::AVTYPE_COMPOSITE; break;
                 case smc::INTERRUPT_REASON: s->regs[smbus::DATA] = 0x00; break;  // no pending
                 case smc::CHALLENGE_0:      s->regs[smbus::DATA] = 0x00; break;
                 case smc::CHALLENGE_1:      s->regs[smbus::DATA] = 0x00; break;
@@ -171,9 +188,9 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
                 default: break;
                 }
             }
-        } else if (dev_addr == 0x45) {
+        } else if (dev_addr == smbus::DEV_VIDENC_TV) {
             if (is_read) s->regs[smbus::DATA] = 0;
-        } else if (dev_addr == 0x6A) {
+        } else if (dev_addr == smbus::DEV_VIDENC_XC) {
             if (is_read) s->regs[smbus::DATA] = 0;
         }
         return;

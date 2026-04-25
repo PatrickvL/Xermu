@@ -23,6 +23,17 @@ static constexpr uint32_t BOOT_0    = 0x000;   // chip ID (NV2A derivative)
 static constexpr uint32_t INTR_0    = 0x100;   // master interrupt status (computed)
 static constexpr uint32_t INTR_EN   = 0x140;   // master interrupt enable
 static constexpr uint32_t ENABLE    = 0x200;   // subsystem enable
+
+// BOOT_0 default: NV2A chip revision
+static constexpr uint32_t NV2A_CHIP_ID     = 0x02A000A1;
+
+// PMC_INTR_0 bit assignments
+static constexpr uint32_t INTR_PFIFO  = (1u << 0);
+static constexpr uint32_t INTR_PVIDEO = (1u << 1);
+static constexpr uint32_t INTR_PTIMER = (1u << 4);
+static constexpr uint32_t INTR_PGRAPH = (1u << 8);
+static constexpr uint32_t INTR_PCRTC  = (1u << 24);
+static constexpr uint32_t INTR_PBUS   = (1u << 28);
 } // namespace pmc
 
 namespace pbus {
@@ -31,6 +42,8 @@ static constexpr uint32_t INTR_EN    = 0x140;   // PBUS interrupt enable
 static constexpr uint32_t REG_0      = 0x200;   // bus control register 0
 static constexpr uint32_t FBIO_RAM   = 0x218;   // FBIO RAM type (DDR indicator)
 static constexpr uint32_t DEBUG_1    = 0x084;   // debug register 1
+
+static constexpr uint32_t FBIO_DDR_SDRAM = 0x00000003;  // DDR SDRAM type value
 } // namespace pbus
 
 namespace pfifo {
@@ -55,6 +68,10 @@ static constexpr uint32_t EXT_METHODS     = 0x1F00;  // methods dispatched count
 static constexpr uint32_t EXT_DWORDS      = 0x1F04;  // dwords consumed count
 static constexpr uint32_t EXT_JUMPS       = 0x1F08;  // jump commands count
 static constexpr uint32_t EXT_CALLS       = 0x1F0C;  // call commands count
+
+// Status bits
+static constexpr uint32_t STATUS_IDLE     = 0x10;    // CACHE1_STATUS / RUNOUT idle
+static constexpr uint32_t DMA_PUSH_ENABLE = 0x01;    // CACHE1_DMA_PUSH enable bit
 } // namespace pfifo
 
 namespace pvideo {
@@ -100,6 +117,7 @@ static constexpr uint32_t ALARM_0  = 0x420;    // alarm low 32 bits
 
 namespace pfb {
 static constexpr uint32_t CFG0     = 0x200;    // framebuffer config (RAM size)
+static constexpr uint32_t CFG0_64MB = 0x03070103;  // 64 MB RAM configuration
 } // namespace pfb
 
 namespace pgraph_ctl {
@@ -115,6 +133,8 @@ static constexpr uint32_t INTR_EN  = 0x140;    // vblank interrupt enable
 static constexpr uint32_t START    = 0x800;    // framebuffer start address
 static constexpr uint32_t CONFIG   = 0x804;    // display config (bpp, width)
 static constexpr uint32_t RASTER   = 0x808;    // current raster line (read-only)
+
+static constexpr uint32_t NTSC_TOTAL_LINES = 525;  // NTSC total scanlines/frame
 } // namespace pcrtc
 
 namespace pramdac {
@@ -187,14 +207,14 @@ struct Nv2aState {
     void*      fifo_notify_user = nullptr;
 
     Nv2aState() {
-        pmc_regs[pmc::BOOT_0 / 4]             = 0x02A000A1;  // NV2A chip ID
+        pmc_regs[pmc::BOOT_0 / 4]             = pmc::NV2A_CHIP_ID;
         pmc_regs[pmc::ENABLE / 4]             = 0xFFFFFFFF;  // all subsystems enabled
-        pbus_regs[pbus::FBIO_RAM / 4]         = 0x00000003;  // DDR SDRAM
+        pbus_regs[pbus::FBIO_RAM / 4]         = pbus::FBIO_DDR_SDRAM;
         ptimer_regs[ptimer::NUM / 4]           = 1;
         ptimer_regs[ptimer::DEN / 4]           = 1;
-        pfb_regs[pfb::CFG0 / 4]               = 0x03070103;  // 64 MB RAM
-        pfifo_regs[pfifo::CACHE1_STATUS / 4]   = 0x10;       // idle
-        pfifo_regs[pfifo::RUNOUT_STATUS / 4]   = 0x10;       // idle
+        pfb_regs[pfb::CFG0 / 4]               = pfb::CFG0_64MB;
+        pfifo_regs[pfifo::CACHE1_STATUS / 4]   = pfifo::STATUS_IDLE;
+        pfifo_regs[pfifo::RUNOUT_STATUS / 4]   = pfifo::STATUS_IDLE;
         pramdac_regs[pramdac::NVPLL / 4]       = 0x00011C01;
         pramdac_regs[pramdac::MPLL / 4]        = 0x00011801;
         pramdac_regs[pramdac::VPLL / 4]        = 0x00031801;
@@ -213,7 +233,7 @@ struct Nv2aState {
             vblank_counter = 0;
             if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1)
                 pcrtc_regs[pcrtc::INTR / 4] |= 1;
-            if ((pmc_regs[pmc::INTR_EN / 4] & 0x01000000) &&
+            if ((pmc_regs[pmc::INTR_EN / 4] & pmc::INTR_PCRTC) &&
                 (pcrtc_regs[pcrtc::INTR / 4] & 1))
                 vblank_irq_pending = true;
         }
@@ -230,11 +250,11 @@ struct Nv2aState {
         //   bit 24 = PCRTC
         //   bit 28 = PBUS
         uint32_t val = 0;
-        if (pfifo_regs[pfifo::INTR / 4])   val |= (1u << 0);
-        if (pvideo_regs[pvideo::INTR / 4])  val |= (1u << 1);
-        if (ptimer_regs[ptimer::INTR / 4])  val |= (1u << 4);
-        if (pcrtc_regs[pcrtc::INTR / 4])    val |= (1u << 24);
-        if (pbus_regs[pbus::INTR / 4])      val |= (1u << 28);
+        if (pfifo_regs[pfifo::INTR / 4])   val |= pmc::INTR_PFIFO;
+        if (pvideo_regs[pvideo::INTR / 4])  val |= pmc::INTR_PVIDEO;
+        if (ptimer_regs[ptimer::INTR / 4])  val |= pmc::INTR_PTIMER;
+        if (pcrtc_regs[pcrtc::INTR / 4])    val |= pmc::INTR_PCRTC;
+        if (pbus_regs[pbus::INTR / 4])      val |= pmc::INTR_PBUS;
         return val;
     }
 
@@ -255,9 +275,9 @@ struct Nv2aState {
         auto& ext_jumps   = pfifo_regs[pfifo::EXT_JUMPS / 4];
         auto& ext_calls   = pfifo_regs[pfifo::EXT_CALLS / 4];
 
-        if (!(dma_push & 1)) return;
+        if (!(dma_push & pfifo::DMA_PUSH_ENABLE)) return;
         if (!(push0 & 1)) return;
-        if (dma_get == dma_put) { status = 0x10; return; }
+        if (dma_get == dma_put) { status = pfifo::STATUS_IDLE; return; }
         status = 0;
 
         uint32_t get = dma_get;
@@ -325,7 +345,7 @@ done:
         ext_dwords += consumed;
         dma_get = get;
         if (get == put)
-            status = 0x10;
+            status = pfifo::STATUS_IDLE;
     }
 };
 
@@ -352,7 +372,7 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
         uint32_t r = off - 0x002000;
         // DMA_STATE is computed: busy if push enabled and GET != PUT.
         if (r == pfifo::CACHE1_DMA_STATE) {
-            bool busy = (nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
+            bool busy = (nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] & pfifo::DMA_PUSH_ENABLE) &&
                         (nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] !=
                          nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4]);
             return busy ? 1u : 0u;
@@ -392,7 +412,7 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
         // RASTER: current scanline (computed from vblank_counter).
         // NTSC: 525 lines total, 480 visible. Map counter to scanline.
         if (r == pcrtc::RASTER) {
-            uint32_t line = (nv->vblank_counter * 525u) / Nv2aState::VBLANK_PERIOD;
+            uint32_t line = (nv->vblank_counter * pcrtc::NTSC_TOTAL_LINES) / Nv2aState::VBLANK_PERIOD;
             return line;
         }
         if (r / 4 < Nv2aState::PCRTC_COUNT) return nv->pcrtc_regs[r / 4];

@@ -47,6 +47,13 @@ static constexpr uint32_t INTR_RD    = 0x00000008; // resume detected
 static constexpr uint32_t INTR_FNO   = 0x00000020; // frame number overflow
 static constexpr uint32_t INTR_RHSC  = 0x00000040; // root hub status change
 static constexpr uint32_t INTR_MIE   = 0x80000000; // master interrupt enable
+
+// Default register values
+static constexpr uint32_t FM_INTERVAL_DEFAULT = 0x27782EDF;  // FSMPS=0x2778, FI=0x2EDF
+static constexpr uint32_t FM_REMAINING_MIDFRAME = 0x2710;    // ~halfway through frame
+
+// Port status writable bits mask
+static constexpr uint32_t PORT_STATUS_W_MASK = 0x001F0000;
 } // namespace ohci
 
 struct OhciState {
@@ -60,7 +67,7 @@ struct OhciState {
         frame_counter = 0;
         regs[ohci::REVISION >> 2]        = 0x00000110;  // OHCI 1.1
         regs[ohci::CONTROL >> 2]         = 0x00000000;
-        regs[ohci::FM_INTERVAL >> 2]     = 0x27782EDF;  // default: bit-time=0x2EDF, FSMPS=0x2778
+        regs[ohci::FM_INTERVAL >> 2]     = ohci::FM_INTERVAL_DEFAULT;
         regs[ohci::RH_DESCRIPTOR_A >> 2] = ports & 0xFF;
     }
 
@@ -88,7 +95,7 @@ static uint32_t ohci_read(uint32_t pa, unsigned size, void* user) {
     if (off >= sizeof(s->regs)) return 0;
     uint32_t val = s->regs[off >> 2];
     if (off == ohci::FM_REMAINING)
-        val = 0x2710;  // always report ~halfway through frame
+        val = ohci::FM_REMAINING_MIDFRAME;
     return val;
 }
 
@@ -120,7 +127,7 @@ static void ohci_write(uint32_t pa, uint32_t val, unsigned size, void* user) {
     default:
         if (off >= ohci::RH_PORT_STATUS0 &&
             off < ohci::RH_PORT_STATUS0 + s->num_ports * 4) {
-            s->regs[off >> 2] = val & 0x001F0000u;
+            s->regs[off >> 2] = val & ohci::PORT_STATUS_W_MASK;
         } else {
             s->regs[off >> 2] = val;
         }

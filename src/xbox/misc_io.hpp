@@ -16,6 +16,8 @@ namespace xbox {
 //   [7] Parity check       (RO)
 
 struct MiscIoState {
+    static constexpr uint8_t REFRESH_TOGGLE = 0x10; // bit 4: refresh toggle
+
     uint8_t sysctl        = 0x20;  // default: refresh toggle set
     uint8_t post_code     = 0x00;  // last POST code written to 0x80
     uint32_t sysctl_reads = 0;     // count reads for toggle
@@ -24,7 +26,7 @@ struct MiscIoState {
 static uint32_t sysctl_read(uint16_t, unsigned, void* user) {
     auto* s = static_cast<MiscIoState*>(user);
     // Toggle refresh bit (bit 4) on each read, mimicking hardware behavior.
-    s->sysctl ^= 0x10;
+    s->sysctl ^= MiscIoState::REFRESH_TOGGLE;
     s->sysctl_reads++;
     return s->sysctl;
 }
