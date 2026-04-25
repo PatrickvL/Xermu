@@ -7,8 +7,8 @@
 //
 // MCPX ROM (512 bytes at physical 0xFFFFFE00): secret boot ROM baked into the
 // MCPX southbridge die.  Executes at the x86 reset vector (0xFFFFFFF0),
-// decrypts the 2BL from flash, then jumps to it.  For HLE mode this is
-// unused; for LLE mode a dump can be loaded.
+// decrypts the 2BL from flash, then jumps to it.  Currently unused (HLE mode
+// only); a future LLE mode could load a dump.
 
 #include "address_map.hpp"
 #include <cstdint>
