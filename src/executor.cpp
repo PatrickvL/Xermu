@@ -953,7 +953,7 @@ uint32_t Executor::io_read(uint16_t port, unsigned size) {
             return io_ports[i].read(port, size, io_ports[i].user);
     }
     fprintf(stderr, "[io] unhandled read  port=%04X size=%u\n", port, size);
-    return 0xFFFFFFFF;
+    return 0xFFFFFFFFu;
 }
 
 void Executor::io_write(uint16_t port, uint32_t val, unsigned size) {
@@ -1251,7 +1251,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             continue;
         }
 
-        // Check for HALT condition (EIP == 0 or EIP out of RAM used as sentinel).
+        // Check for HALT condition (EIP == 0xFFFFFFFF or out of RAM).
         if (ctx.eip == 0xFFFF'FFFFu || ctx.eip >= GUEST_RAM_SIZE) {
             fprintf(stderr, "[exec] EIP=%08X out of range — halting\n", ctx.eip);
             ctx.halted = true;
