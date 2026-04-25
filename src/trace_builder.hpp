@@ -14,14 +14,6 @@ struct TraceArena {
     void   reset() { used = 0; }
 };
 
-// Per-page SMC version counter (legacy — retained for compatibility during migration).
-struct PageVersions {
-    static constexpr size_t PAGES = 1u << 20; // 4 GB / 4 KB
-    uint32_t ver[PAGES] = {};
-    void bump(uint32_t pa) { ver[pa >> 12]++; }
-    uint32_t get(uint32_t pa) const { return ver[pa >> 12]; }
-};
-
 // ---------------------------------------------------------------------------
 // Per-code-page fault bitmap: 1 bit per byte offset (512 bytes per page).
 // When a memory-access instruction faults (VEH), its guest EIP is marked.
@@ -103,7 +95,6 @@ struct TraceBuilder {
                  uint32_t           ram_size,
                  CodeCache&         cc,
                  TraceArena&        arena,
-                 const PageVersions& pv,
                  GuestContext*      ctx,
                  const FaultBitmaps* fb = nullptr);
 

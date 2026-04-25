@@ -41,7 +41,6 @@ struct Executor {
     TraceCache     tcache;
     TraceArena     arena;
     TraceBuilder   builder;
-    PageVersions   pv;
     FaultBitmaps   fb;               // per-code-page fault bitmaps for VEH rebuild
     SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
 

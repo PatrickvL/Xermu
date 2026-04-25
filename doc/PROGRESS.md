@@ -106,6 +106,20 @@
 - **Result**: 47/48 pass (pfifo pre-existing flaky)
 - **Status**: DONE
 
+### Step 8: Remove redundant PageVersions (HEAD)
+- `PageVersions` was a per-page SMC version counter used to validate
+  block-link targets.  This is redundant: `invalidate_code_page()`
+  already sets `valid = false` on all traces for the page, and
+  `try_link_trace()` already checks `!target->valid` before linking.
+- Removed `PageVersions` struct, `Trace::page_ver` field, `Executor::pv`
+  member, `pv` parameter from `TraceBuilder::build()`, and the
+  `pv.get(target_pa) != target->page_ver` check in `try_link_trace()`.
+- Saves ~4 MB (1M × 4-byte version counters for full 4 GB PA space).
+- **Files**: trace_builder.hpp, trace.hpp, executor.hpp, executor.cpp,
+  trace_builder.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -119,4 +133,5 @@
 | (next)  | 48   | 0    | +fastmem, smc_stress     |
 | b89dcac | 47   | 1    | pfifo flaky              |
 | d50fb03 | 47   | 1    | pfifo flaky              |
-| (HEAD)  | 47   | 1    | pfifo flaky              |
+| 09bb822 | 47   | 1    | pfifo flaky              |
+| (HEAD)  | 48   | 0    | ALL PASS                 |
