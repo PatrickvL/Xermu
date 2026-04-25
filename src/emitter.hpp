@@ -78,6 +78,18 @@ struct Emitter {
 };
 
 // ---------------------------------------------------------------------------
+// x86-64 REX prefix constants (0x40 | W<<3 | R<<2 | X<<1 | B)
+// ---------------------------------------------------------------------------
+constexpr uint8_t REX_B   = 0x41;   // R13/R14/R15 in r/m or SIB base
+constexpr uint8_t REX_XB  = 0x43;   // R13 base + extended SIB index (R12)
+constexpr uint8_t REX_R   = 0x44;   // R8-R15 in ModRM.reg
+constexpr uint8_t REX_RB  = 0x45;   // extended reg + extended r/m (R14/R13)
+constexpr uint8_t REX_W   = 0x48;   // 64-bit operand size
+constexpr uint8_t REX_WB  = 0x49;   // 64-bit + extended r/m
+constexpr uint8_t REX_WR  = 0x4C;   // 64-bit + extended reg
+constexpr uint8_t REX_WRB = 0x4D;   // 64-bit + extended reg + extended r/m
+
+// ---------------------------------------------------------------------------
 // Register helpers
 // ---------------------------------------------------------------------------
 
@@ -140,18 +152,18 @@ inline int reg32_gp(ZydisRegister r) {
 // Sequence: save/load all guest GP registers to/from GuestContext
 //
 // MOV [R13 + gp_offset(i)], reg_i
-// Encoding: REX=0x41 (REX.B for R13 base), 0x89, ModRM, disp8
+// Encoding: REX.B (R13 base), 0x89, ModRM, disp8
 //   ModRM = mod=01 | (reg_enc<<3) | 5   (rm=5 = R13&7, mod=01 = disp8)
 // ---------------------------------------------------------------------------
 
 inline void emit_save_gp(Emitter& e, uint8_t reg_enc, uint8_t offset) {
-    e.emit8(0x41); e.emit8(0x89);
+    e.emit8(REX_B); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (reg_enc << 3) | 5u));
     e.emit8(offset);
 }
 
 inline void emit_load_gp(Emitter& e, uint8_t reg_enc, uint8_t offset) {
-    e.emit8(0x41); e.emit8(0x8B);
+    e.emit8(REX_B); e.emit8(0x8B);
     e.emit8(uint8_t(0x40u | (reg_enc << 3) | 5u));
     e.emit8(offset);
 }
@@ -181,8 +193,8 @@ inline void emit_load_all_gp(Emitter& e) {
 // ---------------------------------------------------------------------------
 
 inline void emit_write_next_eip_imm(Emitter& e, uint32_t eip) {
-    e.emit8(0x41); e.emit8(0xBE); e.emit32(eip);          // MOV R14D, imm32
-    e.emit8(0x45); e.emit8(0x89); e.emit8(0x75); e.emit8(CTX_NEXT_EIP); // MOV [R13+next_eip], R14D
+    e.emit8(REX_B); e.emit8(0xBE); e.emit32(eip);          // MOV R14D, imm32
+    e.emit8(REX_RB); e.emit8(0x89); e.emit8(0x75); e.emit8(CTX_NEXT_EIP); // MOV [R13+next_eip], R14D
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +204,7 @@ inline void emit_write_next_eip_imm(Emitter& e, uint32_t eip) {
 // ---------------------------------------------------------------------------
 
 inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
-    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45); e.emit8(CTX_STOP_REASON);
+    e.emit8(REX_B); e.emit8(0xC7); e.emit8(0x45); e.emit8(CTX_STOP_REASON);
     e.emit32(reason);
 }
 
@@ -207,9 +219,9 @@ inline void emit_set_stop_reason(Emitter& e, uint32_t reason) {
 
 inline void emit_save_eflags(Emitter& e) {
     e.emit8(0x9C);                              // PUSHFQ
-    e.emit8(0x41); e.emit8(0x5E);               // POP R14
-    // MOV DWORD [R13+eflags], R14D — REX=0x45 (R14.R + R13.B)
-    e.emit8(0x45); e.emit8(0x89);
+    e.emit8(REX_B); e.emit8(0x5E);               // POP R14
+    // MOV DWORD [R13+eflags], R14D — REX.RB (R14.R + R13.B)
+    e.emit8(REX_RB); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));   // mod=01 reg=6(R14) rm=5(R13)
     e.emit8(CTX_EFLAGS);                        // disp8 = offsetof(eflags)
 }
@@ -225,11 +237,11 @@ inline void emit_save_eflags(Emitter& e) {
 // (REX.B only), which is wrong when the destination is R14 (needs REX.R too).
 inline void emit_write_next_eip_gpreg(Emitter& e, uint8_t gp_idx) {
     // MOV R14D, DWORD [R13 + gp_offset(gp_idx)]
-    e.emit8(0x45); e.emit8(0x8B);                              // REX.RB + MOV r,r/m
+    e.emit8(REX_RB); e.emit8(0x8B);                              // REX.RB + MOV r,r/m
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
     e.emit8(gp_offset(gp_idx));
     // MOV DWORD [R13 + next_eip], R14D
-    e.emit8(0x45); e.emit8(0x89);                              // REX.RB + MOV r/m,r
+    e.emit8(REX_RB); e.emit8(0x89);                              // REX.RB + MOV r/m,r
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));                  // mod=01 reg=6(R14) rm=5(R13)
     e.emit8(CTX_NEXT_EIP);                                      // disp8 = offsetof(next_eip)
 }
@@ -349,12 +361,11 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
     auto disp      = (int32_t)m.disp.value;
 
     constexpr uint8_t R14_REG = 6; // R14 & 7
-    constexpr uint8_t REX_R14 = 0x44; // REX.R = 1
 
     // --- Displacement only (no base, no index) ---
     if (!has_base && !has_index) {
         // MOV R14D, imm32
-        e.emit8(0x41); e.emit8(uint8_t(0xB8u + R14_REG)); e.emit32((uint32_t)disp);
+        e.emit8(REX_B); e.emit8(uint8_t(0xB8u + R14_REG)); e.emit32((uint32_t)disp);
         goto apply_segment;
     }
 
@@ -371,7 +382,7 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
                 // R14 as both src and dst: REX.R=1 REX.B=1 → 0x45
                 bool d8 = (disp >= -128 && disp <= 127);
                 uint8_t mod = d8 ? 1u : 2u;
-                e.emit8(0x45); e.emit8(0x8D);
+                e.emit8(REX_RB); e.emit8(0x8D);
                 e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | R14_REG));
                 if (d8) e.emit8((uint8_t)(int8_t)disp);
                 else    e.emit32((uint32_t)disp);
@@ -382,12 +393,12 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         if (!has_disp || disp == 0) {
             // EBP special: mod=00 rm=101 means disp32-only, force mod=01 disp8=0
             if (base_enc == 5) {
-                e.emit8(REX_R14); e.emit8(0x8D);
+                e.emit8(REX_R); e.emit8(0x8D);
                 e.emit8(uint8_t(0x40u | (R14_REG << 3) | 5u)); e.emit8(0);
                 goto apply_segment;
             }
             // Simple: MOV R14D, base_reg  (mod=11)
-            e.emit8(REX_R14); e.emit8(0x8B);
+            e.emit8(REX_R); e.emit8(0x8B);
             e.emit8(uint8_t(0xC0u | (R14_REG << 3) | base_enc));
             goto apply_segment;
         }
@@ -395,7 +406,7 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         bool d8   = (disp >= -128 && disp <= 127);
         uint8_t mod = d8 ? 1 : 2;
 
-        e.emit8(REX_R14); e.emit8(0x8D);
+        e.emit8(REX_R); e.emit8(0x8D);
         e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | base_enc));
         if (d8) e.emit8((uint8_t)(int8_t)disp);
         else    e.emit32((uint32_t)disp);
@@ -419,7 +430,7 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         if (!has_base) {
             // [index*scale + disp32]: SIB base=101 (no base), mod=00
             uint8_t sib = uint8_t((scale_enc << 6) | (index_enc << 3) | 5u);
-            e.emit8(REX_R14); e.emit8(0x8D);
+            e.emit8(REX_R); e.emit8(0x8D);
             e.emit8(uint8_t((R14_REG << 3) | 4u)); // mod=00 rm=4
             e.emit8(sib);
             e.emit32((uint32_t)(has_disp ? disp : 0));
@@ -440,8 +451,8 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
                 mod = 0;
             else
                 mod = (disp >= -128 && disp <= 127) ? 1u : 2u;
-            // R14 as both reg and base: REX = 0x45 (REX.R + REX.B)
-            e.emit8(0x45); e.emit8(0x8D);
+            // R14 as both reg and base: REX.R + REX.B
+            e.emit8(REX_RB); e.emit8(0x8D);
             e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u)); // rm=4 → SIB
             e.emit8(sib_r14);
             if      (mod == 1) e.emit8((uint8_t)(int8_t)(has_disp ? disp : 0));
@@ -457,7 +468,7 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
         else
             mod = (disp >= -128 && disp <= 127) ? 1 : 2;
 
-        e.emit8(REX_R14); e.emit8(0x8D);
+        e.emit8(REX_R); e.emit8(0x8D);
         e.emit8(uint8_t((mod << 6) | (R14_REG << 3) | 4u)); // rm=4 → SIB
         e.emit8(sib);
         if      (mod == 1) e.emit8((uint8_t)(int8_t)(has_disp ? disp : 0));
@@ -467,11 +478,11 @@ inline bool emit_ea_to_r14(Emitter& e, const ZydisDecodedOperand& op) {
 apply_segment:
     // If FS/GS segment override, add the segment base from GuestContext.
     // ADD R14D, DWORD PTR [R13 + seg_ctx_offset]
-    //   REX = 0x45 (REX.R for R14, REX.B for R13)
+    //   REX.RB (REX.R for R14, REX.B for R13)
     //   opcode = 0x03 (ADD r32, r/m32)
     //   ModRM: mod=01, reg=R14&7=6, rm=R13&7=5, disp8
     if (seg_ctx_offset >= 0) {
-        e.emit8(0x45); e.emit8(0x03);
+        e.emit8(REX_RB); e.emit8(0x03);
         e.emit8(uint8_t(0x40u | (6u << 3) | 5u)); // mod=01 reg=6 rm=5
         e.emit8((uint8_t)seg_ctx_offset);
     }
@@ -487,7 +498,7 @@ apply_segment:
 //
 // Strategy:
 //   1. Copy legacy prefixes (skip address-size override and segment overrides)
-//   2. Emit REX = 0x43 (REX.X=1 for R14 index, REX.B=1 for R12 base)
+//   2. Emit REX = REX_XB (REX.X for R14 index, REX.B for R12 base)
 //   3. Copy opcode escape bytes (0F, 0F38, 0F3A) + opcode byte
 //   4. Emit new ModRM: mod=00, reg=original, rm=100 (SIB follows)
 //   5. Emit SIB = 0x34 (base=R12, index=R14, scale=1)
@@ -561,19 +572,19 @@ inline uint8_t* emit_jmp_fwd(Emitter& e) {
 inline void emit_save_flags(Emitter& e) {
     e.emit8(0x9C);                                             // PUSHFQ
     // LEA RSP, [RSP - 8]  (re-align to 16 bytes; LEA is flag-neutral)
-    e.emit8(0x48); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0xF8);
+    e.emit8(REX_W); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0xF8);
 }
 
 inline void emit_restore_flags(Emitter& e) {
     // LEA RSP, [RSP + 8]  (undo alignment padding)
-    e.emit8(0x48); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0x08);
+    e.emit8(REX_W); e.emit8(0x8D); e.emit8(0x64); e.emit8(0x24); e.emit8(0x08);
     e.emit8(0x9D);                                             // POPFQ
 }
 
 // ---------------------------------------------------------------------------
 // Fastmem access: OP reg, [R12+R14]  or  OP [R12+R14], reg
 //
-// R12 (base, REX.B=1) + R14 (index, REX.X=1): REX = 0x43
+// R12 (base, REX.B=1) + R14 (index, REX.X=1): REX = REX_XB
 // SIB: scale=0, index=6(R14&7), base=4(R12&7) → 0x34
 // ModRM: mod=00, reg=guest_enc, rm=4(SIB) → guest_enc<<3 | 4
 // ---------------------------------------------------------------------------
@@ -581,7 +592,7 @@ inline void emit_restore_flags(Emitter& e) {
 inline void emit_fastmem_op(Emitter& e, uint8_t guest_enc,
                               unsigned size_bits, bool is_load) {
     if (size_bits == 16) e.emit8(0x66);
-    uint8_t rex = 0x43; // REX.B(R12) | REX.X(R14)
+    uint8_t rex = REX_XB; // REX.B(R12) | REX.X(R14)
     uint8_t opc = is_load ? 0x8B : 0x89;
     if (size_bits == 8) opc = is_load ? 0x8A : 0x88;
 
@@ -618,7 +629,7 @@ inline void emit_fastmem_movsx(Emitter& e, uint8_t guest_enc, unsigned src_bits,
 // MOV DWORD PTR [R12+R14], imm32
 // REX=0x43, opcode=0xC7, ModRM=mod=00 reg=0 rm=4(SIB), SIB=0x34, imm32
 inline void emit_fastmem_store_imm32(Emitter& e, uint32_t imm) {
-    e.emit8(0x43); e.emit8(0xC7);
+    e.emit8(REX_XB); e.emit8(0xC7);
     e.emit8(0x04); e.emit8(0x34);
     e.emit32(imm);
 }
@@ -626,7 +637,7 @@ inline void emit_fastmem_store_imm32(Emitter& e, uint32_t imm) {
 // MOV WORD PTR [R12+R14], imm16
 inline void emit_fastmem_store_imm16(Emitter& e, uint16_t imm) {
     e.emit8(0x66);  // operand-size prefix
-    e.emit8(0x43); e.emit8(0xC7);
+    e.emit8(REX_XB); e.emit8(0xC7);
     e.emit8(0x04); e.emit8(0x34);
     e.emit8(uint8_t(imm & 0xFF));
     e.emit8(uint8_t(imm >> 8));
@@ -634,7 +645,7 @@ inline void emit_fastmem_store_imm16(Emitter& e, uint16_t imm) {
 
 // MOV BYTE PTR [R12+R14], imm8
 inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
-    e.emit8(0x43); e.emit8(0xC6);
+    e.emit8(REX_XB); e.emit8(0xC6);
     e.emit8(0x04); e.emit8(0x34);
     e.emit8(imm);
 }
@@ -650,13 +661,13 @@ inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
 inline void emit_call_abs(Emitter& e, const void* target) {
 #ifdef _WIN32
     // SUB RSP, 0x20
-    e.emit8(0x48); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x20);
+    e.emit8(REX_W); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x20);
 #endif
-    e.emit8(0x49); e.emit8(0xBE); e.emit64((uint64_t)(uintptr_t)target);
-    e.emit8(0x41); e.emit8(0xFF); e.emit8(0xD6);
+    e.emit8(REX_WB); e.emit8(0xBE); e.emit64((uint64_t)(uintptr_t)target);
+    e.emit8(REX_B); e.emit8(0xFF); e.emit8(0xD6);
 #ifdef _WIN32
     // ADD RSP, 0x20
-    e.emit8(0x48); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x20);
+    e.emit8(REX_W); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x20);
 #endif
 }
 
@@ -668,14 +679,14 @@ inline void emit_call_abs(Emitter& e, const void* target) {
 // ---------------------------------------------------------------------------
 
 inline void emit_sub_ctx_esp(Emitter& e, uint8_t amount) {
-    e.emit8(0x41); e.emit8(0x83);
+    e.emit8(REX_B); e.emit8(0x83);
     e.emit8(0x6D); // SUB [R13+?]
     e.emit8(gp_offset(GP_ESP));
     e.emit8(amount);
 }
 
 inline void emit_add_ctx_esp(Emitter& e, uint8_t amount) {
-    e.emit8(0x41); e.emit8(0x83);
+    e.emit8(REX_B); e.emit8(0x83);
     e.emit8(0x45); // ADD [R13+?]
     e.emit8(gp_offset(GP_ESP));
     e.emit8(amount);
@@ -685,7 +696,7 @@ inline void emit_add_ctx_esp(Emitter& e, uint8_t amount) {
 //   MOV R14D, [R13 + gp_offset(GP_ESP)]
 //   REX=0x45 (REX.R R14, REX.B R13), 0x8B, mod=01 reg=6(R14&7) rm=5(R13&7), disp8
 inline void emit_load_esp_to_r14(Emitter& e) {
-    e.emit8(0x45); e.emit8(0x8B);
+    e.emit8(REX_RB); e.emit8(0x8B);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }
@@ -694,7 +705,7 @@ inline void emit_load_esp_to_r14(Emitter& e) {
 //   MOV [R13 + gp_offset(GP_ESP)], R14D
 //   REX=0x45 (REX.R R14, REX.B R13), 0x89, mod=01 reg=6(R14&7) rm=5(R13&7), disp8
 inline void emit_store_r14_to_esp(Emitter& e) {
-    e.emit8(0x45); e.emit8(0x89);
+    e.emit8(REX_RB); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }
@@ -703,7 +714,7 @@ inline void emit_store_r14_to_esp(Emitter& e) {
 //   MOV R8D, [R13 + gp_offset(GP_ESP)]
 //   REX=0x45 (REX.R R8, REX.B R13), 0x8B, mod=01 reg=0(R8&7) rm=5(R13&7), disp8
 inline void emit_load_esp_to_r8(Emitter& e) {
-    e.emit8(0x45); e.emit8(0x8B);
+    e.emit8(REX_RB); e.emit8(0x8B);
     e.emit8(uint8_t(0x40u | (0u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }
@@ -712,7 +723,7 @@ inline void emit_load_esp_to_r8(Emitter& e) {
 //   MOV [R13 + gp_offset(GP_ESP)], R8D
 //   REX=0x45 (REX.R R8, REX.B R13), 0x89, mod=01 reg=0(R8&7) rm=5(R13&7), disp8
 inline void emit_store_r8_to_esp(Emitter& e) {
-    e.emit8(0x45); e.emit8(0x89);
+    e.emit8(REX_RB); e.emit8(0x89);
     e.emit8(uint8_t(0x40u | (0u << 3) | 5u));
     e.emit8(gp_offset(GP_ESP));
 }
@@ -732,10 +743,10 @@ inline void emit_store_r8_to_esp(Emitter& e) {
 inline void emit_ccall_arg0_ctx(Emitter& e) {
 #ifdef _WIN32
     // MOV RCX, R13
-    e.emit8(0x4C); e.emit8(0x89); e.emit8(0xE9);
+    e.emit8(REX_WR); e.emit8(0x89); e.emit8(0xE9);
 #else
     // MOV RDI, R13
-    e.emit8(0x49); e.emit8(0x8B); e.emit8(0xFD);
+    e.emit8(REX_WB); e.emit8(0x8B); e.emit8(0xFD);
 #endif
 }
 
@@ -743,10 +754,10 @@ inline void emit_ccall_arg0_ctx(Emitter& e) {
 inline void emit_ccall_arg1_pa(Emitter& e) {
 #ifdef _WIN32
     // MOV EDX, R14D
-    e.emit8(0x44); e.emit8(0x89); e.emit8(0xF2);
+    e.emit8(REX_R); e.emit8(0x89); e.emit8(0xF2);
 #else
     // MOV ESI, R14D (zero-extends to RSI)
-    e.emit8(0x41); e.emit8(0x8B); e.emit8(0xF6);
+    e.emit8(REX_B); e.emit8(0x8B); e.emit8(0xF6);
 #endif
 }
 
@@ -765,7 +776,7 @@ inline void emit_ccall_arg1_imm(Emitter& e, uint32_t v) {
 inline void emit_ccall_arg2_imm(Emitter& e, uint32_t v) {
 #ifdef _WIN32
     // MOV R8D, imm32
-    e.emit8(0x41); e.emit8(0xB8); e.emit32(v);
+    e.emit8(REX_B); e.emit8(0xB8); e.emit32(v);
 #else
     // MOV EDX, imm32
     e.emit8(0xBA); e.emit32(v);
@@ -776,7 +787,7 @@ inline void emit_ccall_arg2_imm(Emitter& e, uint32_t v) {
 inline void emit_ccall_arg3_imm(Emitter& e, uint32_t v) {
 #ifdef _WIN32
     // MOV R9D, imm32
-    e.emit8(0x41); e.emit8(0xB9); e.emit32(v);
+    e.emit8(REX_B); e.emit8(0xB9); e.emit32(v);
 #else
     // MOV ECX, imm32
     e.emit8(0xB9); e.emit32(v);
@@ -822,11 +833,11 @@ inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
 
     // Fault path: store STOP_PAGE_FAULT, fault_eip, then exit trace.
     // MOV DWORD [R13 + stop_reason], STOP_PAGE_FAULT (2)
-    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
+    e.emit8(REX_B); e.emit8(0xC7); e.emit8(0x45);
     e.emit8(CTX_STOP_REASON);
     e.emit32(STOP_PAGE_FAULT);
     // MOV DWORD [R13 + next_eip], fault_eip
-    e.emit8(0x41); e.emit8(0xC7); e.emit8(0x45);
+    e.emit8(REX_B); e.emit8(0xC7); e.emit8(0x45);
     e.emit8(CTX_NEXT_EIP);
     e.emit32(fault_eip);
     // Restore GP regs + RFLAGS, then RET (clean stack: only PUSHFQ on it)
@@ -838,8 +849,8 @@ inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
     *skip = (uint8_t)(e.cur() - skip - 1);
 
     // Normal path: R14D = EAX (PA)
-    // MOV R14D, EAX  →  41 89 C6
-    e.emit8(0x41); e.emit8(0x89); e.emit8(0xC6);
+    // MOV R14D, EAX
+    e.emit8(REX_B); e.emit8(0x89); e.emit8(0xC6);
     emit_load_all_gp(e);
     // Restore guest RFLAGS (preserved across C call)
     e.emit8(0x9D); // POPFQ
