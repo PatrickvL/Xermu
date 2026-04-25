@@ -181,12 +181,20 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
-### Step 15: Minor consistency fixes (HEAD)
+### Step 15: Minor consistency fixes (885eba9)
 - executor.cpp: `0xFFFFFFFF` → `0xFFFFFFFFu` (unsigned suffix consistency)
 - executor.cpp: Fixed stale halt comment ("EIP == 0" → "EIP == 0xFFFFFFFF")
 - trace_builder.cpp: 2× "VEH intercepts faults" → "VEH intercepts faults
   and sets bitmap" (match header comment)
 - **Files**: executor.cpp, trace_builder.cpp
+- **Result**: 48/48 pass
+- **Status**: DONE
+
+### Step 16: Replace reinterpret_cast with memcpy in trace_builder.cpp (HEAD)
+- Replaced 5 more `reinterpret_cast<uint32_t*>` / `<uint16_t*>` aliasing
+  violations in guest_read, guest_write, popfd_helper, read_guest_mem32,
+  write_guest_mem32.
+- **Files**: trace_builder.cpp
 - **Result**: 48/48 pass
 - **Status**: DONE
 
@@ -212,4 +220,5 @@
 | 180fb7d | 48   | 0    | doc fixes                |
 | e39e04b | 48   | 0    | memcpy aliasing          |
 | 106c906 | 48   | 0    | xbox comments            |
+| 885eba9 | 48   | 0    | consistency fixes        |
 | (HEAD)  | 48   | 0    | ALL PASS                 |

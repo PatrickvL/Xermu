@@ -99,11 +99,9 @@ static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t siz
     uint32_t pa = guest_translate(ctx, addr, false);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        switch (size) {
-        case 1: return base[pa];
-        case 2: return *reinterpret_cast<uint16_t*>(base + pa);
-        case 4: return *reinterpret_cast<uint32_t*>(base + pa);
-        }
+        uint32_t v = 0;
+        memcpy(&v, base + pa, size);
+        return v;
     }
     return ctx->mmio ? ctx->mmio->read(pa, size) : 0xFFFFFFFFu;
 }
@@ -113,11 +111,7 @@ static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, u
     uint32_t pa = guest_translate(ctx, addr, true);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        switch (size) {
-        case 1: base[pa] = (uint8_t)val;  break;
-        case 2: *reinterpret_cast<uint16_t*>(base + pa) = (uint16_t)val; break;
-        case 4: *reinterpret_cast<uint32_t*>(base + pa) = val;            break;
-        }
+        memcpy(base + pa, &val, size);
         return;
     }
     if (ctx->mmio) ctx->mmio->write(pa, val, size);
@@ -131,7 +125,7 @@ void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
     uint32_t pa = guest_translate(ctx, esp, true);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        *reinterpret_cast<uint32_t*>(base + pa) = eflags_val;
+        memcpy(base + pa, &eflags_val, 4);
     }
 }
 
@@ -143,7 +137,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
     uint32_t pa = guest_translate(ctx, esp, false);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        return *reinterpret_cast<uint32_t*>(base + pa);
+        uint32_t v; memcpy(&v, base + pa, 4); return v;
     }
     return 0;
 }
@@ -154,7 +148,7 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
     uint32_t pa = guest_translate(ctx, addr, false);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        return *reinterpret_cast<uint32_t*>(base + pa);
+        uint32_t v; memcpy(&v, base + pa, 4); return v;
     }
     return ctx->mmio ? ctx->mmio->read(pa, 4) : 0xFFFF'FFFFu;
 }
@@ -165,7 +159,7 @@ void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
     uint32_t pa = guest_translate(ctx, addr, true);
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        *reinterpret_cast<uint32_t*>(base + pa) = val;
+        memcpy(base + pa, &val, 4);
         return;
     }
     if (ctx->mmio) ctx->mmio->write(pa, val, 4);
