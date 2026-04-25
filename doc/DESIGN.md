@@ -265,7 +265,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/hle.asm`       | HLE kernel stubs: timing, sync, memory, interlocked (21) | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
 | `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
-| `tests/pit.asm`       | 8254 PIT: rate gen, one-shot, latch, IRQ delivery (5) | ✅ ALL PASS   |
+| `tests/pit.asm`       | 8254 PIT: rate gen, square wave, one-shot, ch2 (7) | ✅ ALL PASS   |
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
 | `tests/smbus.asm`     | SMBus: EEPROM read/write, SMC queries, W1C (8)     | ✅ ALL PASS   |
