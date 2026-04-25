@@ -169,6 +169,37 @@ start:
     out 0xA0, al         ; EOI to slave
     out 0x20, al         ; EOI to master
 
+    ; ================================================================
+    ; Test 8: OCW3 read IRR — verify IRQ 1 is still pending (was masked).
+    ; ================================================================
+    mov al, 0x0A        ; OCW3: read IRR
+    out 0x20, al
+    in al, 0x20
+    movzx eax, al
+    and eax, 0x02       ; bit 1 = IRQ 1
+    ASSERT_EQ eax, 0x02  ; IRQ 1 pending (raised but masked)
+
+    ; ================================================================
+    ; Test 9: Specific EOI — verify targeted clear.
+    ; ================================================================
+    ; Unmask IRQ 1, let it fire.
+    mov al, 0xF8        ; unmask IRQ 0, 1, 2
+    out 0x21, al
+
+    nop
+    nop
+    nop
+
+    ; IRQ 1 ISR should have run now.
+    ASSERT_EQ_MEM irq1_flag, 0xDEAD0001
+
+    ; ================================================================
+    ; Test 10: Read IMR after all changes.
+    ; ================================================================
+    in al, 0x21
+    movzx eax, al
+    ASSERT_EQ eax, 0xF8
+
     PASS
 
 ; ---------------------------------------------------------------------------

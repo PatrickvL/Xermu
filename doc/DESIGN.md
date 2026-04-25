@@ -264,7 +264,7 @@ The bump is correctly skipped for them (they are not stores).
 | `tests/xbox.asm`      | Xbox address map: RAM mirror, PCI, NV2A, Flash (9) | ✅ ALL PASS   |
 | `tests/hle.asm`       | HLE kernel stubs: timing, sync, memory, interlocked (21) | ✅ ALL PASS   |
 | `tests/linking.asm`   | Block linking: tight loops, Jcc, nested, CALL (7)  | ✅ ALL PASS   |
-| `tests/pic.asm`       | 8259A PIC: ICW init, IMR, IRQ delivery, EOI (7)    | ✅ ALL PASS   |
+| `tests/pic.asm`       | 8259A PIC: ICW, IMR, IRQ, EOI, OCW3 IRR/ISR (10)  | ✅ ALL PASS   |
 | `tests/pit.asm`       | 8254 PIT: rate gen, square wave, one-shot, ch2 (7) | ✅ ALL PASS   |
 | `tests/nv2a_timer.asm` | NV2A PTIMER: freerunning counter, num/den, readback (6) | ✅ ALL PASS   |
 | `tests/pcrtc.asm`     | NV2A PCRTC: vblank poll, W1C clear, IRQ delivery (6) | ✅ ALL PASS   |
