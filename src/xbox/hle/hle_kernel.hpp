@@ -77,6 +77,7 @@ enum KernelOrdinal : uint32_t {
     ORD_ExAllocatePoolWithTag          = 15,
     ORD_ExFreePool                     = 17,
     ORD_ExInitializeReadWriteLock      = 18,
+    ORD_ExReleaseReadWriteLock          = 19,
     ORD_ExQueryPoolBlockSize           = 23,
     ORD_ExQueryNonVolatileSetting      = 24,
     ORD_ExSaveNonVolatileSetting       = 29,
@@ -99,6 +100,7 @@ enum KernelOrdinal : uint32_t {
     ORD_IoDeleteSymbolicLink           = 69,
     ORD_IoDismountVolume               = 90,
     ORD_IoDismountVolumeByName         = 91,
+    ORD_IoSynchronousDeviceIoControlRequest = 94,
     ORD_KeBugCheck                     = 95,
     ORD_KeBugCheckEx                   = 96,
     ORD_KeCancelTimer                  = 97,
@@ -159,9 +161,12 @@ enum KernelOrdinal : uint32_t {
     ORD_NtCreateMutant                 = 192,
     ORD_NtCreateSemaphore              = 193,
     ORD_NtDeviceIoControlFile           = 196,
+    ORD_NtDuplicateObject              = 197,
+    ORD_NtFlushBuffersFile             = 198,
     ORD_NtFreeVirtualMemory            = 199,
     ORD_NtOpenFile                     = 202,
     ORD_NtQueryInformationFile         = 211,
+    ORD_NtQueryDirectoryFile            = 208,
     ORD_NtQueryFullAttributesFile      = 210,
     ORD_NtQueryVolumeInformationFile   = 218,
     ORD_NtReadFile                     = 219,
@@ -787,8 +792,10 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
             heap->pending_threads.erase(heap->pending_threads.begin());
             fprintf(stderr, "[hle] PsTerminateSystemThread: switching to thread routine=0x%08X ctx=0x%08X\n",
                     t.start_routine, t.start_context);
-            // Set up a call frame: push context as arg, set EIP to routine
-            uint32_t esp = exec.ctx.gp[GP_ESP];
+            // Allocate a fresh stack for the new thread (64 KB).
+            constexpr uint32_t THREAD_STACK_SIZE = 0x10000u;
+            uint32_t stack_base = heap->alloc(THREAD_STACK_SIZE);
+            uint32_t esp = stack_base ? (stack_base + THREAD_STACK_SIZE) : exec.ctx.gp[GP_ESP];
             // Push a return address that will halt (use HalReturnToFirmware stub)
             uint32_t halt_addr = hle_stub_addr(ORD_HalReturnToFirmware);
             esp -= 4;
@@ -1022,12 +1029,20 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     // ---- Object manager stubs ----
 
-    case ORD_ObReferenceObjectByHandle:
+    case ORD_ObReferenceObjectByHandle: {
         // NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE,
         //          KPROCESSOR_MODE, PVOID *Object, POBJECT_HANDLE_INFORMATION)
+        uint32_t obj_out = stack_arg(exec, 4);
+        if (obj_out + 4 <= GUEST_RAM_SIZE) {
+            // Return a fake object pointer (use a page from the heap)
+            uint32_t fake_obj = heap->alloc(0x100);
+            if (fake_obj) memset(exec.ram + fake_obj, 0, 0x100);
+            memcpy(exec.ram + obj_out, &fake_obj, 4);
+        }
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 6);
         return true;
+    }
 
     case ORD_ObfDereferenceObject:
         // void ObDereferenceObject(PVOID Object)
@@ -1625,11 +1640,434 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
     }
 
-    default:
-        // Unhandled: log and return STATUS_NOT_IMPLEMENTED
-        fprintf(stderr, "[hle] unhandled kernel ordinal %u at EIP=0x%08X\n",
+    case ORD_MmClaimGpuInstanceMemory: {
+        // PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes, PSIZE_T NumberOfPaddingBytes)
+        uint32_t num_bytes = stack_arg(exec, 0);
+        uint32_t pad_ptr   = stack_arg(exec, 1);
+        uint32_t addr = heap->alloc(num_bytes > 0 ? num_bytes : 0x1000);
+        if (addr && num_bytes > 0) memset(exec.ram + addr, 0, num_bytes);
+        if (pad_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t pad = 0;
+            memcpy(exec.ram + pad_ptr, &pad, 4);
+        }
+        exec.ctx.gp[GP_EAX] = addr;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_MmCreateKernelStack: {
+        // PVOID MmCreateKernelStack(SIZE_T NumberOfBytes, BOOLEAN DebuggerThread)
+        uint32_t size = stack_arg(exec, 0);
+        if (size == 0) size = 0x10000;
+        uint32_t base = heap->alloc(size);
+        exec.ctx.gp[GP_EAX] = base ? (base + size) : 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_MmDeleteKernelStack:
+        // void MmDeleteKernelStack(PVOID StackBase, PVOID StackLimit)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_MmAllocateSystemMemory: {
+        // PVOID MmAllocateSystemMemory(SIZE_T NumberOfBytes, ULONG Protect)
+        uint32_t size = stack_arg(exec, 0);
+        uint32_t addr = heap->alloc(size > 0 ? size : 0x1000);
+        if (addr && size > 0) memset(exec.ram + addr, 0, size);
+        exec.ctx.gp[GP_EAX] = addr;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_MmFreeSystemMemory:
+        // ULONG MmFreeSystemMemory(PVOID, SIZE_T)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_MmIsAddressValid:
+        // BOOLEAN MmIsAddressValid(PVOID VirtualAddress)
+        exec.ctx.gp[GP_EAX] = (stack_arg(exec, 0) < GUEST_RAM_SIZE) ? 1 : 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_MmQueryStatistics: {
+        // NTSTATUS MmQueryStatistics(PMM_STATISTICS)
+        uint32_t ptr = stack_arg(exec, 0);
+        if (ptr + 0x24 <= GUEST_RAM_SIZE) {
+            memset(exec.ram + ptr, 0, 0x24);
+            uint32_t total = GUEST_RAM_SIZE / 0x1000;
+            uint32_t avail = total / 2;
+            memcpy(exec.ram + ptr + 0x04, &total, 4);
+            memcpy(exec.ram + ptr + 0x0C, &avail, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_MmSetAddressProtect:
+        // void MmSetAddressProtect(PVOID, ULONG, ULONG)
+        stdcall_cleanup(exec, 3);
+        return true;
+
+
+
+
+    case ORD_NtYieldExecution:
+        // NTSTATUS NtYieldExecution(void)
+        exec.ctx.gp[GP_EAX] = 0;
+        exec.ctx.halted = true;
+        return true;
+
+    case ORD_NtFlushBuffersFile:
+        // NTSTATUS NtFlushBuffersFile(HANDLE, PIO_STATUS_BLOCK)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_NtQueryDirectoryFile: {
+        // NTSTATUS NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
+        //     PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS,
+        //     PSTRING, BOOLEAN)
+        exec.ctx.gp[GP_EAX] = 0x80000006u; // STATUS_NO_MORE_FILES
+        stdcall_cleanup(exec, 10);
+        return true;
+    }
+
+    case ORD_NtDuplicateObject: {
+        // NTSTATUS NtDuplicateObject(HANDLE Source, PHANDLE Target, ULONG Options)
+        uint32_t source     = stack_arg(exec, 0);
+        uint32_t target_ptr = stack_arg(exec, 1);
+        if (target_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + target_ptr, &source, 4);
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_IoSynchronousDeviceIoControlRequest:
+        // NTSTATUS IoSynchronousDeviceIoControlRequest(...)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 8);
+        return true;
+
+    case ORD_ObfReferenceObject:
+        // void ObfReferenceObject(PVOID)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlAnsiStringToUnicodeString: {
+        // NTSTATUS RtlAnsiStringToUnicodeString(PUNICODE_STRING, PCANSI_STRING, BOOLEAN)
+        uint32_t dest = stack_arg(exec, 0);
+        uint32_t src  = stack_arg(exec, 1);
+        uint16_t src_len = 0;
+        uint32_t src_buf = 0;
+        if (src + 8 <= GUEST_RAM_SIZE) {
+            memcpy(&src_len, exec.ram + src, 2);
+            memcpy(&src_buf, exec.ram + src + 4, 4);
+        }
+        uint32_t uni_len = (uint32_t)src_len * 2;
+        uint32_t uni_buf = heap->alloc(uni_len + 2);
+        if (uni_buf && src_buf + src_len <= GUEST_RAM_SIZE) {
+            for (uint16_t i = 0; i < src_len; i++) {
+                uint16_t ch = exec.ram[src_buf + i];
+                memcpy(exec.ram + uni_buf + i * 2, &ch, 2);
+            }
+            uint16_t zero = 0;
+            memcpy(exec.ram + uni_buf + uni_len, &zero, 2);
+        }
+        if (dest + 8 <= GUEST_RAM_SIZE) {
+            uint16_t u_len = (uint16_t)uni_len;
+            uint16_t u_max = (uint16_t)(uni_len + 2);
+            memcpy(exec.ram + dest + 0, &u_len, 2);
+            memcpy(exec.ram + dest + 2, &u_max, 2);
+            memcpy(exec.ram + dest + 4, &uni_buf, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_RtlUnicodeStringToAnsiString: {
+        // NTSTATUS RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN)
+        uint32_t dest = stack_arg(exec, 0);
+        uint32_t src  = stack_arg(exec, 1);
+        uint16_t src_len = 0;
+        uint32_t src_buf = 0;
+        if (src + 8 <= GUEST_RAM_SIZE) {
+            memcpy(&src_len, exec.ram + src, 2);
+            memcpy(&src_buf, exec.ram + src + 4, 4);
+        }
+        uint32_t ansi_len = src_len / 2;
+        uint32_t ansi_buf = heap->alloc(ansi_len + 1);
+        if (ansi_buf && src_buf + src_len <= GUEST_RAM_SIZE) {
+            for (uint32_t i = 0; i < ansi_len; i++) {
+                uint16_t ch;
+                memcpy(&ch, exec.ram + src_buf + i * 2, 2);
+                exec.ram[ansi_buf + i] = (uint8_t)(ch & 0xFF);
+            }
+            exec.ram[ansi_buf + ansi_len] = 0;
+        }
+        if (dest + 8 <= GUEST_RAM_SIZE) {
+            uint16_t a_len = (uint16_t)ansi_len;
+            uint16_t a_max = (uint16_t)(ansi_len + 1);
+            memcpy(exec.ram + dest + 0, &a_len, 2);
+            memcpy(exec.ram + dest + 2, &a_max, 2);
+            memcpy(exec.ram + dest + 4, &ansi_buf, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_RtlFreeAnsiString:
+        // void RtlFreeAnsiString(PANSI_STRING)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlFreeUnicodeString:
+        // void RtlFreeUnicodeString(PUNICODE_STRING)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_RtlTryEnterCriticalSection: {
+        // BOOLEAN RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION)
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            int32_t lock = 0;
+            memcpy(exec.ram + cs + 0x04, &lock, 4);
+            int32_t rec = 1;
+            memcpy(exec.ram + cs + 0x08, &rec, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 1;
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_KeLeaveCriticalRegion:
+        // void KeLeaveCriticalRegion(void)
+        return true;
+
+
+
+    case ORD_KeInitializeQueue:
+        // void KeInitializeQueue(PKQUEUE, ULONG)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+
+
+
+    case ORD_ExSaveNonVolatileSetting:
+        // NTSTATUS ExSaveNonVolatileSetting(4 args)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        return true;
+
+    case ORD_RtlEnterCriticalSectionAndRegion: {
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            int32_t lock = 0;
+            memcpy(exec.ram + cs + 0x04, &lock, 4);
+            int32_t rec = 1;
+            memcpy(exec.ram + cs + 0x08, &rec, 4);
+        }
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_RtlLeaveCriticalSectionAndRegion: {
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            int32_t lock = -1;
+            memcpy(exec.ram + cs + 0x04, &lock, 4);
+            int32_t rec = 0;
+            memcpy(exec.ram + cs + 0x08, &rec, 4);
+        }
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_RtlCopyUnicodeString: {
+        // void RtlCopyUnicodeString(PUNICODE_STRING Dest, PCUNICODE_STRING Src)
+        uint32_t dest = stack_arg(exec, 0);
+        uint32_t src  = stack_arg(exec, 1);
+        if (src + 8 <= GUEST_RAM_SIZE && dest + 8 <= GUEST_RAM_SIZE) {
+            uint16_t src_len = 0, dest_max = 0;
+            uint32_t src_buf = 0, dest_buf = 0;
+            memcpy(&src_len,  exec.ram + src + 0, 2);
+            memcpy(&src_buf,  exec.ram + src + 4, 4);
+            memcpy(&dest_max, exec.ram + dest + 2, 2);
+            memcpy(&dest_buf, exec.ram + dest + 4, 4);
+            uint16_t copy_len = (src_len < dest_max) ? src_len : dest_max;
+            if (src_buf + copy_len <= GUEST_RAM_SIZE && dest_buf + copy_len <= GUEST_RAM_SIZE)
+                memcpy(exec.ram + dest_buf, exec.ram + src_buf, copy_len);
+            memcpy(exec.ram + dest + 0, &copy_len, 2);
+        }
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_RtlCreateUnicodeString: {
+        // BOOLEAN RtlCreateUnicodeString(PUNICODE_STRING Dest, PCWSTR Src)
+        uint32_t dest = stack_arg(exec, 0);
+        uint32_t src  = stack_arg(exec, 1);
+        uint16_t len = 0;
+        if (src && src < GUEST_RAM_SIZE) {
+            while (src + len + 1 < GUEST_RAM_SIZE) {
+                uint16_t ch;
+                memcpy(&ch, exec.ram + src + len, 2);
+                if (ch == 0) break;
+                len += 2;
+            }
+        }
+        uint32_t buf = heap->alloc(len + 2);
+        if (buf && src + len <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + buf, exec.ram + src, len + 2);
+        if (dest + 8 <= GUEST_RAM_SIZE) {
+            uint16_t max_len = len + 2;
+            memcpy(exec.ram + dest + 0, &len, 2);
+            memcpy(exec.ram + dest + 2, &max_len, 2);
+            memcpy(exec.ram + dest + 4, &buf, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 1;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_InterlockedExchangeAdd: {
+        // LONG InterlockedExchangeAdd(LONG volatile *Addend, LONG Value)
+        uint32_t ptr = stack_arg(exec, 0);
+        int32_t val = (int32_t)stack_arg(exec, 1);
+        int32_t old_val = 0;
+        if (ptr + 4 <= GUEST_RAM_SIZE) {
+            memcpy(&old_val, exec.ram + ptr, 4);
+            int32_t new_val = old_val + val;
+            memcpy(exec.ram + ptr, &new_val, 4);
+        }
+        exec.ctx.gp[GP_EAX] = (uint32_t)old_val;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_NtWaitForSingleObjectEx:
+        // NTSTATUS NtWaitForSingleObjectEx(HANDLE, KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        exec.ctx.halted = true;
+        return true;
+
+    case ORD_XeUnloadSection:
+        // NTSTATUS XeUnloadSection(PXBE_SECTION_HEADER)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_IoDismountVolume:
+        // NTSTATUS IoDismountVolume(PDEVICE_OBJECT)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+        case ORD_AvSendTVEncoderOption:
+        // void AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result)
+        stdcall_cleanup(exec, 4);
+        return true;
+
+    case ORD_DbgBreakPoint:
+        // void DbgBreakPoint(void)
+        fprintf(stderr, "[hle] DbgBreakPoint at EIP=0x%08X\n", exec.ctx.eip);
+        return true;
+
+    case ORD_ExAcquireReadWriteLockExclusive:
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_ExAcquireReadWriteLockShared:
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_ExReleaseReadWriteLock:
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_HalReadWritePCISpace: {
+        // void HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber,
+        //     ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace)
+        uint32_t buf_ptr  = stack_arg(exec, 3);
+        uint32_t length   = stack_arg(exec, 4);
+        uint32_t is_write = stack_arg(exec, 5);
+        if (!is_write && buf_ptr + length <= GUEST_RAM_SIZE && length > 0)
+            memset(exec.ram + buf_ptr, 0, length);
+        stdcall_cleanup(exec, 6);
+        return true;
+    }
+
+    case ORD_KeInitializeApc:
+        // void KeInitializeApc(7 args)
+        stdcall_cleanup(exec, 7);
+        return true;
+
+    case ORD_KeInsertQueueDpc: {
+        // BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2)
+        uint32_t dpc_va = stack_arg(exec, 0);
+        if (dpc_va + 0x1C <= GUEST_RAM_SIZE) {
+            uint32_t routine = 0, context = 0;
+            memcpy(&routine, exec.ram + dpc_va + 0x0C, 4);
+            memcpy(&context, exec.ram + dpc_va + 0x10, 4);
+            if (routine)
+                heap->pending_dpcs.push_back({routine, context, dpc_va, 0});
+        }
+        exec.ctx.gp[GP_EAX] = 1; // TRUE (inserted)
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_KeSetBasePriorityThread:
+        // LONG KeSetBasePriorityThread(PKTHREAD, LONG Increment)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_KfRaiseIrql:
+        // KIRQL KfRaiseIrql(KIRQL) - fastcall, arg in CL
+        exec.ctx.gp[GP_EAX] = 0; // old IRQL = PASSIVE_LEVEL
+        return true;
+
+    case ORD_KiUnlockDispatcherDatabase:
+        // void KiUnlockDispatcherDatabase(KIRQL) - fastcall
+        return true;
+
+    case ORD_NtWriteFile: {
+        // NTSTATUS NtWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+        //     PIO_STATUS_BLOCK, PVOID, ULONG Length, PLARGE_INTEGER)
+        uint32_t iosb_ptr = stack_arg(exec, 4);
+        uint32_t length   = stack_arg(exec, 6);
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            uint32_t status = 0;
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            memcpy(exec.ram + iosb_ptr + 4, &length, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 8);
+        return true;
+    }
+
+    case ORD_HalBootSMCVideoMode:
+        // ULONG HalBootSMCVideoMode - DATA export, not a function
+        exec.ctx.gp[GP_EAX] = 1; // NTSC-M
+        return true;
+
+        default:
+        // Unhandled: log and halt (cannot continue safely because
+        // we don't know the argument count for stdcall cleanup).
+        fprintf(stderr, "[hle] FATAL: unhandled kernel ordinal %u at EIP=0x%08X\n",
                 ordinal, exec.ctx.eip);
         exec.ctx.gp[GP_EAX] = 0xC0000002u; // STATUS_NOT_IMPLEMENTED
+        exec.ctx.halted = true;
+        exec.ctx.stop_reason = STOP_INVALID_OPCODE;
         return true;
     }
 }

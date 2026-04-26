@@ -415,7 +415,11 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
         xbe::PendingThread t = sys.hle_heap.pending_threads.front();
         sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
 
-        uint32_t esp = sys.exec->ctx.gp[GP_ESP];
+        // Allocate a fresh stack for the new thread (64 KB, page-aligned).
+        constexpr uint32_t THREAD_STACK_SIZE = 0x10000u;
+        uint32_t stack_base = sys.hle_heap.alloc(THREAD_STACK_SIZE);
+        uint32_t esp = stack_base ? (stack_base + THREAD_STACK_SIZE) : sys.exec->ctx.gp[GP_ESP];
+
         // Push start_context as argument
         esp -= 4;
         if (esp + 4 <= GUEST_RAM_SIZE)
