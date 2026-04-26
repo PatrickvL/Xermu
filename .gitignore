@@ -24,3 +24,4 @@ data/
 *.txt
 stderr.txt
 stdout.txt
+imgui.ini
