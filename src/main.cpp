@@ -23,6 +23,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#  include <sys/stat.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Vulkan helpers — minimal single-queue setup for ImGui rendering.
 // ---------------------------------------------------------------------------
@@ -349,60 +353,104 @@ struct AppContext {
     }
 };
 
+// ---------------------------------------------------------------------------
+// find_data_root — locate the project data/ directory.
+// Walks up from the executable's directory until a "data" subfolder is found.
+// Falls back to CWD-relative "data/" if nothing is found.
+// ---------------------------------------------------------------------------
+static std::string find_data_root(const char* argv0) {
+    // Get directory containing the executable
+    std::string exe_dir;
+    if (argv0) {
+        exe_dir = argv0;
+        size_t sep = exe_dir.find_last_of("/\\");
+        if (sep != std::string::npos) exe_dir = exe_dir.substr(0, sep);
+        else exe_dir = ".";
+    } else {
+        exe_dir = ".";
+    }
+
+    // Walk up from exe_dir looking for a "data" subfolder
+    std::string dir = exe_dir;
+    for (int i = 0; i < 5; ++i) {
+        std::string candidate = dir + "/data";
+#ifdef _WIN32
+        DWORD attr = GetFileAttributesA(candidate.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            return candidate;
+        }
+#else
+        struct stat st;
+        if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            return candidate;
+        }
+#endif
+        // Go up one level
+        size_t sep = dir.find_last_of("/\\");
+        if (sep == std::string::npos) break;
+        dir = dir.substr(0, sep);
+    }
+
+    return "data";  // fallback: CWD-relative
+}
+
 // Scan data/ for known files
-static void scan_data_dir(AppContext& app) {
-    // Dashboard XBE — several common dump layouts
-    const char* dash_paths[] = {
-        "data/xbox dash orig_5960/xboxdash.xbe",
-        "data/xboxdash.xbe",
-        "data/dashboard/xboxdash.xbe",
-        "xboxdash.xbe",
+static void scan_data_dir(AppContext& app, const std::string& data_root) {
+    auto probe = [&](const char* rel) -> std::string {
+        std::string full = data_root + "/" + rel;
+        FILE* f = fopen(full.c_str(), "rb");
+        if (f) { fclose(f); return full; }
+        return {};
     };
-    for (auto& p : dash_paths) {
-        FILE* f = fopen(p, "rb");
-        if (f) { fclose(f); app.dashboard_xbe = p; break; }
+
+    // Dashboard XBE — several common dump layouts
+    const char* dash_rel[] = {
+        "xbox dash orig_5960/xboxdash.xbe",
+        "xboxdash.xbe",
+        "dashboard/xboxdash.xbe",
+    };
+    for (auto& r : dash_rel) {
+        auto p = probe(r);
+        if (!p.empty()) { app.dashboard_xbe = p; break; }
     }
 
     // BIOS ROM images (256 KB or 1 MB)
-    const char* bios_paths[] = {
-        "data/bios.bin",
-        "data/xbox5838.bin",
-        "data/xbox5960.bin",
-        "data/xbox4627.bin",
-        "data/xbox4034.bin",
-        "data/complex_4627.bin",
-        "data/complex_5838.bin",
-        "data/xboxrom.bin",
+    const char* bios_rel[] = {
         "bios.bin",
+        "xbox5838.bin",
+        "xbox5960.bin",
+        "xbox4627.bin",
+        "xbox4034.bin",
+        "complex_4627.bin",
+        "complex_5838.bin",
+        "xboxrom.bin",
     };
-    for (auto& p : bios_paths) {
-        FILE* f = fopen(p, "rb");
-        if (f) { fclose(f); app.bios_path = p; break; }
+    for (auto& r : bios_rel) {
+        auto p = probe(r);
+        if (!p.empty()) { app.bios_path = p; break; }
     }
 
     // MCPX boot ROM (512 bytes)
-    const char* mcpx_paths[] = {
-        "data/mcpx_1.0.bin",
-        "data/mcpx_1.1.bin",
-        "data/mcpx.bin",
+    const char* mcpx_rel[] = {
+        "mcpx_1.0.bin",
+        "mcpx_1.1.bin",
         "mcpx.bin",
     };
-    for (auto& p : mcpx_paths) {
-        FILE* f = fopen(p, "rb");
-        if (f) { fclose(f); app.mcpx_path = p; break; }
+    for (auto& r : mcpx_rel) {
+        auto p = probe(r);
+        if (!p.empty()) { app.mcpx_path = p; break; }
     }
 
     // xboxkrnl.exe — extracted kernel PE
-    const char* kernel_paths[] = {
-        "data/xboxkrnl.exe",
-        "data/xboxkrnl_5838.exe",
-        "data/xboxkrnl_5960.exe",
-        "data/xboxkrnl_4627.exe",
+    const char* kernel_rel[] = {
         "xboxkrnl.exe",
+        "xboxkrnl_5838.exe",
+        "xboxkrnl_5960.exe",
+        "xboxkrnl_4627.exe",
     };
-    for (auto& p : kernel_paths) {
-        FILE* f = fopen(p, "rb");
-        if (f) { fclose(f); app.kernel_path = p; break; }
+    for (auto& r : kernel_rel) {
+        auto p = probe(r);
+        if (!p.empty()) { app.kernel_path = p; break; }
     }
 }
 
@@ -582,7 +630,8 @@ static void draw_running(AppContext& app) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+    // Locate project data/ directory (works from any CWD)
+    std::string data_root = find_data_root(argv[0]);
 
     // Init SDL
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -639,7 +688,7 @@ int main(int argc, char** argv) {
 
     // App state
     AppContext app;
-    scan_data_dir(app);
+    scan_data_dir(app, data_root);
 
     // Handle command-line args: [--kernel xboxkrnl.exe] <game.xbe>
     if (argc >= 2) {
