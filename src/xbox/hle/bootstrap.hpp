@@ -371,6 +371,13 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     sys.exec->ctx.stop_reason = STOP_NONE;
     sys.exec->run(sys.entry_eip, max_steps);
 
+    // Check for error stops — these are always permanent
+    uint32_t sr = sys.exec->ctx.stop_reason;
+    if (sr == STOP_INVALID_OPCODE || sr == STOP_DIVIDE_ERROR) {
+        sys.running = false;
+        return false;
+    }
+
     // Check if this is a permanent halt (sentinel or HalReturnToFirmware)
     uint32_t eip = sys.exec->ctx.eip;
     bool real_halt = sys.exec->ctx.halted &&

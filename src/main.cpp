@@ -690,20 +690,55 @@ int main(int argc, char** argv) {
     AppContext app;
     scan_data_dir(app, data_root);
 
-    // Handle command-line args: [--kernel xboxkrnl.exe] <game.xbe>
+    // Handle command-line args:
+    //   xermu [--kernel xboxkrnl.exe] <game.xbe>   — HLE or LLE-kernel mode
+    //   xermu --bios <bios.bin> [--mcpx <mcpx.bin>] — LLE BIOS boot
     if (argc >= 2) {
         int cli_argi = 1;
         std::string cli_kernel;
-        if (std::string(argv[cli_argi]) == "--kernel" && cli_argi + 1 < argc) {
-            cli_kernel = argv[++cli_argi];
-            ++cli_argi;
+        std::string cli_bios;
+        std::string cli_mcpx;
+
+        // Parse flags
+        while (cli_argi < argc && argv[cli_argi][0] == '-') {
+            std::string flag = argv[cli_argi];
+            if (flag == "--kernel" && cli_argi + 1 < argc) {
+                cli_kernel = argv[++cli_argi];
+                ++cli_argi;
+            } else if (flag == "--bios") {
+                // --bios with optional path; if next arg looks like a file use it
+                ++cli_argi;
+                if (cli_argi < argc && argv[cli_argi][0] != '-') {
+                    cli_bios = argv[cli_argi++];
+                } else {
+                    cli_bios = app.bios_path;  // use auto-detected
+                }
+            } else if (flag == "--mcpx" && cli_argi + 1 < argc) {
+                cli_mcpx = argv[++cli_argi];
+                ++cli_argi;
+            } else {
+                ++cli_argi;
+            }
         }
-        if (cli_argi < argc) {
+
+        auto log_fn = [&](const char* msg) { app.log(msg); };
+
+        if (!cli_bios.empty()) {
+            // LLE BIOS boot
+            app.cfg.bios_path = cli_bios;
+            if (!cli_mcpx.empty()) app.cfg.mcpx_path = cli_mcpx;
+            else if (!app.mcpx_path.empty()) app.cfg.mcpx_path = app.mcpx_path;
+            if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
+                app.state = AppState::Running;
+            } else {
+                app.log("[ui] LLE BIOS boot failed");
+            }
+        } else if (cli_argi < argc) {
+            // XBE mode (HLE or LLE-kernel)
             std::string arg = argv[cli_argi];
             if (arg.size() > 4 && (arg.substr(arg.size()-4) == ".xbe" || arg.substr(arg.size()-4) == ".XBE")) {
                 app.cfg.xbe_path = arg;
                 app.cfg.kernel_path = cli_kernel;
-                auto log_fn = [&](const char* msg) { app.log(msg); };
                 bool ok = cli_kernel.empty()
                     ? xbox::boot_hle(app.sys, app.cfg, log_fn)
                     : xbox::boot_lle_kernel(app.sys, app.cfg, log_fn);
