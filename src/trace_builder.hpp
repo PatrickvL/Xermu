@@ -15,47 +15,6 @@ struct TraceArena {
 };
 
 // ---------------------------------------------------------------------------
-// Per-code-page fault bitmap: 1 bit per byte offset (512 bytes per page).
-// When a memory-access instruction faults (VEH), its guest EIP is marked.
-// On trace rebuild, marked instructions emit the slow-path CALL instead
-// of the optimistic bare fastmem op.
-//
-// Bitmaps are allocated on demand and released when the code page is
-// written to (invalidating all traces on that page).
-// ---------------------------------------------------------------------------
-struct FaultBitmaps {
-    static constexpr size_t PAGES = 1u << 20; // 4 GB / 4 KB = 1M pages
-    uint8_t* maps[PAGES] = {};
-
-    bool test(uint32_t guest_pa) const {
-        uint32_t page = guest_pa >> 12;
-        uint32_t off  = guest_pa & 0xFFF;
-        auto* m = maps[page];
-        return m && (m[off >> 3] & (1u << (off & 7)));
-    }
-
-    void set(uint32_t guest_pa) {
-        uint32_t page = guest_pa >> 12;
-        uint32_t off  = guest_pa & 0xFFF;
-        if (!maps[page]) {
-            maps[page] = new uint8_t[512]();
-        }
-        maps[page][off >> 3] |= (1u << (off & 7));
-    }
-
-    void clear_page(uint32_t pa) {
-        uint32_t page = pa >> 12;
-        delete[] maps[page];
-        maps[page] = nullptr;
-    }
-
-    ~FaultBitmaps() {
-        for (size_t i = 0; i < PAGES; ++i)
-            delete[] maps[i];
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Software TLB for VA→PA translation when paging (CR0.PG) is enabled.
 // Direct-mapped, indexed by VPN & MASK. Separate read/write arrays so that
 // write permission is checked only on stores.
@@ -94,8 +53,7 @@ struct TraceBuilder {
                  const uint8_t*     ram,
                  CodeCache&         cc,
                  TraceArena&        arena,
-                 GuestContext*      ctx,
-                 const FaultBitmaps* fb = nullptr);
+                 GuestContext*      ctx);
 
     // has_mem_operand is used by emit handlers — needs to be accessible
     static bool has_mem_operand(const ZydisDecodedOperand* ops, uint8_t count,
@@ -124,3 +82,22 @@ private:
     // Emit a RET trace exit (reads return addr from guest stack).
     void emit_ret_exit(Emitter& e, GuestContext* ctx);
 };
+
+// ---------------------------------------------------------------------------
+// Generate a slow-path MMIO dispatch stub for the given patchable mem site.
+//
+// The stub is called via CALL rel32 from the 5-byte NOP sled that precedes
+// the fastmem instruction.  On entry:
+//   [RSP]  = return address = address of fastmem instruction in host code
+//   R13    = GuestContext*
+//   R14D   = physical address of the memory operation
+//   host GP registers hold current guest register values
+//
+// The stub saves GP regs, calls the appropriate MMIO helper, restores GP
+// regs, advances the return address past the fastmem instruction by
+// site.skip_len bytes, then returns.
+//
+// Returns the number of bytes written into buf[0..cap), or 0 on failure.
+// ---------------------------------------------------------------------------
+size_t generate_slow_path_stub(uint8_t* buf, size_t cap,
+                                const Trace::MemOpSite& site);

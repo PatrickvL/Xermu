@@ -3,6 +3,16 @@
 #include <cstddef>
 #include <cstring>
 
+// Slow-path kind for VEH patching of 5-byte NOP sleds that precede each
+// patchable fastmem instruction.  On the first MMIO fault the VEH generates
+// a slow-path stub in the stub slab and patches the NOP sled to CALL rel32.
+enum SlowPathKind : uint8_t {
+    SP_NONE      = 0,  // not patchable (ALU/FPU/SSE/flagmem — VEH logs and crashes)
+    SP_READ      = 1,  // mmio_dispatch_read(ctx, pa, reg_enc, size_bytes)
+    SP_WRITE     = 2,  // mmio_dispatch_write(ctx, pa, reg_enc, size_bytes)
+    SP_WRITE_IMM = 3,  // mmio_dispatch_write_imm(ctx, pa, imm_val, size_bytes)
+};
+
 // A compiled trace: a run of guest instructions from guest_eip up to (but not
 // including) the first branch/call/ret, emitted into the code cache.
 //
@@ -33,18 +43,31 @@ struct Trace {
     }
 
     // Memory-op site table: maps host code offset → guest EIP for VEH lookup.
-    // Populated during trace build at each memory-op emit site.
+    // For patchable sites (sp_kind != SP_NONE) a 5-byte NOP sled immediately
+    // precedes the fastmem instruction at host_offset; the VEH patches it to
+    // CALL rel32 → stub on the first MMIO fault.
     static constexpr int MAX_MEM_SITES = 64;
     struct MemOpSite {
-        uint32_t host_offset;   // offset from host_code where the mem op starts
-        uint32_t guest_eip;     // guest instruction that emitted this memory op
+        uint32_t     host_offset;   // offset of fastmem insn from host_code
+        uint32_t     guest_eip;     // guest instruction EIP
+        SlowPathKind sp_kind;       // SP_NONE = no slow path; otherwise patchable
+        uint8_t      sp_reg_enc;    // GP register encoding (SP_READ: dst, SP_WRITE: src)
+        uint8_t      sp_size;       // operation size in bytes (1, 2, 4)
+        uint8_t      skip_len;      // host bytes to skip on stub return (fastmem insn + trailing)
+        bool         sp_save_flags; // true → stub wraps C call with PUSHFQ/POPFQ
+        uint32_t     sp_imm;        // immediate value (SP_WRITE_IMM)
+        uint8_t*     stub_ptr;      // generated stub (nullptr = not yet patched)
     };
     MemOpSite mem_sites[MAX_MEM_SITES] = {};
     int       num_mem_sites = 0;
 
-    void add_mem_site(uint32_t host_off, uint32_t geip) {
+    void add_mem_site(uint32_t host_off, uint32_t geip,
+                      SlowPathKind kind = SP_NONE, uint8_t reg_enc = 0,
+                      uint8_t size = 0, uint8_t skip = 0,
+                      bool save_flags = false, uint32_t imm = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { host_off, geip };
+            mem_sites[num_mem_sites++] = { host_off, geip, kind, reg_enc, size,
+                                           skip, save_flags, imm, nullptr };
     }
 
     // Lookup guest EIP by host code address. Returns 0 on miss.

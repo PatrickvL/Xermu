@@ -514,34 +514,22 @@ uint8_t TraceBuilder::jcc_short_opcode(ZydisMnemonic m) {
 // `guest_enc` is the register encoding, `size_bits` the operand width,
 // `is_load` true for load, false for store.
 //
-// Two modes based on e.slow_path:
-//   false → emit bare fastmem op; VEH handles faults and sets bitmap bit
-//   true  → emit slow-path MMIO call directly (bitmap was set on prior fault)
+// Emits a 5-byte NOP sled followed by the fastmem instruction.  The VEH
+// patches the NOP sled to CALL rel32 → slow-path stub on the first MMIO fault.
 static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
                                    uint8_t guest_enc, unsigned size_bits,
                                    bool is_load, bool save_flags) {
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/!is_load);
 
-    if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_op(e, guest_enc, size_bits, is_load);
-    } else {
-        // Slow path: full MMIO dispatch call.
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, guest_enc);
-        emit_ccall_arg3_imm(e, size_bits / 8);
-        emit_call_abs(e, is_load
-            ? reinterpret_cast<void*>(mmio_dispatch_read)
-            : reinterpret_cast<void*>(mmio_dispatch_write));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // NOP sled: VEH patches to CALL rel32 on first MMIO fault.
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    emit_fastmem_op(e, guest_enc, size_bits, is_load);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip,
+                   is_load ? SP_READ : SP_WRITE,
+                   guest_enc, (uint8_t)(size_bits / 8), skip_len, save_flags, 0);
     return true;
 }
 
@@ -553,25 +541,15 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
     if (!emit_ea_to_r14(e, mem_op)) return false;
     emit_paging_translate(e, /*is_write=*/true);
 
-    if (!e.slow_path) {
-        // Fast path: single instruction; VEH intercepts faults and sets bitmap.
-        e.add_mem_site(e.fault_eip);
-        if (size_bits == 32)     emit_fastmem_store_imm32(e, imm);
-        else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
-        else                     emit_fastmem_store_imm8(e, (uint8_t)imm);
-    } else {
-        // Slow path: full MMIO dispatch call.
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, imm);           // arg2 = value (not gp index)
-        emit_ccall_arg3_imm(e, size_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // NOP sled: VEH patches to CALL rel32 on first MMIO fault.
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    if (size_bits == 32)      emit_fastmem_store_imm32(e, imm);
+    else if (size_bits == 16) emit_fastmem_store_imm16(e, (uint16_t)imm);
+    else                      emit_fastmem_store_imm8(e, (uint8_t)imm);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip,
+                   SP_WRITE_IMM, 0, (uint8_t)(size_bits / 8), skip_len, save_flags, imm);
     return true;
 }
 
@@ -888,18 +866,13 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
     if (esp_in_reg) emit_load_esp_to_r8(e);
 
-    if (!e.slow_path) {
-        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
-        if (save_flags) emit_save_flags(e);
-        e.add_mem_site(e.fault_eip);
-        if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
-        if (esp_is_dst_mem) emit_store_r8_to_esp(e);
-        if (save_flags) emit_restore_flags(e);
-    } else {
-        // Slow path: MMIO not supported for ALU-mem — UD2 trap
-        e.add_mem_site(e.fault_eip);
-        e.emit8(0x0F); e.emit8(0x0B); // UD2
-    }
+    // ALU-mem MMIO is not supported (SP_NONE); VEH will log and crash.
+    if (save_flags) emit_save_flags(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+    if (esp_is_dst_mem) emit_store_r8_to_esp(e);
+    e.add_mem_site(insn_start, e.fault_eip, SP_NONE, 0, 0, 0, false, 0);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -952,16 +925,11 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
     if (esp_in_reg) emit_load_esp_to_r8(e);
 
-    if (!e.slow_path) {
-        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
-        e.add_mem_site(e.fault_eip);
-        if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
-        if (esp_in_reg) emit_store_r8_to_esp(e);
-    } else {
-        // Slow path: MMIO not supported for SETcc/CMOVcc — UD2 trap
-        e.add_mem_site(e.fault_eip);
-        e.emit8(0x0F); e.emit8(0x0B); // UD2
-    }
+    // SETcc/CMOVcc mem MMIO is not supported (SP_NONE); VEH will log and crash.
+    uint32_t insn_start = (uint32_t)e.pos;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw, esp_in_reg)) return false;
+    if (esp_in_reg) emit_store_r8_to_esp(e);
+    e.add_mem_site(insn_start, e.fault_eip, SP_NONE, 0, 0, 0, false, 0);
     return true;
 }
 
@@ -1025,17 +993,12 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
-        if (save_flags) emit_save_flags(e);
-        e.add_mem_site(e.fault_eip);
-        if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
-        if (save_flags) emit_restore_flags(e);
-    } else {
-        // Slow path: UD2
-        e.add_mem_site(e.fault_eip);
-        e.emit8(0x0F); e.emit8(0x0B); // UD2
-    }
+    // TEST-mem MMIO is not supported (SP_NONE); VEH will log and crash.
+    if (save_flags) emit_save_flags(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    e.add_mem_site(insn_start, e.fault_eip, SP_NONE, 0, 0, 0, false, 0);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -1052,21 +1015,12 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_store_imm32(e, imm);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, imm);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write_imm));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        emit_nop_sled(e);
+        uint32_t insn_start = (uint32_t)e.pos;
+        emit_fastmem_store_imm32(e, imm);
+        uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+        e.add_mem_site(insn_start, e.fault_eip,
+                       SP_WRITE_IMM, 0, 4, skip_len, save_flags, imm);
         return true;
     }
 
@@ -1092,21 +1046,12 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/true);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_op(e, reg_enc, 32, false);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, reg_enc);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_write));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        emit_nop_sled(e);
+        uint32_t insn_start = (uint32_t)e.pos;
+        emit_fastmem_op(e, reg_enc, 32, false);
+        uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+        e.add_mem_site(insn_start, e.fault_eip,
+                       SP_WRITE, reg_enc, 4, skip_len, save_flags, 0);
         return true;
     }
 
@@ -1153,21 +1098,12 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
         emit_load_esp_to_r14(e);
         emit_paging_translate(e, /*is_write=*/false);
 
-        if (!e.slow_path) {
-            e.add_mem_site(e.fault_eip);
-            emit_fastmem_op(e, reg_enc, 32, true);
-        } else {
-            e.add_mem_site(e.fault_eip);
-            if (save_flags) emit_save_flags(e);
-            emit_save_all_gp(e);
-            emit_ccall_arg0_ctx(e);
-            emit_ccall_arg1_pa(e);
-            emit_ccall_arg2_imm(e, reg_enc);
-            emit_ccall_arg3_imm(e, 4);
-            emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-            emit_load_all_gp(e);
-            if (save_flags) emit_restore_flags(e);
-        }
+        emit_nop_sled(e);
+        uint32_t insn_start = (uint32_t)e.pos;
+        emit_fastmem_op(e, reg_enc, 32, true);
+        uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+        e.add_mem_site(insn_start, e.fault_eip,
+                       SP_READ, reg_enc, 4, skip_len, save_flags, 0);
         emit_add_ctx_esp(e, 4);
         return true;
     }
@@ -1243,21 +1179,12 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     emit_load_esp_to_r14(e);
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_op(e, GP_EBP, 32, true);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, GP_EBP);
-        emit_ccall_arg3_imm(e, 4);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    emit_fastmem_op(e, GP_EBP, 32, true);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip,
+                   SP_READ, GP_EBP, 4, skip_len, save_flags, 0);
     emit_add_ctx_esp(e, 4);
     return true;
 }
@@ -1409,22 +1336,16 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
-        if (esp_dst) emit_store_r8_to_esp(e);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, dst_enc);
-        emit_ccall_arg3_imm(e, src_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // NOP sled: VEH patches to CALL rel32 on first MMIO fault.
+    // When esp_dst=true the NOP sled skips both the MOVZX and the
+    // following emit_store_r8_to_esp (4 bytes) so skip_len covers both.
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    emit_fastmem_movzx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip,
+                   SP_READ, dst_enc, (uint8_t)(src_bits / 8), skip_len, save_flags, 0);
     return true;
 }
 
@@ -1455,22 +1376,15 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (!emit_ea_to_r14(e, ops[1])) return false;
     emit_paging_translate(e, /*is_write=*/false);
 
-    if (!e.slow_path) {
-        e.add_mem_site(e.fault_eip);
-        emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
-        if (esp_dst) emit_store_r8_to_esp(e);
-    } else {
-        e.add_mem_site(e.fault_eip);
-        if (save_flags) emit_save_flags(e);
-        emit_save_all_gp(e);
-        emit_ccall_arg0_ctx(e);
-        emit_ccall_arg1_pa(e);
-        emit_ccall_arg2_imm(e, dst_enc);
-        emit_ccall_arg3_imm(e, src_bits / 8);
-        emit_call_abs(e, reinterpret_cast<void*>(mmio_dispatch_read));
-        emit_load_all_gp(e);
-        if (save_flags) emit_restore_flags(e);
-    }
+    // NOP sled: VEH patches to CALL rel32 on first MMIO fault.
+    // When esp_dst=true skip_len covers both the MOVSX and emit_store_r8_to_esp.
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    emit_fastmem_movsx(e, dst_enc, src_bits, esp_dst);
+    if (esp_dst) emit_store_r8_to_esp(e);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip,
+                   SP_READ, dst_enc, (uint8_t)(src_bits / 8), skip_len, save_flags, 0);
     return true;
 }
 
@@ -1490,23 +1404,16 @@ bool emit_handler_fpu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         return true;
     }
 
-    // Memory form: compute EA, bounds check, rewrite for fastmem
+    // Memory form: compute EA, bounds check, rewrite for fastmem.
+    // FPU/SSE MMIO is not supported (SP_NONE); VEH will log and crash.
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/mem_idx == 0);
 
-    if (!e.slow_path) {
-        // Fast path: rewrite the instruction to use [R12+R14]; VEH handles faults.
-        if (save_flags) emit_save_flags(e);
-        e.add_mem_site(e.fault_eip);
-        if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) {
-            return false;
-        }
-        if (save_flags) emit_restore_flags(e);
-    } else {
-        // Slow path: MMIO not supported for FPU — UD2 trap (unreachable in practice)
-        e.add_mem_site(e.fault_eip);
-        e.emit8(0x0F); e.emit8(0x0B); // UD2
-    }
+    if (save_flags) emit_save_flags(e);
+    uint32_t insn_start = (uint32_t)e.pos;
+    if (!emit_rewrite_mem_to_fastmem(e, insn, raw)) return false;
+    e.add_mem_site(insn_start, e.fault_eip, SP_NONE, 0, 0, 0, false, 0);
+    if (save_flags) emit_restore_flags(e);
     return true;
 }
 
@@ -1592,8 +1499,12 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             emit_sub_ctx_esp(e, 4);
             emit_load_esp_to_r14(e);
             emit_paging_translate(e, /*is_write=*/true);
-            e.add_mem_site(e.fault_eip);
+            emit_nop_sled(e);
+            uint32_t insn_start = (uint32_t)e.pos;
             emit_fastmem_store_imm32(e, pc_after);
+            uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+            e.add_mem_site(insn_start, e.fault_eip,
+                           SP_WRITE_IMM, 0, 4, skip_len, false, pc_after);
             emit_epilog_static(e, target);  // ends with RET
             return;
         }
@@ -1603,8 +1514,12 @@ void TraceBuilder::emit_call_exit(Emitter& e,
                 emit_sub_ctx_esp(e, 4);
                 emit_load_esp_to_r14(e);
                 emit_paging_translate(e, /*is_write=*/true);
-                e.add_mem_site(e.fault_eip);
+                emit_nop_sled(e);
+                uint32_t insn_start = (uint32_t)e.pos;
                 emit_fastmem_store_imm32(e, pc_after);
+                uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+                e.add_mem_site(insn_start, e.fault_eip,
+                               SP_WRITE_IMM, 0, 4, skip_len, false, pc_after);
                 emit_epilog_dynamic(e, enc);  // ends with RET
                 return;
             }
@@ -1643,12 +1558,15 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     // Step 2: R14D = ctx->esp (ESP was never in a host register; read from ctx).
     emit_load_esp_to_r14(e);
 
-    // Step 3: fastmem load.
+    // Step 3: fastmem load with NOP sled.
     emit_paging_translate(e, /*is_write=*/false);
     // EAX = [R12 + R14]  — return address from guest stack.
-    // VEH handles any fault (stack in unmapped page — shouldn't happen in practice).
-    e.add_mem_site(e.fault_eip);
+    // VEH can patch NOP sled to CALL rel32 → slow-path stub on MMIO fault.
+    emit_nop_sled(e);
+    uint32_t insn_start = (uint32_t)e.pos;
     emit_fastmem_op(e, GP_EAX, 32, true);
+    uint8_t skip_len = (uint8_t)((uint32_t)e.pos - insn_start);
+    e.add_mem_site(insn_start, e.fault_eip, SP_READ, GP_EAX, 4, skip_len, false, 0);
 
     // Step 4: ctx->esp += 4.
     emit_add_ctx_esp(e, 4);
@@ -1672,7 +1590,7 @@ static constexpr size_t MAX_TRACE_BYTES = 8192;
 static constexpr size_t MAX_INSN_COUNT  = 512;
 
 // Arithmetic flags clobbered by the inline SUB/ADD ctx->gp[ESP] in
-// PUSH/POP sequences and by slow-path MMIO CALL sequences.
+// PUSH/POP sequences and by MMIO slow-path CALL sequences in generated stubs.
 static constexpr uint32_t ARITH_FLAGS =
     ZYDIS_CPUFLAG_CF | ZYDIS_CPUFLAG_PF | ZYDIS_CPUFLAG_AF |
     ZYDIS_CPUFLAG_ZF | ZYDIS_CPUFLAG_SF | ZYDIS_CPUFLAG_OF;
@@ -1681,8 +1599,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             const uint8_t*      ram,
                             CodeCache&          cc,
                             TraceArena&         arena,
-                            GuestContext*       ctx,
-                            const FaultBitmaps* fb) {
+                            GuestContext*       ctx) {
     constexpr uint32_t ram_size = GUEST_RAM_SIZE;
     if (guest_eip >= ram_size) {
         fprintf(stderr, "[trace] EIP %08X outside RAM\n", guest_eip);
@@ -1728,10 +1645,10 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             }
 
             InsnClassFlags icf = lookup_flags(insn.mnemonic);
-            // In the 4GB fastmem model, bare fastmem ops don't clobber flags.
-            // Only slow-path CALL sequences (bitmap-set instructions) do.
-            bool dispatch = (icf & ICF_HAS_DISPATCH) != 0 &&
-                            fb && fb->test(scan_guest_pc);
+            // Instructions with ICF_HAS_DISPATCH may clobber flags via the
+            // SUB/ADD ESP sequences in PUSH/POP, or when the NOP sled is
+            // patched to a CALL that invokes an MMIO stub.
+            bool dispatch = (icf & ICF_HAS_DISPATCH) != 0;
 
             meta[n_insns++] = { insn.length, tested, written, dispatch, false };
 
@@ -1797,9 +1714,6 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         uint32_t pc_after = guest_pc + insn.length;
         e.fault_eip = guest_pc; // for paging fault exit stubs
-        // Set slow_path flag: if the bitmap says this guest PA faulted before,
-        // the handler will emit a full MMIO CALL instead of a bare fastmem op.
-        e.slow_path = fb && fb->test(guest_pc);
 
         // Look up the instruction's class via O(1) dispatch table
         InsnClassFlags icf = lookup_flags(insn.mnemonic);
@@ -1988,8 +1902,86 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
     // Transfer memory-op site table from emitter to trace (for VEH lookup).
     t->num_mem_sites = 0;
-    for (int i = 0; i < e.num_mem_sites; ++i)
-        t->add_mem_site(e.mem_sites[i].host_offset, e.mem_sites[i].guest_eip);
+    for (int i = 0; i < e.num_mem_sites; ++i) {
+        const auto& ms = e.mem_sites[i];
+        t->add_mem_site(ms.host_offset, ms.guest_eip,
+                        ms.sp_kind, ms.sp_reg_enc, ms.sp_size,
+                        ms.skip_len, ms.sp_save_flags, ms.sp_imm);
+    }
 
     return t;
+}
+
+// ---------------------------------------------------------------------------
+// generate_slow_path_stub — emit a slow-path MMIO dispatch stub.
+//
+// The stub is called via CALL rel32 patched over the 5-byte NOP sled that
+// precedes the faulting fastmem instruction.  On entry:
+//   [RSP]  = return address = address of fastmem instruction in JIT code
+//   R13    = GuestContext*
+//   R14D   = physical address of the memory operation (set by paging_translate
+//            or by the EA→R14 sequence before the NOP sled)
+//   host GP registers = current guest register values
+//
+// The stub:
+//   1. (optional) PUSHFQ + LEA RSP,[RSP-8]  — save guest EFLAGS
+//   2. save_all_gp: 7 MOV [R13+off], reg    — save GP regs to ctx
+//   3. Set C call args: arg0=R13(ctx), arg1=R14D(PA), arg2=reg/imm, arg3=size
+//   4. Windows shadow space + MOVABS + CALL  — call MMIO helper
+//   5. load_all_gp: 7 MOV reg, [R13+off]    — restore GP regs from ctx
+//   6. (optional) LEA RSP,[RSP+8] + POPFQ   — restore guest EFLAGS
+//   7. ADD QWORD PTR [RSP], skip_len         — skip fastmem insn on return
+//   8. RET
+//
+// Returns bytes written, or 0 on failure.
+// ---------------------------------------------------------------------------
+size_t generate_slow_path_stub(uint8_t* buf, size_t cap,
+                                const Trace::MemOpSite& site) {
+    if (site.sp_kind == SP_NONE) return 0;
+
+    Emitter e(buf, cap);
+
+    if (site.sp_save_flags) emit_save_flags(e);
+
+    emit_save_all_gp(e);
+
+    emit_ccall_arg0_ctx(e);    // arg0 = ctx (R13)
+    emit_ccall_arg1_pa(e);     // arg1 = PA  (R14D)
+
+    void* helper = nullptr;
+    switch (site.sp_kind) {
+    case SP_READ:
+        emit_ccall_arg2_imm(e, site.sp_reg_enc);
+        emit_ccall_arg3_imm(e, site.sp_size);
+        helper = reinterpret_cast<void*>(mmio_dispatch_read);
+        break;
+    case SP_WRITE:
+        emit_ccall_arg2_imm(e, site.sp_reg_enc);
+        emit_ccall_arg3_imm(e, site.sp_size);
+        helper = reinterpret_cast<void*>(mmio_dispatch_write);
+        break;
+    case SP_WRITE_IMM:
+        emit_ccall_arg2_imm(e, site.sp_imm);
+        emit_ccall_arg3_imm(e, site.sp_size);
+        helper = reinterpret_cast<void*>(mmio_dispatch_write_imm);
+        break;
+    default:
+        return 0;
+    }
+
+    emit_call_abs(e, helper);
+
+    emit_load_all_gp(e);
+
+    if (site.sp_save_flags) emit_restore_flags(e);
+
+    // Advance the return address (at [RSP]) past the fastmem instruction and
+    // any trailing bytes that must be skipped (e.g. emit_store_r8_to_esp).
+    // ADD QWORD PTR [RSP], skip_len: REX.W(1) 83(1) /0 04 24(2) imm8(1) = 5 bytes
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0x04); e.emit8(0x24);
+    e.emit8(site.skip_len);
+
+    e.emit8(0xC3); // RET
+
+    return e.pos;
 }

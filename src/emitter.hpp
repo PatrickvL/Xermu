@@ -1,5 +1,6 @@
 #pragma once
 #include "context.hpp"
+#include "trace.hpp"
 #include <cstdint>
 #include <cstring>
 #include <cassert>
@@ -15,7 +16,6 @@ struct Emitter {
     size_t   cap;
     bool     paging   = false; // true when CR0.PG is set at build time
     uint32_t fault_eip = 0;    // guest EIP for #PF exit on translate fault
-    bool     slow_path = false; // true when fault bitmap says this insn needs MMIO slow path
 
     // Pending link slots collected during trace emission.
     // Transferred to the Trace after building.
@@ -28,17 +28,30 @@ struct Emitter {
     int num_pending_links = 0;
 
     // Memory-op site table: accumulated during emit, transferred to Trace.
+    // host_offset is provided explicitly by the caller (offset of the fastmem insn).
     struct MemSite {
-        uint32_t host_offset;
-        uint32_t guest_eip;
+        uint32_t     host_offset;
+        uint32_t     guest_eip;
+        SlowPathKind sp_kind;
+        uint8_t      sp_reg_enc;
+        uint8_t      sp_size;
+        uint8_t      skip_len;
+        bool         sp_save_flags;
+        uint32_t     sp_imm;
     };
     static constexpr int MAX_MEM_SITES = 64;
     MemSite mem_sites[MAX_MEM_SITES] = {};
     int num_mem_sites = 0;
 
-    void add_mem_site(uint32_t guest_eip_val) {
+    // Record a mem_site at host_off (caller must compute this as e.pos before
+    // the fastmem instruction is emitted).
+    void add_mem_site(uint32_t host_off, uint32_t geip,
+                      SlowPathKind kind = SP_NONE, uint8_t reg_enc = 0,
+                      uint8_t size = 0, uint8_t skip = 0,
+                      bool save_flags = false, uint32_t imm = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { (uint32_t)pos, guest_eip_val };
+            mem_sites[num_mem_sites++] = { host_off, geip, kind, reg_enc,
+                                           size, skip, save_flags, imm };
     }
 
     void add_pending_link(uint8_t* site, uint32_t target) {
@@ -76,6 +89,14 @@ struct Emitter {
         memcpy(site, &delta, 4);
     }
 };
+
+// Emit a 5-byte NOP sled (five 0x90 single-byte NOPs) immediately before a
+// patchable fastmem instruction.  The VEH patches this sled to CALL rel32
+// (0xE8 + 4-byte offset) on the first MMIO fault, redirecting to a generated
+// slow-path stub without rebuilding the trace.
+inline void emit_nop_sled(Emitter& e) {
+    e.emit8(0x90); e.emit8(0x90); e.emit8(0x90); e.emit8(0x90); e.emit8(0x90);
+}
 
 // ---------------------------------------------------------------------------
 // x86-64 REX prefix constants (0x40 | W<<3 | R<<2 | X<<1 | B)
