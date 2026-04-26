@@ -24,17 +24,25 @@ extern "C" {
 
 void mmio_dispatch_read(GuestContext* ctx, uint32_t pa,
                         uint32_t dst_gp_idx, uint32_t size_bytes) {
+    uint32_t val;
     if (pa < GUEST_RAM_SIZE) {
         // Direct RAM access (site was patched on prior MMIO fault for this EIP,
         // but this execution's PA happens to land in RAM).
-        uint32_t val = 0;
+        val = 0;
         memcpy(&val, reinterpret_cast<uint8_t*>(ctx->fastmem_base) + pa, size_bytes);
-        ctx->gp[dst_gp_idx] = val;
     } else if (ctx->mmio) {
-        ctx->gp[dst_gp_idx] = ctx->mmio->read(pa, size_bytes);
+        val = ctx->mmio->read(pa, size_bytes);
     } else {
-        ctx->gp[dst_gp_idx] = MmioMap::BUS_FLOAT;
+        val = MmioMap::BUS_FLOAT;
     }
+    // Merge into the destination register, preserving upper bytes for sub-32-bit
+    // reads (e.g. MOV AL,[mem] must not clobber AH or bits 16-31).
+    if (size_bytes == 1)
+        ctx->gp[dst_gp_idx] = (ctx->gp[dst_gp_idx] & 0xFFFFFF00u) | (val & 0xFFu);
+    else if (size_bytes == 2)
+        ctx->gp[dst_gp_idx] = (ctx->gp[dst_gp_idx] & 0xFFFF0000u) | (val & 0xFFFFu);
+    else
+        ctx->gp[dst_gp_idx] = val;
 }
 
 void mmio_dispatch_write(GuestContext* ctx, uint32_t pa,

@@ -800,6 +800,286 @@ void Executor::handle_privileged() {
         return;
     }
 
+    // LES/LDS r32, m16:32 — load far pointer.
+    // C4/C5 opcodes are VEX prefix in 64-bit mode, so these can't be
+    // clean-copied by the JIT.  In Xbox flat mode the segment value is
+    // irrelevant; just load the 32-bit offset into the register and
+    // store the 16-bit segment selector into ES/DS.
+    case ZYDIS_MNEMONIC_LES:
+    case ZYDIS_MNEMONIC_LDS: {
+        // ops[0] = register destination, ops[1] = memory source (m16:32)
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            uint8_t dst_enc;
+            if (!reg32_enc(ops[0].reg.value, dst_enc)) {
+                fprintf(stderr, "[exec] LES/LDS bad reg at EIP=%08X\n", ctx.eip);
+                ctx.halted = true;
+                return;
+            }
+            uint32_t ea = compute_ea(ops[1], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
+            }
+            // Read 6 bytes: 4-byte offset + 2-byte selector
+            uint32_t offset = 0;
+            uint16_t sel    = 0;
+            if (pa + 6 <= GUEST_RAM_SIZE) {
+                memcpy(&offset, ram + pa, 4);
+                memcpy(&sel,    ram + pa + 4, 2);
+            } else if (ctx.mmio) {
+                offset = ctx.mmio->read(pa, 4);
+                sel    = (uint16_t)ctx.mmio->read(pa + 4, 2);
+            }
+            ctx.gp[dst_enc] = offset;
+            if (insn.mnemonic == ZYDIS_MNEMONIC_LES)
+                ctx.es_sel = sel;
+            else
+                ctx.ds_sel = sel;
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    // ---- BCD instructions: invalid in 64-bit long mode ----
+
+    case ZYDIS_MNEMONIC_DAA: {
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint32_t ef = ctx.eflags;
+        bool old_cf = (ef & 1) != 0;
+        bool old_af = (ef & 0x10) != 0;
+        ef &= ~1u; // clear CF
+        if ((al & 0x0F) > 9 || old_af) {
+            al += 6;
+            ef |= 0x10; // AF
+            if (old_cf || al < 6) ef |= 1; // CF
+        } else {
+            ef &= ~0x10u;
+        }
+        if (al > 0x9F || old_cf) {
+            al += 0x60;
+            ef |= 1; // CF
+        }
+        // SF/ZF/PF
+        ef &= ~(0x80u | 0x40u | 0x04u);
+        if (al == 0) ef |= 0x40;
+        if (al & 0x80) ef |= 0x80;
+        { uint8_t p = al; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+          if (!(p & 1)) ef |= 0x04; }
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFu) | al;
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_DAS: {
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint32_t ef = ctx.eflags;
+        bool old_cf = (ef & 1) != 0;
+        bool old_af = (ef & 0x10) != 0;
+        ef &= ~1u;
+        if ((al & 0x0F) > 9 || old_af) {
+            uint8_t new_al = al - 6;
+            ef |= 0x10;
+            if (old_cf || al < 6) ef |= 1;
+            al = new_al;
+        } else {
+            ef &= ~0x10u;
+        }
+        if (al > 0x9F || old_cf) {
+            al -= 0x60;
+            ef |= 1;
+        }
+        ef &= ~(0x80u | 0x40u | 0x04u);
+        if (al == 0) ef |= 0x40;
+        if (al & 0x80) ef |= 0x80;
+        { uint8_t p = al; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+          if (!(p & 1)) ef |= 0x04; }
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFu) | al;
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_AAA: {
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint8_t ah = (uint8_t)(ctx.gp[GP_EAX] >> 8);
+        uint32_t ef = ctx.eflags;
+        if ((al & 0x0F) > 9 || (ef & 0x10)) {
+            al += 6;
+            ah += 1;
+            ef |= 0x11; // AF + CF
+        } else {
+            ef &= ~0x11u;
+        }
+        al &= 0x0F;
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFFFu) | al | ((uint32_t)ah << 8);
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_AAS: {
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint8_t ah = (uint8_t)(ctx.gp[GP_EAX] >> 8);
+        uint32_t ef = ctx.eflags;
+        if ((al & 0x0F) > 9 || (ef & 0x10)) {
+            al -= 6;
+            ah -= 1;
+            ef |= 0x11;
+        } else {
+            ef &= ~0x11u;
+        }
+        al &= 0x0F;
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFFFu) | al | ((uint32_t)ah << 8);
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_AAM: {
+        // AAM imm8 (default base = 10)
+        uint8_t base = 10;
+        if (insn.operand_count_visible >= 1 &&
+            ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            base = (uint8_t)ops[0].imm.value.u;
+        if (base == 0) {
+            deliver_interrupt(0, ctx.eip); // #DE
+            return;
+        }
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint8_t ah = al / base;
+        al = al % base;
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFFFu) | al | ((uint32_t)ah << 8);
+        // SF/ZF/PF on AL
+        uint32_t ef = ctx.eflags & ~(0x80u | 0x40u | 0x04u);
+        if (al == 0) ef |= 0x40;
+        if (al & 0x80) ef |= 0x80;
+        { uint8_t p = al; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+          if (!(p & 1)) ef |= 0x04; }
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_AAD: {
+        uint8_t base = 10;
+        if (insn.operand_count_visible >= 1 &&
+            ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            base = (uint8_t)ops[0].imm.value.u;
+        uint8_t al = (uint8_t)ctx.gp[GP_EAX];
+        uint8_t ah = (uint8_t)(ctx.gp[GP_EAX] >> 8);
+        al = (uint8_t)(ah * base + al);
+        ah = 0;
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFFFu) | al;
+        uint32_t ef = ctx.eflags & ~(0x80u | 0x40u | 0x04u);
+        if (al == 0) ef |= 0x40;
+        if (al & 0x80) ef |= 0x80;
+        { uint8_t p = al; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+          if (!(p & 1)) ef |= 0x04; }
+        ctx.eflags = ef;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_SALC:
+        // SALC (D6): set AL to 0xFF if CF set, 0x00 otherwise.
+        ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFFu) |
+                          ((ctx.eflags & 1) ? 0xFF : 0x00);
+        ctx.eip += insn.length;
+        return;
+
+    case ZYDIS_MNEMONIC_PUSHA:
+    case ZYDIS_MNEMONIC_PUSHAD: {
+        // PUSHAD: push EAX, ECX, EDX, EBX, original ESP, EBP, ESI, EDI
+        uint32_t sp = ctx.gp[GP_ESP];
+        uint32_t orig_esp = sp;
+        auto push32 = [&](uint32_t val) {
+            sp -= 4;
+            uint32_t pa = sp;
+            if (paging_enabled()) {
+                pa = translate_va(sp, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
+            }
+            if (pa < GUEST_RAM_SIZE) memcpy(ram + pa, &val, 4);
+            else if (ctx.mmio) ctx.mmio->write(pa, val, 4);
+        };
+        push32(ctx.gp[GP_EAX]);
+        push32(ctx.gp[GP_ECX]);
+        push32(ctx.gp[GP_EDX]);
+        push32(ctx.gp[GP_EBX]);
+        push32(orig_esp);
+        push32(ctx.gp[GP_EBP]);
+        push32(ctx.gp[GP_ESI]);
+        push32(ctx.gp[GP_EDI]);
+        ctx.gp[GP_ESP] = sp;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_POPA:
+    case ZYDIS_MNEMONIC_POPAD: {
+        // POPAD: pop EDI, ESI, EBP, skip ESP, EBX, EDX, ECX, EAX
+        uint32_t sp = ctx.gp[GP_ESP];
+        auto pop32 = [&]() -> uint32_t {
+            uint32_t pa = sp;
+            if (paging_enabled()) {
+                pa = translate_va(sp, false);
+                if (pa == ~0u) return 0;
+            }
+            uint32_t val = 0;
+            if (pa < GUEST_RAM_SIZE) memcpy(&val, ram + pa, 4);
+            else if (ctx.mmio) val = ctx.mmio->read(pa, 4);
+            sp += 4;
+            return val;
+        };
+        ctx.gp[GP_EDI] = pop32();
+        ctx.gp[GP_ESI] = pop32();
+        ctx.gp[GP_EBP] = pop32();
+        (void)pop32(); // skip ESP
+        ctx.gp[GP_EBX] = pop32();
+        ctx.gp[GP_EDX] = pop32();
+        ctx.gp[GP_ECX] = pop32();
+        ctx.gp[GP_EAX] = pop32();
+        ctx.gp[GP_ESP] = sp;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_BOUND:
+        // BOUND r32, m32&32: check array index.  Xbox code rarely uses this;
+        // for now, always pass (no #BR).
+        ctx.eip += insn.length;
+        return;
+
+    case ZYDIS_MNEMONIC_ARPL: {
+        // ARPL r/m16, r16: adjust RPL field.  Rarely used on Xbox.
+        // Just set ZF if source RPL > dest RPL.
+        uint16_t dst = 0, src = 0;
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (reg32_enc(ops[0].reg.value, enc)) dst = (uint16_t)ctx.gp[enc];
+        }
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            uint8_t enc;
+            if (reg32_enc(ops[1].reg.value, enc)) src = (uint16_t)ctx.gp[enc];
+        }
+        if ((dst & 3) < (src & 3)) {
+            dst = (dst & ~3u) | (src & 3);
+            ctx.eflags |= 0x40; // ZF
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                uint8_t enc;
+                if (reg32_enc(ops[0].reg.value, enc))
+                    ctx.gp[enc] = (ctx.gp[enc] & 0xFFFF0000u) | dst;
+            }
+        } else {
+            ctx.eflags &= ~0x40u;
+        }
+        ctx.eip += insn.length;
+        return;
+    }
+
     default:
         fprintf(stderr, "[exec] unhandled privileged mnem=%d at EIP=%08X\n",
                 insn.mnemonic, ctx.eip);

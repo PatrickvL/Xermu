@@ -235,6 +235,15 @@ inline void init_mnemonic_table() {
         ZYDIS_MNEMONIC_INT,    ZYDIS_MNEMONIC_INT3,   ZYDIS_MNEMONIC_INT1,
         ZYDIS_MNEMONIC_INTO,
         ZYDIS_MNEMONIC_SYSENTER, ZYDIS_MNEMONIC_SYSEXIT,
+        ZYDIS_MNEMONIC_LES,    ZYDIS_MNEMONIC_LDS,    // C4/C5 are VEX in 64-bit
+        // BCD/obsolete instructions: invalid in 64-bit long mode, must be emulated.
+        ZYDIS_MNEMONIC_DAA,    ZYDIS_MNEMONIC_DAS,
+        ZYDIS_MNEMONIC_AAA,    ZYDIS_MNEMONIC_AAS,
+        ZYDIS_MNEMONIC_AAM,    ZYDIS_MNEMONIC_AAD,
+        ZYDIS_MNEMONIC_PUSHA,  ZYDIS_MNEMONIC_PUSHAD,
+        ZYDIS_MNEMONIC_POPA,   ZYDIS_MNEMONIC_POPAD,
+        ZYDIS_MNEMONIC_SALC,   ZYDIS_MNEMONIC_BOUND,
+        ZYDIS_MNEMONIC_ARPL,
     }) MNEMONIC_CLASS[m] = IC_PRIVILEGED;
 
     // ---- LEA — no memory access ----

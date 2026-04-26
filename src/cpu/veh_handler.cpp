@@ -17,7 +17,11 @@
 
 #ifdef _WIN32
 LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
-    if (!g_active_executor) return EXCEPTION_CONTINUE_SEARCH;
+    if (!g_active_executor) {
+        fprintf(stderr, "[veh] handler called but g_active_executor is null, code=0x%08lX\n",
+                ep->ExceptionRecord->ExceptionCode);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     auto  code = ep->ExceptionRecord->ExceptionCode;
     auto* ctx_regs = ep->ContextRecord;
@@ -79,6 +83,52 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    // -----------------------------------------------------------------------
+    // EXCEPTION_ILLEGAL_INSTRUCTION: JIT code may have emitted something the
+    // host CPU can't execute, or the guest has a UD2.  Diagnose + halt.
+    // -----------------------------------------------------------------------
+    if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+        auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
+        if (exec->cc.contains(rip)) {
+            fprintf(stderr, "[veh] ILLEGAL_INSTRUCTION in JIT code at RIP=%p bytes:",
+                    (void*)rip);
+            for (int i = 0; i < 16; ++i)
+                fprintf(stderr, " %02X", rip[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[veh]   R12(fastmem)=%p R13(ctx)=%p R14(EA)=0x%llX\n",
+                    (void*)(uintptr_t)ctx_regs->R12,
+                    (void*)(uintptr_t)ctx_regs->R13,
+                    (unsigned long long)ctx_regs->R14);
+            fprintf(stderr, "[veh]   RAX=0x%08X ECX=0x%08X EDX=0x%08X EBX=0x%08X\n",
+                    (uint32_t)ctx_regs->Rax, (uint32_t)ctx_regs->Rcx,
+                    (uint32_t)ctx_regs->Rdx, (uint32_t)ctx_regs->Rbx);
+            // Find the trace to get guest EIP
+            auto& tcache = exec->tcache;
+            for (size_t p = 0; p < TraceCache::L1_SIZE; ++p) {
+                auto* page = tcache.page_map[p];
+                if (!page) continue;
+                for (size_t s = 0; s < TraceCache::L2_SIZE; ++s) {
+                    Trace* t = page->slots[s];
+                    if (!t || !t->host_code) continue;
+                    if (rip >= t->host_code && rip < t->host_code + t->host_size) {
+                        fprintf(stderr, "[veh]   trace guest_eip=0x%08X host_off=%u\n",
+                                t->guest_eip, (uint32_t)(rip - t->host_code));
+                        break;
+                    }
+                }
+            }
+            // Set halt + redirect to exception_exit
+            auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
+            gctx->halted = true;
+            gctx->stop_reason = STOP_INVALID_OPCODE;
+            ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        fprintf(stderr, "[veh] ILLEGAL_INSTRUCTION outside code cache at RIP=%p\n",
+                (void*)rip);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     // Only handle access violations below this point.
     if (code != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -87,8 +137,13 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
 
     // Step 1: Is the fault within the fastmem window?
     auto base = (uintptr_t)exec->ctx.fastmem_base;
-    if (fault_addr < base || fault_addr >= base + 0x100000000ULL)
+    if (fault_addr < base || fault_addr >= base + 0x100000000ULL) {
+        fprintf(stderr, "[veh] AV outside fastmem: fault=0x%llX base=0x%llX RIP=%p access=%lld\n",
+                (unsigned long long)fault_addr, (unsigned long long)base,
+                (void*)(uintptr_t)ctx_regs->Rip,
+                (long long)ep->ExceptionRecord->ExceptionInformation[0]);
         return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Step 1b: SMC detection — write to a protected code page in RAM.
     // ExceptionInformation[0]: 0=read, 1=write, 8=DEP
@@ -102,10 +157,15 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
 
     // Step 2: Is the faulting RIP within our code cache?
     auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
-    if (!exec->cc.contains(rip))
+    if (!exec->cc.contains(rip)) {
+        fprintf(stderr, "[veh] AV in fastmem but RIP=%p outside code cache, PA=0x%08X access=%lld\n",
+                (void*)rip, guest_pa, (long long)access_type);
         return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Step 3: Find the trace containing RIP (linear scan — VEH is rare).
+    // Include invalid traces: host code is still in-cache and may have been
+    // executing when the fault occurred (e.g. after SMC invalidation).
     Trace* faulting_trace = nullptr;
     {
         auto& tcache = exec->tcache;
@@ -114,7 +174,7 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
             if (!page) continue;
             for (size_t s = 0; s < TraceCache::L2_SIZE; ++s) {
                 Trace* t = page->slots[s];
-                if (!t || !t->valid || !t->host_code) continue;
+                if (!t || !t->host_code) continue;
                 if (rip >= t->host_code && rip < t->host_code + t->host_size) {
                     faulting_trace = t;
                     break;
@@ -329,8 +389,9 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        // --- Arithmetic ALU: ADD/SUB [mem], reg/imm  or  reg, [mem] ---
-        if (mnem == ZYDIS_MNEMONIC_ADD || mnem == ZYDIS_MNEMONIC_SUB) {
+        // --- Arithmetic ALU: ADD/SUB/ADC/SBB [mem], reg/imm  or  reg, [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_ADD || mnem == ZYDIS_MNEMONIC_SUB ||
+            mnem == ZYDIS_MNEMONIC_ADC || mnem == ZYDIS_MNEMONIC_SBB) {
             uint32_t mem_val = mmio->read(mmio_pa, op_size);
             bool mem_is_dst = (hops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
             uint32_t a, b;
@@ -344,14 +405,33 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
                 a = read_reg(hops[0].reg.value, op_size);
                 b = mem_val;
             }
+            uint32_t carry = (ctx_regs->EFlags & 0x01u); // current CF
             uint32_t result;
             uint32_t fl;
             if (mnem == ZYDIS_MNEMONIC_ADD) {
                 result = a + b;
                 fl = compute_add_flags(a, b, op_size);
-            } else {
+            } else if (mnem == ZYDIS_MNEMONIC_ADC) {
+                uint64_t sum = (uint64_t)a + b + carry;
+                result = (uint32_t)sum;
+                fl = compute_logical_flags(result, op_size);
+                unsigned bits = op_size * 8;
+                if (sum >> bits) fl |= 0x01; // CF
+                uint32_t sign_mask = 1u << (bits - 1);
+                if (~(a ^ b) & (a ^ result) & sign_mask) fl |= 0x800; // OF
+                if ((a ^ b ^ result) & 0x10) fl |= 0x10; // AF
+            } else if (mnem == ZYDIS_MNEMONIC_SUB) {
                 result = a - b;
                 fl = compute_sub_flags(a, b, op_size);
+            } else { // SBB
+                uint64_t diff = (uint64_t)a - b - carry;
+                result = (uint32_t)diff;
+                fl = compute_logical_flags(result, op_size);
+                unsigned bits = op_size * 8;
+                if (a < (uint64_t)b + carry) fl |= 0x01; // CF (borrow)
+                uint32_t sign_mask = 1u << (bits - 1);
+                if ((a ^ b) & (a ^ result) & sign_mask) fl |= 0x800; // OF
+                if ((a ^ b ^ result) & 0x10) fl |= 0x10; // AF
             }
             set_status_flags(fl);
             if (mem_is_dst)
@@ -485,10 +565,12 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — unhandled non-patchable op (mnemonic=%d)\n",
                 site->guest_eip, (int)mnem);
         // Set halt flag and stop_reason so the run loop can terminate cleanly.
+        // Redirect to exception_exit stub to stop immediately (avoiding
+        // cascading faults from subsequent instructions in this trace).
         exec->ctx.halted = true;
         exec->ctx.stop_reason = STOP_INVALID_OPCODE;
         exec->ctx.next_eip = site->guest_eip;
-        ctx_regs->Rip += hinsn.length; // skip past the faulting instruction
+        ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
