@@ -1715,8 +1715,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, pc, avail, &insn, ops);
         if (!ZYAN_SUCCESS(st)) {
-            fprintf(stderr, "[trace] decode error at %08X (st=%08X)\n", guest_pc, st);
-            emit_epilog_static(e, guest_pc);
+            // Undecodable instruction → #UD.
+            emit_save_all_gp(e);
+            emit_save_eflags(e);
+            emit_write_next_eip_imm(e, guest_pc);
+            emit_set_stop_reason(e, STOP_INVALID_OPCODE);
+            e.emit8(0xC3);
             break;
         }
 
@@ -1824,6 +1828,17 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             break;
         }
 
+        // ---- UD2: intentional #UD ----
+        if (insn.mnemonic == ZYDIS_MNEMONIC_UD2) {
+            emit_save_all_gp(e);
+            emit_save_eflags(e);
+            emit_write_next_eip_imm(e, guest_pc);
+            emit_set_stop_reason(e, STOP_INVALID_OPCODE);
+            e.emit8(0xC3);
+            done_flag = true;
+            goto advance;
+        }
+
         // ---- Privileged ----
         if (icf & ICF_PRIVILEGED) {
             emit_save_all_gp(e);
@@ -1863,9 +1878,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             if (ic && ic->handler) {
                 bool save = (insn_idx < n_insns) && meta[insn_idx].need_save;
                 if (!ic->handler(e, insn, ops, pc, ctx, save)) {
-                    fprintf(stderr, "[trace] unsupported insn mnem=%d at %08X\n",
-                            insn.mnemonic, guest_pc);
-                    emit_epilog_static(e, guest_pc);
+                    // Handler rejected this form → #UD.
+                    emit_save_all_gp(e);
+                    emit_save_eflags(e);
+                    emit_write_next_eip_imm(e, guest_pc);
+                    emit_set_stop_reason(e, STOP_INVALID_OPCODE);
+                    e.emit8(0xC3);
                     done_flag = true;
                 }
                 goto advance;

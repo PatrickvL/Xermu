@@ -1730,6 +1730,13 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             continue;
         }
 
+        // Invalid opcode (#UD, vector 6): trace builder couldn't translate.
+        if (ctx.stop_reason == STOP_INVALID_OPCODE) {
+            prev_trace = nullptr;
+            deliver_interrupt(6, ctx.eip);
+            continue;
+        }
+
         // Check for HALT condition (EIP == 0xFFFFFFFF or out of RAM).
         if (ctx.eip == 0xFFFF'FFFFu || ctx.eip >= GUEST_RAM_SIZE) {
             fprintf(stderr, "[exec] EIP=%08X out of range — halting\n", ctx.eip);

@@ -1890,6 +1890,22 @@ non-Xbox test harness to provide a read/write backing store.
 Test: `tests/mmio_alu.asm` — 14 assertions exercising OR, AND, XOR, TEST, ADD,
 SUB, INC, DEC, NOT, NEG, BTS, BTR, CMP on MMIO registers.
 
+#### 5.26 #UD (Invalid Opcode) Exception Delivery ✅ DONE
+
+Guest UD2 and any instruction the trace builder cannot translate now raise #UD
+(vector 6) instead of crashing or looping:
+
+- **UD2**: Recognized at trace-build time; emits `STOP_INVALID_OPCODE` exit.
+- **Decode failure**: Undecodable bytes emit `STOP_INVALID_OPCODE` exit.
+- **Handler rejection**: When a dispatch handler returns false (unsupported
+  operand form), emits `STOP_INVALID_OPCODE` exit instead of `emit_epilog_static`.
+- **Run loop**: `STOP_INVALID_OPCODE` → `deliver_interrupt(6, ctx.eip)`.
+
+`StopReason` enum: `STOP_INVALID_OPCODE = 4`.
+
+Test: `tests/ud2.asm` — UD2 fires guest #UD ISR which increments a counter and
+resumes past the faulting instruction via IRETD.
+
 ---
 
 ## 6. Bugs Fixed During Development
