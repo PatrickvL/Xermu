@@ -9,6 +9,7 @@
 
 #include "cpu/executor.hpp"
 #include "xbox/xbox.hpp"
+#include "xbox/pe_loader.hpp"
 #include "xbox/hle/hle_kernel.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -23,13 +24,15 @@ namespace xbox {
 // BootConfig — describes what to boot and how.
 // ---------------------------------------------------------------------------
 struct BootConfig {
-    std::string xbe_path;     // XBE file to load (HLE mode)
+    std::string xbe_path;     // XBE file to load (HLE or LLE-kernel mode)
     std::string bios_path;    // BIOS image for LLE boot
     std::string mcpx_path;    // optional MCPX ROM for LLE boot
     std::string xiso_path;    // XISO image to mount as D:
+    std::string kernel_path;  // xboxkrnl.exe for LLE-kernel mode
 
-    bool is_hle()  const { return !xbe_path.empty(); }
+    bool is_hle()  const { return !xbe_path.empty() && kernel_path.empty(); }
     bool is_lle()  const { return !bios_path.empty(); }
+    bool is_lle_kernel() const { return !xbe_path.empty() && !kernel_path.empty(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +223,134 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
 
     sys.entry_eip = sys.exec->ctx.eip;
     sys.running = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// boot_lle_kernel — load the real xboxkrnl.exe as a PE, then load an XBE
+// and resolve its kernel thunks against the real kernel's export table.
+// Ordinals not found in the kernel fall back to HLE stubs.
+// Returns false on error; fills sys.entry_eip on success.
+// ---------------------------------------------------------------------------
+inline bool boot_lle_kernel(XboxSystem& sys, const BootConfig& cfg,
+                            std::function<void(const char*)> log = nullptr)
+{
+    auto say = [&](const char* msg) { if (log) log(msg); else fprintf(stderr, "%s\n", msg); };
+
+    sys.hw = xbox_setup(*sys.exec);
+
+    // ---- Load xboxkrnl.exe into guest RAM ----
+    pe::LoadResult krnl = pe::load_pe(sys.exec->ram, GUEST_RAM_SIZE, cfg.kernel_path.c_str());
+    if (!krnl.ok) {
+        say("[boot] Failed to load xboxkrnl.exe");
+        return false;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[boot] Kernel loaded: base=0x%08X entry=0x%08X size=0x%08X sections=%u",
+             krnl.image_base, krnl.entry_point, krnl.image_size, krnl.num_sections);
+    say(msg);
+
+    // ---- Load XBE file ----
+    auto xbe_data = read_file_to_vec(cfg.xbe_path);
+    if (xbe_data.empty()) {
+        say("[boot] Failed to read XBE file");
+        return false;
+    }
+
+    // Copy raw XBE into RAM for load_xbe to parse
+    uint32_t load_pa = 0x1000;
+    sys.exec->load_guest(load_pa, xbe_data.data(), xbe_data.size());
+
+    // Parse XBE (this also writes HLE stubs and resolves thunks to HLE)
+    sys.xbe_info = xbe::load_xbe(sys.exec->ram, xbe_data.data(), xbe_data.size());
+    if (!sys.xbe_info.valid) {
+        say("[boot] XBE parsing failed");
+        return false;
+    }
+
+    snprintf(msg, sizeof(msg), "[boot] XBE entry=0x%08X thunks=0x%08X sections=%u",
+             sys.xbe_info.entry_point, sys.xbe_info.kernel_thunk_va, sys.xbe_info.num_sections);
+    say(msg);
+
+    // ---- Re-resolve kernel thunks against real kernel exports ----
+    // load_xbe already resolved all thunks to HLE stubs.  Now re-patch
+    // each one: if the real kernel exports that ordinal, use the real VA;
+    // otherwise keep the HLE stub (fallback).
+    uint32_t thunk_va = sys.xbe_info.kernel_thunk_va;
+    uint32_t resolved_lle = 0, fallback_hle = 0;
+    for (uint32_t off = thunk_va; off + 4 <= GUEST_RAM_SIZE; off += 4) {
+        uint32_t current_va;
+        memcpy(&current_va, sys.exec->ram + off, 4);
+        if (current_va == 0) break;
+
+        // Determine which ordinal this thunk was for by checking if it
+        // points into the HLE stub region
+        if (current_va >= xbe::HLE_STUB_BASE &&
+            current_va < xbe::HLE_STUB_BASE + xbe::MAX_KERNEL_ORDINALS * xbe::HLE_STUB_SIZE) {
+            uint32_t ordinal = (current_va - xbe::HLE_STUB_BASE) / xbe::HLE_STUB_SIZE;
+
+            // Also check if it's a data export (those point to KDATA_BASE area)
+            // — skip re-resolving those, they're fine as-is
+            uint32_t data_va = xbe::kernel_data_addr(ordinal);
+            if (data_va) continue;  // data export — keep kernel data pointer
+
+            // Try to resolve from real kernel
+            uint32_t real_va = pe::resolve_export_by_ordinal(
+                sys.exec->ram, krnl.image_base, ordinal);
+            if (real_va != 0) {
+                memcpy(sys.exec->ram + off, &real_va, 4);
+                ++resolved_lle;
+            } else {
+                ++fallback_hle;
+            }
+        }
+        // If it points to KDATA area, it's a data export — leave it
+    }
+
+    snprintf(msg, sizeof(msg), "[boot] Thunks: %u resolved to kernel, %u HLE fallback",
+             resolved_lle, fallback_hle);
+    say(msg);
+
+    // ---- Stack and KPCR setup (same as HLE mode) ----
+    constexpr uint32_t STACK_TOP = 0x00B0'0000u;
+    constexpr uint32_t SENTINEL  = 0xFFFF'FFFFu;
+    sys.exec->ctx.gp[GP_ESP] = STACK_TOP;
+    memcpy(sys.exec->ram + STACK_TOP, &SENTINEL, 4);
+    sys.exec->ctx.eflags = 0x0000'0202;
+
+    constexpr uint32_t FS_BASE = 0x00D0'0000u;
+    sys.exec->ctx.fs_base = FS_BASE;
+    sys.exec->ctx.gs_base = 0;
+    setup_kpcr(*sys.exec, FS_BASE, STACK_TOP);
+
+    // ---- Install HLE handler for fallback stubs ----
+    // HLE stubs are still present in RAM — if the guest calls an ordinal
+    // that wasn't in the real kernel, INT 0x20 fires and we handle it.
+    sys.hle_heap.reset();
+    sys.hle_heap.set_xbe_path(cfg.xbe_path);
+
+    if (!cfg.xiso_path.empty()) {
+        size_t sep = cfg.xiso_path.find_last_of("/\\");
+        std::string xiso_dir = (sep != std::string::npos)
+            ? cfg.xiso_path.substr(0, sep) : ".";
+        sys.hle_heap.mounts.push_back({"\\??\\D:", xiso_dir});
+        sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xiso_dir});
+    }
+
+    sys.exec->hle_handler = xbe::default_hle_handler;
+    sys.exec->hle_user    = &sys.hle_heap;
+
+    // ---- Choose entry point ----
+    // The real Xbox boot has the kernel run first (KiSystemStartup), which
+    // then loads and calls the XBE.  For now, we start at the XBE entry
+    // point since the kernel's init depends on hardware state we don't
+    // fully emulate.  The thunks point into real kernel code, so when the
+    // XBE calls kernel functions they execute natively.
+    sys.entry_eip = sys.xbe_info.entry_point;
+    sys.running = true;
+
+    say("[boot] LLE-kernel mode ready — starting at XBE entry point");
     return true;
 }
 

@@ -129,6 +129,58 @@ Currently executes 305+ HLE kernel calls with zero unhandled ordinals. The
 dashboard performs file I/O, thread creation, interrupt setup, and critical
 section management through emulated kernel stubs.
 
+### Boot Modes
+
+Xermu supports three boot modes:
+
+| Mode | Description | Required Files |
+|------|-------------|----------------|
+| **HLE** | XBE runs with high-level emulated kernel stubs | Dashboard XBE |
+| **LLE Kernel** | XBE runs with real `xboxkrnl.exe` (HLE fallback for missing exports) | `xboxkrnl.exe` + XBE |
+| **LLE BIOS** | Full low-level boot from BIOS ROM through reset vector | BIOS ROM (+ optional MCPX) |
+
+**HLE mode** (default): Kernel calls are intercepted via `INT 0x20` stubs and
+handled in C++. Fastest to set up — only needs an XBE file.
+
+**LLE Kernel mode**: Loads the real `xboxkrnl.exe` as a PE image into guest RAM.
+XBE kernel thunks are resolved against the kernel's export table, so function
+calls execute real kernel code. Exports not found in the PE fall back to HLE
+stubs automatically.
+
+**LLE BIOS mode**: Boots from the BIOS reset vector (`0xFFFFFFF0`), going
+through real-mode init and protected-mode transition. Requires a BIOS ROM dump;
+an MCPX boot ROM is optional.
+
+#### Command-line usage
+
+```bash
+# HLE mode — XBE with emulated kernel
+./build/Release/xermu data/xbox\ dash\ orig_5960/xboxdash.xbe
+
+# LLE Kernel mode — XBE with real xboxkrnl.exe
+./build/Release/xermu --kernel data/xboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
+
+# Headless test runner variants
+./build/Release/test_runner --xbox data/xbox\ dash\ orig_5960/xboxdash.xbe
+./build/Release/test_runner --xbox --kernel data/xboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
+./build/Release/test_runner --bios data/xbox5838.bin [--mcpx data/mcpx_1.0.bin]
+```
+
+### Auto-Detection of ROM and System Files
+
+The GUI automatically scans for known files on startup. Place files in the
+`data/` directory and they will be detected:
+
+| File | Searched paths |
+|------|---------------|
+| Dashboard XBE | `data/xbox dash orig_5960/xboxdash.xbe`, `data/xboxdash.xbe`, `data/dashboard/xboxdash.xbe` |
+| BIOS ROM | `data/bios.bin`, `data/xbox5838.bin`, `data/xbox5960.bin`, `data/xbox4627.bin`, `data/complex_*.bin`, `data/xboxrom.bin` |
+| MCPX ROM | `data/mcpx_1.0.bin`, `data/mcpx_1.1.bin`, `data/mcpx.bin` |
+| Kernel PE | `data/xboxkrnl.exe`, `data/xboxkrnl_5838.exe`, `data/xboxkrnl_5960.exe` |
+
+When detected, additional boot buttons appear in the GUI (e.g. "Boot Dashboard
+(LLE Kernel)" when both the kernel PE and a dashboard XBE are found).
+
 ## Current Status
 
 **JIT engine:**

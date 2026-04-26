@@ -90,7 +90,13 @@ static constexpr uint32_t PE_SIG     = 0x00004550; // 'PE\0\0'
 static constexpr uint16_t MACHINE_I386 = 0x014C;
 static constexpr uint16_t PE32_MAGIC   = 0x010B;
 
-// Section characteristics flags
+// Section characteristics flags — #undef any Windows SDK macros first
+#undef IMAGE_SCN_CNT_CODE
+#undef IMAGE_SCN_CNT_INITIALIZED_DATA
+#undef IMAGE_SCN_CNT_UNINITIALIZED_DATA
+#undef IMAGE_SCN_MEM_EXECUTE
+#undef IMAGE_SCN_MEM_READ
+#undef IMAGE_SCN_MEM_WRITE
 static constexpr uint32_t IMAGE_SCN_CNT_CODE               = 0x00000020;
 static constexpr uint32_t IMAGE_SCN_CNT_INITIALIZED_DATA   = 0x00000040;
 static constexpr uint32_t IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x00000080;

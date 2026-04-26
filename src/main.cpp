@@ -340,6 +340,7 @@ struct AppContext {
     std::string            dashboard_xbe;  // auto-detected dashboard
     std::string            bios_path;
     std::string            mcpx_path;
+    std::string            kernel_path;    // xboxkrnl.exe for LLE-kernel mode
 
     void log(const char* msg) {
         log_lines.emplace_back(msg);
@@ -350,10 +351,11 @@ struct AppContext {
 
 // Scan data/ for known files
 static void scan_data_dir(AppContext& app) {
-    // Check common locations for dashboard and BIOS
+    // Dashboard XBE — several common dump layouts
     const char* dash_paths[] = {
         "data/xbox dash orig_5960/xboxdash.xbe",
         "data/xboxdash.xbe",
+        "data/dashboard/xboxdash.xbe",
         "xboxdash.xbe",
     };
     for (auto& p : dash_paths) {
@@ -361,23 +363,46 @@ static void scan_data_dir(AppContext& app) {
         if (f) { fclose(f); app.dashboard_xbe = p; break; }
     }
 
+    // BIOS ROM images (256 KB or 1 MB)
     const char* bios_paths[] = {
         "data/bios.bin",
-        "bios.bin",
+        "data/xbox5838.bin",
+        "data/xbox5960.bin",
+        "data/xbox4627.bin",
+        "data/xbox4034.bin",
         "data/complex_4627.bin",
+        "data/complex_5838.bin",
+        "data/xboxrom.bin",
+        "bios.bin",
     };
     for (auto& p : bios_paths) {
         FILE* f = fopen(p, "rb");
         if (f) { fclose(f); app.bios_path = p; break; }
     }
 
+    // MCPX boot ROM (512 bytes)
     const char* mcpx_paths[] = {
         "data/mcpx_1.0.bin",
+        "data/mcpx_1.1.bin",
+        "data/mcpx.bin",
         "mcpx.bin",
     };
     for (auto& p : mcpx_paths) {
         FILE* f = fopen(p, "rb");
         if (f) { fclose(f); app.mcpx_path = p; break; }
+    }
+
+    // xboxkrnl.exe — extracted kernel PE
+    const char* kernel_paths[] = {
+        "data/xboxkrnl.exe",
+        "data/xboxkrnl_5838.exe",
+        "data/xboxkrnl_5960.exe",
+        "data/xboxkrnl_4627.exe",
+        "xboxkrnl.exe",
+    };
+    for (auto& p : kernel_paths) {
+        FILE* f = fopen(p, "rb");
+        if (f) { fclose(f); app.kernel_path = p; break; }
     }
 }
 
@@ -414,6 +439,16 @@ static void draw_menu(AppContext& app) {
 
     if (!app.bios_path.empty())
         ImGui::Text("BIOS: %s", app.bios_path.c_str());
+    else
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No BIOS ROM found");
+
+    if (!app.mcpx_path.empty())
+        ImGui::Text("MCPX: %s", app.mcpx_path.c_str());
+
+    if (!app.kernel_path.empty())
+        ImGui::Text("Kernel: %s", app.kernel_path.c_str());
+    else
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No xboxkrnl.exe found");
 
     ImGui::Separator();
 
@@ -464,6 +499,25 @@ static void draw_menu(AppContext& app) {
                 app.state = AppState::Running;
             } else {
                 app.log("[ui] LLE boot failed!");
+                app.state = AppState::Halted;
+            }
+        }
+    }
+
+    // LLE-kernel boot (if kernel + dashboard available)
+    if (!app.kernel_path.empty() && !app.dashboard_xbe.empty()) {
+        ImGui::Spacing();
+        if (ImGui::Button("Boot Dashboard (LLE Kernel)", ImVec2(300, 30))) {
+            app.cfg = {};
+            app.cfg.xbe_path = app.dashboard_xbe;
+            app.cfg.kernel_path = app.kernel_path;
+            app.log("[ui] Booting dashboard with real kernel...");
+
+            auto log_fn = [&](const char* msg) { app.log(msg); };
+            if (xbox::boot_lle_kernel(app.sys, app.cfg, log_fn)) {
+                app.state = AppState::Running;
+            } else {
+                app.log("[ui] LLE-kernel boot failed!");
                 app.state = AppState::Halted;
             }
         }
@@ -587,16 +641,28 @@ int main(int argc, char** argv) {
     AppContext app;
     scan_data_dir(app);
 
-    // Handle command-line XBE arg
+    // Handle command-line args: [--kernel xboxkrnl.exe] <game.xbe>
     if (argc >= 2) {
-        std::string arg = argv[1];
-        if (arg.size() > 4 && (arg.substr(arg.size()-4) == ".xbe" || arg.substr(arg.size()-4) == ".XBE")) {
-            app.cfg.xbe_path = arg;
-            auto log_fn = [&](const char* msg) { app.log(msg); };
-            if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
-                app.state = AppState::Running;
-            } else {
-                app.log("[ui] Boot failed for command-line XBE");
+        int cli_argi = 1;
+        std::string cli_kernel;
+        if (std::string(argv[cli_argi]) == "--kernel" && cli_argi + 1 < argc) {
+            cli_kernel = argv[++cli_argi];
+            ++cli_argi;
+        }
+        if (cli_argi < argc) {
+            std::string arg = argv[cli_argi];
+            if (arg.size() > 4 && (arg.substr(arg.size()-4) == ".xbe" || arg.substr(arg.size()-4) == ".XBE")) {
+                app.cfg.xbe_path = arg;
+                app.cfg.kernel_path = cli_kernel;
+                auto log_fn = [&](const char* msg) { app.log(msg); };
+                bool ok = cli_kernel.empty()
+                    ? xbox::boot_hle(app.sys, app.cfg, log_fn)
+                    : xbox::boot_lle_kernel(app.sys, app.cfg, log_fn);
+                if (ok) {
+                    app.state = AppState::Running;
+                } else {
+                    app.log("[ui] Boot failed for command-line XBE");
+                }
             }
         }
     }

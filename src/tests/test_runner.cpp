@@ -77,7 +77,8 @@ static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n"
-                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]\n");
+                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]\n"
+                        "       test_runner --xbox --kernel <xboxkrnl.exe> <game.xbe>\n");
         return 2;
     }
 
@@ -86,6 +87,7 @@ int main(int argc, char** argv) {
     bool bios_mode = false;
     const char* bios_path = nullptr;
     const char* mcpx_path = nullptr;
+    const char* kernel_path = nullptr;
     int argi = 1;
 
     while (argi < argc && argv[argi][0] == '-') {
@@ -107,6 +109,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
             mcpx_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--kernel") == 0) {
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--kernel requires an xboxkrnl.exe path\n");
+                return 2;
+            }
+            kernel_path = argv[argi++];
         } else {
             break;
         }
@@ -135,6 +144,27 @@ int main(int argc, char** argv) {
         }
         printf("\n");
         return 0;
+    }
+
+    // ---- LLE-kernel mode (xboxkrnl.exe + XBE) ----
+    if (kernel_path && argi < argc) {
+        xbox::BootConfig cfg;
+        cfg.kernel_path = kernel_path;
+        cfg.xbe_path = argv[argi];
+
+        xbox::XboxSystem sys;
+        if (!xbox::boot_lle_kernel(sys, cfg)) return 2;
+
+        // Register test-only IRQ trigger port
+        sys.exec->register_io(0xEB, nullptr, io_irq_trigger_write, &sys.hw->pic);
+
+        // Run to completion
+        while (xbox::run_step(sys, 10'000'000)) {}
+
+        uint32_t result = sys.exec->ctx.gp[GP_EAX];
+        printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",
+               result == 0 ? "PASS" : "FAIL", result, sys.exec->ctx.eip);
+        return result == 0 ? 0 : 1;
     }
 
     // ---- Test binary / XBE mode ----
