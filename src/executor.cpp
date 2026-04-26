@@ -477,10 +477,15 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        // Unhandled non-patchable mnemonic — fall through to crash.
+        // Unhandled non-patchable mnemonic — halt gracefully instead of crashing.
         fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — unhandled non-patchable op (mnemonic=%d)\n",
                 site->guest_eip, (int)mnem);
-        return EXCEPTION_CONTINUE_SEARCH;
+        // Set halt flag and stop_reason so the run loop can terminate cleanly.
+        exec->ctx.halted = true;
+        exec->ctx.stop_reason = STOP_INVALID_OPCODE;
+        exec->ctx.next_eip = site->guest_eip;
+        ctx_regs->Rip += hinsn.length; // skip past the faulting instruction
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     // Step 5: Decode the faulting fastmem instruction to derive the helper.

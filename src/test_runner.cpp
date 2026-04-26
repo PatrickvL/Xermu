@@ -141,6 +141,19 @@ int main(int argc, char** argv) {
             printf("[test_runner] MCPX ROM loaded\n");
         }
 
+        // Without MCPX ROM, the init table at PA 0xFFFC0000 (flash offset
+        // 0xC0000) is encrypted/garbage with no 0xEE terminator.  Patch the
+        // first byte to 0xEE so the table immediately terminates and the code
+        // proceeds to the RC4 decryption stage at 0xFFFFFEB4.
+        // The MCPX ROM would normally decrypt and populate this table; without
+        // it, we skip the hardware init commands (our emulator already has
+        // all devices in a known-good initial state).
+        if (!mcpx_path) {
+            constexpr uint32_t init_table_flash_off = 0xC0000;
+            hw->flash.data[init_table_flash_off] = 0xEE;
+            printf("[test_runner] Patched init table with 0xEE (no MCPX ROM)\n");
+        }
+
         // Boot: interpret the 16-bit real-mode prologue (LGDT/LIDT/PE/far JMP)
         // to reach the 32-bit protected mode entry point.
         if (!exec->interpret_real_mode_boot()) {
@@ -161,6 +174,15 @@ int main(int argc, char** argv) {
 
         printf("[test_runner] Halted: EIP=0x%08X EAX=0x%08X\n",
                exec->ctx.eip, exec->ctx.gp[GP_EAX]);
+
+        // Dump the first 64 bytes at the 2BL load address (0x400000)
+        // to verify whether RC4 decryption produced valid code.
+        printf("[test_runner] RAM at 0x400000:");
+        for (int i = 0; i < 64; ++i) {
+            if (i % 16 == 0) printf("\n  %08X:", 0x400000 + i);
+            printf(" %02X", exec->ram[0x400000 + i]);
+        }
+        printf("\n");
 
         exec->destroy();
         delete hw;
