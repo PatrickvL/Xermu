@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Stub MMIO
@@ -77,7 +78,7 @@ static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n"
-                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>]\n"
+                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>] [--rc4-key <key.bin>] [--dump-kernel <out.exe>]\n"
                         "       test_runner --xbox --kernel <xboxkrnl.exe> <game.xbe>\n");
         return 2;
     }
@@ -88,6 +89,8 @@ int main(int argc, char** argv) {
     const char* bios_path = nullptr;
     const char* mcpx_path = nullptr;
     const char* kernel_path = nullptr;
+    const char* rc4_key_path = nullptr;
+    const char* dump_kernel_path = nullptr;
     int argi = 1;
 
     while (argi < argc && argv[argi][0] == '-') {
@@ -109,6 +112,20 @@ int main(int argc, char** argv) {
                 return 2;
             }
             mcpx_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--rc4-key") == 0) {
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--rc4-key requires a 16-byte key file path\n");
+                return 2;
+            }
+            rc4_key_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--dump-kernel") == 0) {
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--dump-kernel requires an output file path\n");
+                return 2;
+            }
+            dump_kernel_path = argv[argi++];
         } else if (strcmp(argv[argi], "--kernel") == 0) {
             argi++;
             if (argi >= argc) {
@@ -126,6 +143,8 @@ int main(int argc, char** argv) {
         xbox::BootConfig cfg;
         cfg.bios_path = bios_path;
         if (mcpx_path) cfg.mcpx_path = mcpx_path;
+        if (rc4_key_path) cfg.rc4_key_path = rc4_key_path;
+        if (dump_kernel_path) cfg.dump_kernel_path = dump_kernel_path;
 
         xbox::XboxSystem sys;
         if (!xbox::boot_lle(sys, cfg)) return 2;
@@ -179,47 +198,11 @@ int main(int argc, char** argv) {
                sys.exec->ctx.eip, sys.exec->ctx.gp[GP_EAX]);
 
         // Scan RAM for a valid PE image (the decrypted/decompressed kernel).
-        // xboxkrnl.exe is typically loaded at 0x80010000 (VA) which maps to
-        // PA 0x00010000 with identity paging, or at the image's preferred base.
         printf("[test_runner] Scanning RAM for PE images...\n");
-        for (uint32_t pa = 0; pa + 0x200 < GUEST_RAM_SIZE; pa += 0x1000) {
-            if (sys.exec->ram[pa] == 'M' && sys.exec->ram[pa+1] == 'Z') {
-                uint32_t e_lfanew;
-                memcpy(&e_lfanew, sys.exec->ram + pa + 0x3C, 4);
-                if (e_lfanew > 0 && e_lfanew < 0x1000 && pa + e_lfanew + 4 < GUEST_RAM_SIZE) {
-                    uint32_t pe_sig;
-                    memcpy(&pe_sig, sys.exec->ram + pa + e_lfanew, 4);
-                    if (pe_sig == 0x00004550) { // 'PE\0\0'
-                        uint16_t machine, num_sec;
-                        memcpy(&machine, sys.exec->ram + pa + e_lfanew + 4, 2);
-                        memcpy(&num_sec, sys.exec->ram + pa + e_lfanew + 6, 2);
-                        uint32_t img_base, img_size, entry_rva;
-                        uint32_t opt = pa + e_lfanew + 24;
-                        memcpy(&entry_rva, sys.exec->ram + opt + 16, 4);
-                        memcpy(&img_base, sys.exec->ram + opt + 28, 4);
-                        memcpy(&img_size, sys.exec->ram + opt + 56, 4);
-                        printf("  PE at PA=0x%08X: machine=0x%04X sections=%u "
-                               "base=0x%08X size=0x%X entry=0x%X\n",
-                               pa, machine, num_sec, img_base, img_size, entry_rva);
-                        // Dump to file if it looks like xboxkrnl.exe
-                        if (machine == 0x014C && img_size > 0x10000 && img_size < 0x400000) {
-                            char dump_path[256];
-                            snprintf(dump_path, sizeof(dump_path),
-                                     "data/xboxkrnl_dumped_0x%08X.exe", pa);
-                            FILE* df = fopen(dump_path, "wb");
-                            if (df) {
-                                uint32_t dump_sz = img_size;
-                                if (pa + dump_sz > GUEST_RAM_SIZE)
-                                    dump_sz = GUEST_RAM_SIZE - pa;
-                                fwrite(sys.exec->ram + pa, 1, dump_sz, df);
-                                fclose(df);
-                                printf("  -> Dumped %u bytes to %s\n", dump_sz, dump_path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        std::string dump_path = cfg.dump_kernel_path;
+        if (dump_path.empty()) dump_path = "data/xboxkrnl_dumped.exe";
+        uint32_t kernel_pa = xbox::scan_and_dump_kernel(
+            sys.exec->ram, GUEST_RAM_SIZE, dump_path);
         return 0;
     }
 

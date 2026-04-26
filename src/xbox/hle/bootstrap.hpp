@@ -24,11 +24,13 @@ namespace xbox {
 // BootConfig — describes what to boot and how.
 // ---------------------------------------------------------------------------
 struct BootConfig {
-    std::string xbe_path;     // XBE file to load (HLE or LLE-kernel mode)
-    std::string bios_path;    // BIOS image for LLE boot
-    std::string mcpx_path;    // optional MCPX ROM for LLE boot
-    std::string xiso_path;    // XISO image to mount as D:
-    std::string kernel_path;  // xboxkrnl.exe for LLE-kernel mode
+    std::string xbe_path;          // XBE file to load (HLE or LLE-kernel mode)
+    std::string bios_path;         // BIOS image for LLE boot
+    std::string mcpx_path;         // optional MCPX ROM for LLE boot
+    std::string xiso_path;         // XISO image to mount as D:
+    std::string kernel_path;       // xboxkrnl.exe for LLE-kernel mode
+    std::string rc4_key_path;      // 16-byte RC4 key file for 2BL decryption
+    std::string dump_kernel_path;  // output path for dumped kernel image
 
     bool is_hle()  const { return !xbe_path.empty() && kernel_path.empty(); }
     bool is_lle()  const { return !bios_path.empty(); }
@@ -182,6 +184,102 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
+// RC4 stream cipher — used by the MCPX ROM to decrypt the 2BL.
+// ---------------------------------------------------------------------------
+inline void rc4_crypt(const uint8_t* key, size_t key_len,
+                      uint8_t* data, size_t data_len)
+{
+    uint8_t S[256];
+    for (int i = 0; i < 256; i++) S[i] = (uint8_t)i;
+    int j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = (j + S[i] + key[i % key_len]) & 0xFF;
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+    int si = 0; j = 0;
+    for (size_t n = 0; n < data_len; n++) {
+        si = (si + 1) & 0xFF;
+        j  = (j + S[si]) & 0xFF;
+        uint8_t tmp = S[si]; S[si] = S[j]; S[j] = tmp;
+        data[n] ^= S[(S[si] + S[j]) & 0xFF];
+    }
+}
+
+// 2BL constants
+static constexpr uint32_t BL2_LOAD_ADDR = 0x00400000u;  // RAM address where 2BL is loaded
+static constexpr uint32_t BL2_SIZE      = 0x6000u;       // MCPX 1.0 decrypts 24 KB
+static constexpr uint32_t MCPX_KEY_OFF  = 0x1A5u;        // RC4 key offset in MCPX 1.0 ROM
+static constexpr uint32_t MCPX_KEY_LEN  = 16u;           // RC4 key length
+
+// ---------------------------------------------------------------------------
+// scan_and_dump_kernel — scan guest RAM for a valid PE image and write it to
+// a file.  Returns the PA of the first kernel-sized PE found, or 0.
+// ---------------------------------------------------------------------------
+inline uint32_t scan_and_dump_kernel(const uint8_t* ram, uint32_t ram_size,
+                                     const std::string& dump_path,
+                                     std::function<void(const char*)> log = nullptr)
+{
+    auto say = [&](const char* msg) { if (log) log(msg); else fprintf(stderr, "%s\n", msg); };
+    uint32_t found_pa = 0;
+
+    for (uint32_t pa = 0; pa + 0x200 < ram_size; pa += 0x1000) {
+        if (ram[pa] != 'M' || ram[pa + 1] != 'Z') continue;
+
+        uint32_t e_lfanew;
+        memcpy(&e_lfanew, ram + pa + 0x3C, 4);
+        if (e_lfanew == 0 || e_lfanew >= 0x1000 || pa + e_lfanew + 0x100 >= ram_size)
+            continue;
+
+        uint32_t pe_sig;
+        memcpy(&pe_sig, ram + pa + e_lfanew, 4);
+        if (pe_sig != 0x00004550u) continue; // 'PE\0\0'
+
+        uint16_t machine, num_sec;
+        memcpy(&machine,  ram + pa + e_lfanew + 4, 2);
+        memcpy(&num_sec,  ram + pa + e_lfanew + 6, 2);
+
+        uint32_t opt = pa + e_lfanew + 24;
+        uint32_t img_base, img_size, entry_rva;
+        memcpy(&entry_rva, ram + opt + 16, 4);
+        memcpy(&img_base,  ram + opt + 28, 4);
+        memcpy(&img_size,  ram + opt + 56, 4);
+
+        // Filter: must be i386, reasonable size for xboxkrnl.exe
+        if (machine != 0x014C) continue;
+        if (img_size < 0x10000 || img_size > 0x400000) continue;
+
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "[kernel] PE at PA=0x%08X: base=0x%08X size=0x%X entry=0x%X sections=%u",
+                 pa, img_base, img_size, entry_rva, num_sec);
+        say(msg);
+
+        if (found_pa == 0) found_pa = pa;
+
+        // Dump to file if requested
+        if (!dump_path.empty()) {
+            uint32_t dump_sz = img_size;
+            if (pa + dump_sz > ram_size) dump_sz = ram_size - pa;
+
+            FILE* df = fopen(dump_path.c_str(), "wb");
+            if (df) {
+                fwrite(ram + pa, 1, dump_sz, df);
+                fclose(df);
+                snprintf(msg, sizeof(msg),
+                         "[kernel] Dumped %u bytes to %s", dump_sz, dump_path.c_str());
+                say(msg);
+            } else {
+                snprintf(msg, sizeof(msg),
+                         "[kernel] Failed to write %s", dump_path.c_str());
+                say(msg);
+            }
+            break; // dump only the first match
+        }
+    }
+    return found_pa;
+}
+
+// ---------------------------------------------------------------------------
 // boot_lle — load BIOS (+ optional MCPX) and enter via reset vector.
 // Returns false on error; fills sys.entry_eip on success.
 // ---------------------------------------------------------------------------
@@ -198,16 +296,69 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
     }
     say("[boot] BIOS loaded into flash");
 
-    if (!cfg.mcpx_path.empty()) {
+    // --- Obtain the RC4 key for 2BL decryption ---
+    // Priority: explicit key file > extract from MCPX ROM > none (skip decrypt)
+    uint8_t rc4_key[MCPX_KEY_LEN] = {};
+    bool have_key = false;
+
+    if (!cfg.rc4_key_path.empty()) {
+        // Load raw 16-byte key file
+        auto key_data = read_file_to_vec(cfg.rc4_key_path);
+        if (key_data.size() == MCPX_KEY_LEN) {
+            memcpy(rc4_key, key_data.data(), MCPX_KEY_LEN);
+            have_key = true;
+            say("[boot] RC4 key loaded from key file");
+        } else {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "[boot] RC4 key file must be %u bytes (got %zu)",
+                     MCPX_KEY_LEN, key_data.size());
+            say(msg);
+            return false;
+        }
+    } else if (!cfg.mcpx_path.empty()) {
+        // Extract key from MCPX ROM at known offset
         if (!sys.hw->flash.load_mcpx(cfg.mcpx_path.c_str())) {
             say("[boot] Failed to load MCPX ROM");
             return false;
         }
         say("[boot] MCPX ROM loaded");
+        if (MCPX_KEY_OFF + MCPX_KEY_LEN <= FlashState::MCPX_ROM_SIZE) {
+            memcpy(rc4_key, sys.hw->flash.mcpx_rom + MCPX_KEY_OFF, MCPX_KEY_LEN);
+            have_key = true;
+            say("[boot] RC4 key extracted from MCPX ROM");
+        }
+    }
+
+    // --- Decrypt and load the 2BL ---
+    if (have_key) {
+        // Copy 2BL from flash offset 0 into RAM at BL2_LOAD_ADDR
+        if (BL2_LOAD_ADDR + BL2_SIZE <= GUEST_RAM_SIZE) {
+            memcpy(sys.exec->ram + BL2_LOAD_ADDR,
+                   sys.hw->flash.data, BL2_SIZE);
+            // RC4-decrypt the 2BL in-place
+            rc4_crypt(rc4_key, MCPX_KEY_LEN,
+                      sys.exec->ram + BL2_LOAD_ADDR, BL2_SIZE);
+
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "[boot] 2BL decrypted: first bytes %02X %02X %02X %02X at 0x%08X",
+                     sys.exec->ram[BL2_LOAD_ADDR + 0],
+                     sys.exec->ram[BL2_LOAD_ADDR + 1],
+                     sys.exec->ram[BL2_LOAD_ADDR + 2],
+                     sys.exec->ram[BL2_LOAD_ADDR + 3],
+                     BL2_LOAD_ADDR);
+            say(msg);
+
+            // Check if decryption produced valid code (first byte should not be 0xCC/0xFF)
+            uint8_t first = sys.exec->ram[BL2_LOAD_ADDR];
+            if (first == 0xCC || first == 0xFF || first == 0x00) {
+                say("[boot] WARNING: decrypted 2BL starts with suspicious byte — wrong key?");
+            }
+        }
     } else {
-        // Patch init table to skip encrypted commands
-        constexpr uint32_t INIT_TABLE_OFF = 0xC0000;
-        sys.hw->flash.data[INIT_TABLE_OFF] = 0xEE;
+        say("[boot] No RC4 key — 2BL is still encrypted.");
+        say("[boot] Provide --rc4-key <key.bin> or --mcpx <mcpx.bin> for full LLE boot.");
     }
 
     // Real-mode prologue → protected mode
@@ -217,11 +368,22 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
     }
 
     char msg[256];
-    snprintf(msg, sizeof(msg), "[boot] PM entry EIP=0x%08X CR0=0x%08X",
-             sys.exec->ctx.eip, sys.exec->ctx.cr0);
+    if (have_key) {
+        // Skip MCPX ROM — jump directly to decrypted 2BL
+        sys.entry_eip = BL2_LOAD_ADDR;
+        // Set up minimal CPU state that the 2BL expects:
+        // - Protected mode (already set by interpret_real_mode_boot)
+        // - ESP at a sane location
+        sys.exec->ctx.gp[GP_ESP] = BL2_LOAD_ADDR - 4; // stack just below 2BL
+        snprintf(msg, sizeof(msg), "[boot] Entering decrypted 2BL at EIP=0x%08X",
+                 BL2_LOAD_ADDR);
+    } else {
+        snprintf(msg, sizeof(msg), "[boot] PM entry EIP=0x%08X CR0=0x%08X",
+                 sys.exec->ctx.eip, sys.exec->ctx.cr0);
+    }
     say(msg);
 
-    sys.entry_eip = sys.exec->ctx.eip;
+    if (!have_key) sys.entry_eip = sys.exec->ctx.eip;
     sys.running = true;
     return true;
 }

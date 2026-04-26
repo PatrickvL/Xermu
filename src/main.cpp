@@ -344,6 +344,7 @@ struct AppContext {
     std::string            dashboard_xbe;  // auto-detected dashboard
     std::string            bios_path;
     std::string            mcpx_path;
+    std::string            rc4_key_path;   // RC4 key for 2BL decryption
     std::string            kernel_path;    // xboxkrnl.exe for LLE-kernel mode
 
     void log(const char* msg) {
@@ -441,6 +442,16 @@ static void scan_data_dir(AppContext& app, const std::string& data_root) {
         if (!p.empty()) { app.mcpx_path = p; break; }
     }
 
+    // RC4 key file (16 bytes) for 2BL decryption
+    const char* key_rel[] = {
+        "rc4_key.bin",
+        "mcpx_key.bin",
+    };
+    for (auto& r : key_rel) {
+        auto p = probe(r);
+        if (!p.empty()) { app.rc4_key_path = p; break; }
+    }
+
     // xboxkrnl.exe — extracted kernel PE
     const char* kernel_rel[] = {
         "xboxkrnl.exe",
@@ -493,6 +504,9 @@ static void draw_menu(AppContext& app) {
     if (!app.mcpx_path.empty())
         ImGui::Text("MCPX: %s", app.mcpx_path.c_str());
 
+    if (!app.rc4_key_path.empty())
+        ImGui::Text("RC4 Key: %s", app.rc4_key_path.c_str());
+
     if (!app.kernel_path.empty())
         ImGui::Text("Kernel: %s", app.kernel_path.c_str());
     else
@@ -540,6 +554,7 @@ static void draw_menu(AppContext& app) {
             app.cfg = {};
             app.cfg.bios_path = app.bios_path;
             app.cfg.mcpx_path = app.mcpx_path;
+            app.cfg.rc4_key_path = app.rc4_key_path;
             app.log("[ui] Booting BIOS (LLE)...");
 
             auto log_fn = [&](const char* msg) { app.log(msg); };
@@ -728,6 +743,7 @@ int main(int argc, char** argv) {
             app.cfg.bios_path = cli_bios;
             if (!cli_mcpx.empty()) app.cfg.mcpx_path = cli_mcpx;
             else if (!app.mcpx_path.empty()) app.cfg.mcpx_path = app.mcpx_path;
+            if (!app.rc4_key_path.empty()) app.cfg.rc4_key_path = app.rc4_key_path;
             if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
                 app.state = AppState::Running;
             } else {
