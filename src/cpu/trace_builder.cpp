@@ -1,492 +1,10 @@
-#include "trace_builder.hpp"
+﻿#include "trace_builder.hpp"
 #include "executor.hpp"
 #include "insn_dispatch.hpp"
+#include "jit_helpers.hpp"
 #include <cstdio>
 #include <cstring>
 
-// ---------------------------------------------------------------------------
-// C-linkage MMIO slow-path helpers called from JIT code.
-// All guest GP regs are saved to GuestContext before the call.
-// ---------------------------------------------------------------------------
-
-extern "C" {
-
-void mmio_dispatch_read(GuestContext* ctx, uint32_t pa,
-                        uint32_t dst_gp_idx, uint32_t size_bytes) {
-    if (pa < GUEST_RAM_SIZE) {
-        // Direct RAM access (site was patched on prior MMIO fault for this EIP,
-        // but this execution's PA happens to land in RAM).
-        uint32_t val = 0;
-        memcpy(&val, reinterpret_cast<uint8_t*>(ctx->fastmem_base) + pa, size_bytes);
-        ctx->gp[dst_gp_idx] = val;
-    } else if (ctx->mmio) {
-        ctx->gp[dst_gp_idx] = ctx->mmio->read(pa, size_bytes);
-    } else {
-        ctx->gp[dst_gp_idx] = MmioMap::BUS_FLOAT;
-    }
-}
-
-void mmio_dispatch_write(GuestContext* ctx, uint32_t pa,
-                         uint32_t src_gp_idx, uint32_t size_bytes) {
-    if (pa < GUEST_RAM_SIZE) {
-        uint32_t val = ctx->gp[src_gp_idx];
-        memcpy(reinterpret_cast<uint8_t*>(ctx->fastmem_base) + pa, &val, size_bytes);
-    } else if (ctx->mmio) {
-        ctx->mmio->write(pa, ctx->gp[src_gp_idx], size_bytes);
-    }
-}
-
-void mmio_dispatch_write_imm(GuestContext* ctx, uint32_t pa,
-                             uint32_t value, uint32_t size_bytes) {
-    if (pa < GUEST_RAM_SIZE) {
-        memcpy(reinterpret_cast<uint8_t*>(ctx->fastmem_base) + pa, &value, size_bytes);
-    } else if (ctx->mmio) {
-        ctx->mmio->write(pa, value, size_bytes);
-    }
-}
-
-// VA→PA page-table walk called from JIT code when paging is enabled.
-// Returns PA on success, ~0u on fault (CR2 set to faulting VA).
-uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
-    auto* ram = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-    uint32_t ram_size = GUEST_RAM_SIZE;
-    uint32_t cr3 = ctx->cr3;
-
-    uint32_t pdir_pa = cr3 & GUEST_PAGE_MASK;
-    uint32_t pdi     = (va >> 22) & 0x3FF;
-    uint32_t pti     = (va >> 12) & 0x3FF;
-
-    // Read PDE
-    uint32_t pde_pa = pdir_pa + pdi * 4;
-    if (pde_pa + 4 > ram_size) goto fault;
-    uint32_t pde;
-    memcpy(&pde, ram + pde_pa, 4);
-    if (!(pde & PTE_PRESENT)) goto fault;
-
-    // 4 MB page (PS=1)?
-    if (pde & PDE_PS) {
-        uint32_t pa = (pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF);
-        if (is_write && !(pde & PTE_RW)) goto fault;
-        if (!(pde & PTE_ACCESSED) || (is_write && !(pde & PTE_DIRTY))) {
-            pde |= PTE_ACCESSED;
-            if (is_write) pde |= PTE_DIRTY;
-            memcpy(ram + pde_pa, &pde, 4);
-        }
-        return pa;
-    }
-
-    // 4 KB page table
-    {
-        uint32_t pt_pa = (pde & GUEST_PAGE_MASK) + pti * 4;
-        if (pt_pa + 4 > ram_size) goto fault;
-        uint32_t pte;
-        memcpy(&pte, ram + pt_pa, 4);
-        if (!(pte & PTE_PRESENT)) goto fault;
-        if (is_write && !(pte & PTE_RW)) goto fault;
-        uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
-        bool need_pde_update = !(pde & PTE_ACCESSED);
-        bool need_pte_update = !(pte & PTE_ACCESSED) || (is_write && !(pte & PTE_DIRTY));
-        if (need_pde_update) { pde |= PTE_ACCESSED; memcpy(ram + pde_pa, &pde, 4); }
-        if (need_pte_update) {
-            pte |= PTE_ACCESSED;
-            if (is_write) pte |= PTE_DIRTY;
-            memcpy(ram + pt_pa, &pte, 4);
-        }
-        return pa;
-    }
-
-fault:
-    ctx->cr2 = va;
-    return ~0u;
-}
-
-// Translate a guest address to PA if paging is enabled, otherwise pass through.
-// Used by C helpers that access guest memory by VA.
-static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is_write) {
-    if (ctx->cr0 & 0x80000000u)
-        return translate_va_jit(ctx, addr, is_write ? 1 : 0);
-    return addr;
-}
-
-// Generic guest memory read (handles paging + MMIO).
-static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t size) {
-    uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        uint32_t v = 0;
-        memcpy(&v, base + pa, size);
-        return v;
-    }
-    return ctx->mmio ? ctx->mmio->read(pa, size) : 0xFFFFFFFFu;
-}
-
-// Generic guest memory write (handles paging + MMIO + SMC bump).
-static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, uint32_t size) {
-    uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        memcpy(base + pa, &val, size);
-        return;
-    }
-    if (ctx->mmio) ctx->mmio->write(pa, val, size);
-}
-
-// PUSHFD helper: push EFLAGS onto the guest stack.
-// Called with the captured EFLAGS value in `eflags_val`.
-void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
-    uint32_t esp = ctx->gp[GP_ESP] - 4;
-    ctx->gp[GP_ESP] = esp;
-    uint32_t pa = guest_translate(ctx, esp, true);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        memcpy(base + pa, &eflags_val, 4);
-    }
-}
-
-// POPFD helper: pop EFLAGS from the guest stack.
-// Returns the 32-bit EFLAGS value.
-uint32_t popfd_helper(GuestContext* ctx) {
-    uint32_t esp = ctx->gp[GP_ESP];
-    ctx->gp[GP_ESP] = esp + 4;
-    uint32_t pa = guest_translate(ctx, esp, false);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        uint32_t v; memcpy(&v, base + pa, 4); return v;
-    }
-    return 0;
-}
-
-// Read a 32-bit value from guest physical memory (or MMIO).
-// Used by JMP/CALL [mem] handlers.
-uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
-    uint32_t pa = guest_translate(ctx, addr, false);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        uint32_t v; memcpy(&v, base + pa, 4); return v;
-    }
-    return ctx->mmio ? ctx->mmio->read(pa, 4) : MmioMap::BUS_FLOAT;
-}
-
-// Write a 32-bit value to guest physical memory (or MMIO).
-// Used by PUSH [mem] and CALL [mem] handlers.
-void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
-    uint32_t pa = guest_translate(ctx, addr, true);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        memcpy(base + pa, &val, 4);
-        return;
-    }
-    if (ctx->mmio) ctx->mmio->write(pa, val, 4);
-}
-
-// CALL [mem] helper: reads jump target from `pa`, pushes `retaddr` onto
-// guest stack, returns the call target address.
-uint32_t call_mem_helper(GuestContext* ctx, uint32_t pa, uint32_t retaddr) {
-    uint32_t target = read_guest_mem32(ctx, pa);
-    uint32_t esp = ctx->gp[GP_ESP] - 4;
-    ctx->gp[GP_ESP] = esp;
-    write_guest_mem32(ctx, esp, retaddr);
-    return target;
-}
-
-// PUSH ESP helper: pushes pre-decrement ESP value onto the guest stack.
-// Guest ESP is NOT in a host register, so the generic PUSH r32 path would
-// incorrectly store the host RSP.  This helper reads old ESP from ctx,
-// decrements, and writes the old value — matching real x86 PUSH ESP semantics.
-void push_esp_helper(GuestContext* ctx) {
-    uint32_t old_esp = ctx->gp[GP_ESP];
-    uint32_t new_esp = old_esp - 4;
-    ctx->gp[GP_ESP] = new_esp;
-    write_guest_mem32(ctx, new_esp, old_esp);
-}
-
-// POP ESP helper: pops a 32-bit value from [old ESP] and sets ESP to that
-// value.  On real x86, the +4 from POP is overwritten by the popped value.
-void pop_esp_helper(GuestContext* ctx) {
-    uint32_t old_esp = ctx->gp[GP_ESP];
-    uint32_t val = read_guest_mem32(ctx, old_esp);
-    ctx->gp[GP_ESP] = val;
-}
-
-// MOV ESP, [mem] helper: read 32-bit value from PA, store to ctx->gp[GP_ESP].
-void mov_esp_from_mem(GuestContext* ctx, uint32_t pa) {
-    ctx->gp[GP_ESP] = read_guest_mem32(ctx, pa);
-}
-
-// High-byte register MOV helpers (AH/CH/DH/BH can't use REX in x86-64).
-// gp_idx = 0..3 for AH/CH/DH/BH (maps to EAX/ECX/EDX/EBX).
-void mov_highbyte_from_mem(GuestContext* ctx, uint32_t pa, uint32_t gp_idx) {
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-    uint8_t byte = (pa < GUEST_RAM_SIZE) ? base[pa] : 0;
-    ctx->gp[gp_idx] = (ctx->gp[gp_idx] & 0xFFFF00FFu) | ((uint32_t)byte << 8);
-}
-void mov_highbyte_to_mem(GuestContext* ctx, uint32_t pa, uint32_t gp_idx) {
-    uint8_t byte = (uint8_t)(ctx->gp[gp_idx] >> 8);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        base[pa] = byte;
-    }
-}
-
-// MOV [mem], ESP helper: write ctx->gp[GP_ESP] to PA.
-void mov_esp_to_mem(GuestContext* ctx, uint32_t pa) {
-    write_guest_mem32(ctx, pa, ctx->gp[GP_ESP]);
-}
-
-// PUSH [mem] helper: reads 32-bit value from `pa`, pushes onto guest stack.
-void push_mem_helper(GuestContext* ctx, uint32_t pa) {
-    uint32_t val = read_guest_mem32(ctx, pa);
-    uint32_t esp = ctx->gp[GP_ESP] - 4;
-    ctx->gp[GP_ESP] = esp;
-    write_guest_mem32(ctx, esp, val);
-}
-
-// POP [mem] helper: pops 32-bit value from guest stack, writes to `pa`.
-void pop_mem_helper(GuestContext* ctx, uint32_t pa) {
-    uint32_t esp = ctx->gp[GP_ESP];
-    uint32_t val = read_guest_mem32(ctx, esp);
-    ctx->gp[GP_ESP] = esp + 4;
-    write_guest_mem32(ctx, pa, val);
-}
-
-// PUSHAD helper: push EAX, ECX, EDX, EBX, original-ESP, EBP, ESI, EDI
-void pushad_helper(GuestContext* ctx) {
-    uint32_t orig_esp = ctx->gp[GP_ESP];
-    uint32_t esp = orig_esp;
-    static constexpr int order[] = { GP_EAX, GP_ECX, GP_EDX, GP_EBX };
-    for (int i : order) {
-        esp -= 4;
-        write_guest_mem32(ctx, esp, ctx->gp[i]);
-    }
-    esp -= 4;
-    write_guest_mem32(ctx, esp, orig_esp); // push original ESP
-    static constexpr int order2[] = { GP_EBP, GP_ESI, GP_EDI };
-    for (int i : order2) {
-        esp -= 4;
-        write_guest_mem32(ctx, esp, ctx->gp[i]);
-    }
-    ctx->gp[GP_ESP] = esp;
-}
-
-// POPAD helper: pop EDI, ESI, EBP, skip-ESP, EBX, EDX, ECX, EAX
-void popad_helper(GuestContext* ctx) {
-    uint32_t esp = ctx->gp[GP_ESP];
-    ctx->gp[GP_EDI] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_ESI] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_EBP] = read_guest_mem32(ctx, esp); esp += 4;
-    esp += 4; // skip ESP slot
-    ctx->gp[GP_EBX] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_EDX] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_ECX] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_EAX] = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_ESP] = esp;
-}
-
-// ENTER helper: ENTER imm16, nesting_level.
-// Level 0 (common): PUSH EBP; MOV EBP, ESP; SUB ESP, size.
-// Higher levels push additional frame pointers.
-void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
-    nesting &= 0x1F; // mask to 0..31
-
-    // Step 1: PUSH EBP
-    uint32_t esp = ctx->gp[GP_ESP] - 4;
-    write_guest_mem32(ctx, esp, ctx->gp[GP_EBP]);
-    uint32_t frame_ptr = esp; // value after the initial PUSH EBP
-
-    // Step 2: higher nesting levels push previous frame pointers
-    if (nesting > 0) {
-        for (uint32_t i = 1; i < nesting; ++i) {
-            ctx->gp[GP_EBP] -= 4;
-            esp -= 4;
-            write_guest_mem32(ctx, esp, read_guest_mem32(ctx, ctx->gp[GP_EBP]));
-        }
-        // Push the new frame pointer itself
-        esp -= 4;
-        write_guest_mem32(ctx, esp, frame_ptr);
-    }
-
-    // Step 3: MOV EBP, frame_ptr; SUB ESP, alloc_size
-    ctx->gp[GP_EBP] = frame_ptr;
-    ctx->gp[GP_ESP] = esp - alloc_size;
-}
-
-// XLATB helper: AL = byte at [EBX + zero_extend(AL)].
-// Returns the byte value to store in AL.
-uint32_t xlatb_helper(GuestContext* ctx) {
-    uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
-    uint32_t pa = guest_translate(ctx, ea, false);
-    if (pa < GUEST_RAM_SIZE) {
-        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        return base[pa];
-    }
-    return ctx->mmio ? ctx->mmio->read(pa, 1) : 0xFF;
-}
-
-// IRETD helper: pop EIP, CS, EFLAGS from guest stack (12 bytes).
-// Sets ctx->next_eip and ctx->eflags.  CS is ignored (flat model).
-// Also restores virtual_if from the IF bit of the popped EFLAGS.
-void iret_helper(GuestContext* ctx) {
-    uint32_t esp = ctx->gp[GP_ESP];
-    uint32_t new_eip    = read_guest_mem32(ctx, esp); esp += 4;
-    /* uint32_t cs = */    read_guest_mem32(ctx, esp); esp += 4; // ignored
-    uint32_t new_eflags = read_guest_mem32(ctx, esp); esp += 4;
-    ctx->gp[GP_ESP] = esp;
-    ctx->next_eip   = new_eip;
-    // Preserve only safe flags (mask out VM, IOPL, VIF, VIP, RF):
-    ctx->eflags = (new_eflags & 0x003F7FD5u) | 0x02u; // bit 1 always set
-    // Restore interrupt enable from the IF bit.
-    ctx->virtual_if = (new_eflags & 0x200u) != 0;
-}
-
-// ---------------------------------------------------------------------------
-// String instruction helpers (MOVS/STOS/LODS/CMPS/SCAS).
-//
-// Called from JIT code with all GP regs saved to ctx.
-//   arg0  ctx        — GuestContext*
-//   arg1  eflags     — captured host EFLAGS (DF bit controls direction)
-//   arg2  elem_size  — 1, 2, or 4
-//   arg3  rep_mode   — 0 = no prefix, 1 = REP/REPE, 2 = REPNE
-//
-// Returns the EFLAGS to restore.  MOVS/STOS/LODS return the input value
-// unchanged; CMPS/SCAS return updated arithmetic flags.
-// ---------------------------------------------------------------------------
-
-static uint32_t compute_sub_flags(uint32_t a, uint32_t b, uint32_t elem_size) {
-    uint32_t mask = (elem_size == 1) ? 0xFFu
-                  : (elem_size == 2) ? 0xFFFFu
-                  :                    0xFFFFFFFFu;
-    a &= mask; b &= mask;
-    uint32_t result = (a - b) & mask;
-    uint32_t flags = 0;
-    if (a < b)                    flags |= (1u << 0);  // CF
-    { uint8_t p = (uint8_t)result;
-      p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-      if (!(p & 1))              flags |= (1u << 2); } // PF
-    if ((a ^ b ^ result) & 0x10) flags |= (1u << 4);  // AF
-    if (result == 0)             flags |= (1u << 6);  // ZF
-    uint32_t sb = (elem_size == 1) ? 7 : (elem_size == 2) ? 15 : 31;
-    if ((result >> sb) & 1)      flags |= (1u << 7);  // SF
-    uint32_t sa = (a >> sb) & 1, sbb = (b >> sb) & 1, sr = (result >> sb) & 1;
-    if (sa != sbb && sa != sr)   flags |= (1u << 11); // OF
-    return flags;
-}
-
-static constexpr uint32_t ARITH_FLAGS_MASK = 0x8D5u; // CF|PF|AF|ZF|SF|OF
-
-uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,
-                            uint32_t elem_size, uint32_t rep_mode) {
-    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
-    uint32_t& esi = ctx->gp[GP_ESI];
-    uint32_t& edi = ctx->gp[GP_EDI];
-    uint32_t& ecx = ctx->gp[GP_ECX];
-
-    auto do_one = [&]() {
-        uint32_t val = guest_read(ctx, esi, elem_size);
-        guest_write(ctx, edi, val, elem_size);
-        esi += dir; edi += dir;
-    };
-    if (rep_mode == 0) do_one();
-    else while (ecx > 0) { do_one(); ecx--; }
-    return eflags;
-}
-
-uint32_t string_stos_helper(GuestContext* ctx, uint32_t eflags,
-                            uint32_t elem_size, uint32_t rep_mode) {
-    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
-    uint32_t eax = ctx->gp[GP_EAX];
-    uint32_t& edi = ctx->gp[GP_EDI];
-    uint32_t& ecx = ctx->gp[GP_ECX];
-
-    auto do_one = [&]() {
-        guest_write(ctx, edi, eax, elem_size);
-        edi += dir;
-    };
-    if (rep_mode == 0) do_one();
-    else while (ecx > 0) { do_one(); ecx--; }
-    return eflags;
-}
-
-uint32_t string_lods_helper(GuestContext* ctx, uint32_t eflags,
-                            uint32_t elem_size, uint32_t rep_mode) {
-    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
-    uint32_t& eax = ctx->gp[GP_EAX];
-    uint32_t& esi = ctx->gp[GP_ESI];
-    uint32_t& ecx = ctx->gp[GP_ECX];
-
-    auto do_one = [&]() {
-        uint32_t val = guest_read(ctx, esi, elem_size);
-        switch (elem_size) {
-        case 1: eax = (eax & 0xFFFFFF00u) | (val & 0xFF); break;
-        case 2: eax = (eax & 0xFFFF0000u) | (val & 0xFFFF); break;
-        case 4: eax = val; break;
-        }
-        esi += dir;
-    };
-    if (rep_mode == 0) do_one();
-    else while (ecx > 0) { do_one(); ecx--; }
-    return eflags;
-}
-
-uint32_t string_cmps_helper(GuestContext* ctx, uint32_t eflags,
-                            uint32_t elem_size, uint32_t rep_mode) {
-    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
-    uint32_t& esi = ctx->gp[GP_ESI];
-    uint32_t& edi = ctx->gp[GP_EDI];
-    uint32_t& ecx = ctx->gp[GP_ECX];
-    uint32_t rf = eflags;
-
-    auto do_one = [&]() {
-        uint32_t s = guest_read(ctx, esi, elem_size);
-        uint32_t d = guest_read(ctx, edi, elem_size);
-        rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
-        esi += dir; edi += dir;
-    };
-
-    if (rep_mode == 0) {
-        do_one();
-    } else {
-        while (ecx > 0) {
-            do_one(); ecx--;
-            if (rep_mode == 1 && !(rf & (1u<<6))) break; // REPE: stop if ZF=0
-            if (rep_mode == 2 &&  (rf & (1u<<6))) break; // REPNE: stop if ZF=1
-        }
-    }
-    return rf;
-}
-
-uint32_t string_scas_helper(GuestContext* ctx, uint32_t eflags,
-                            uint32_t elem_size, uint32_t rep_mode) {
-    int dir = (eflags & 0x400u) ? -(int)elem_size : (int)elem_size;
-    uint32_t eax = ctx->gp[GP_EAX];
-    uint32_t& edi = ctx->gp[GP_EDI];
-    uint32_t& ecx = ctx->gp[GP_ECX];
-    uint32_t rf = eflags;
-
-    auto do_one = [&]() {
-        uint32_t d = guest_read(ctx, edi, elem_size);
-        uint32_t s = 0;
-        switch (elem_size) {
-        case 1: s = eax & 0xFFu;   break;
-        case 2: s = eax & 0xFFFFu; break;
-        case 4: s = eax;           break;
-        }
-        rf = (rf & ~ARITH_FLAGS_MASK) | compute_sub_flags(s, d, elem_size);
-        edi += dir;
-    };
-
-    if (rep_mode == 0) {
-        do_one();
-    } else {
-        while (ecx > 0) {
-            do_one(); ecx--;
-            if (rep_mode == 1 && !(rf & (1u<<6))) break; // REPE: stop if ZF=0
-            if (rep_mode == 2 &&  (rf & (1u<<6))) break; // REPNE: stop if ZF=1
-        }
-    }
-    return rf;
-}
-
-} // extern "C"
 
 // ---------------------------------------------------------------------------
 // TraceBuilder
@@ -500,7 +18,7 @@ TraceBuilder::TraceBuilder() {
 }
 
 // ---------------------------------------------------------------------------
-// Static helpers — defined as class members to match the .hpp declarations
+// Static helpers â€” defined as class members to match the .hpp declarations
 // ---------------------------------------------------------------------------
 
 bool TraceBuilder::has_mem_operand(const ZydisDecodedOperand* ops,
@@ -537,14 +55,14 @@ uint8_t TraceBuilder::jcc_short_opcode(ZydisMnemonic m) {
 }
 
 // ===========================================================================
-// Emit handlers — free functions called via the dispatch table
+// Emit handlers â€” free functions called via the dispatch table
 // ===========================================================================
 
 // Shared: emit inline fastmem dispatch for a reg/mem MOV-like instruction.
 // `guest_enc` is the register encoding, `size_bits` the operand width,
 // `is_load` true for load, false for store.
 //
-// Emits the fastmem instruction padded to ≥5 bytes with trailing NOPs.
+// Emits the fastmem instruction padded to â‰¥5 bytes with trailing NOPs.
 // The VEH decodes the instruction bytes, selects a pre-generated helper,
 // and patches the region with CALL rel32 + NOP fill on first MMIO fault.
 static bool emit_fastmem_dispatch(Emitter& e, const ZydisDecodedOperand& mem_op,
@@ -580,7 +98,7 @@ static bool emit_fastmem_dispatch_store_imm(Emitter& e,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_clean — verbatim copy with INC/DEC r32 re-encoding
+// emit_handler_clean â€” verbatim copy with INC/DEC r32 re-encoding
 // ---------------------------------------------------------------------------
 bool emit_handler_clean(Emitter& e, const ZydisDecodedInstruction& insn,
                         const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -589,12 +107,12 @@ bool emit_handler_clean(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_lea — LEA has no memory access; re-encode to host form
+// emit_handler_lea â€” LEA has no memory access; re-encode to host form
 // ---------------------------------------------------------------------------
 bool emit_handler_lea(Emitter& e, const ZydisDecodedInstruction& insn,
                       const ZydisDecodedOperand* ops, const uint8_t* raw,
                       GuestContext* /*ctx*/, bool /*save_flags*/) {
-    // LEA reg, [mem] — compute EA in R14, then MOV guest_reg, R14D
+    // LEA reg, [mem] â€” compute EA in R14, then MOV guest_reg, R14D
     if (insn.operand_count < 2) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY)   return false;
@@ -604,7 +122,7 @@ bool emit_handler_lea(Emitter& e, const ZydisDecodedInstruction& insn,
 
     if (!emit_ea_to_r14(e, ops[1])) return false;
 
-    // Special case: LEA ESP, [...] → store R14D to ctx->gp[GP_ESP]
+    // Special case: LEA ESP, [...] â†’ store R14D to ctx->gp[GP_ESP]
     if (dst_enc == GP_ESP) {
         emit_store_r14_to_esp(e);
         return true;
@@ -617,7 +135,7 @@ bool emit_handler_lea(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_mov_mem — MOV r,[m] / MOV [m],r / MOV [m],imm / MOV CRn,r
+// emit_handler_mov_mem â€” MOV r,[m] / MOV [m],r / MOV [m],imm / MOV CRn,r
 // ---------------------------------------------------------------------------
 
 static bool is_control_register(ZydisRegister r) {
@@ -641,7 +159,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
         if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
             is_segment_register(ops[i].reg.value))
-            return false;  // reject → caller emits STOP_PRIVILEGED or #UD
+            return false;  // reject â†’ caller emits STOP_PRIVILEGED or #UD
     }
 
     int mem_idx = -1;
@@ -655,7 +173,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         bool src_esp = (insn.operand_count_visible >= 2 &&
                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                         ops[1].reg.value == ZYDIS_REGISTER_ESP);
-        // MOV ESP, imm32 → store immediate to ctx->gp[GP_ESP]
+        // MOV ESP, imm32 â†’ store immediate to ctx->gp[GP_ESP]
         if (dst_esp && insn.operand_count_visible >= 2 &&
             ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
             uint32_t imm = (uint32_t)(int32_t)ops[1].imm.value.s;
@@ -667,7 +185,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
             return true;
         }
         if (dst_esp && !src_esp) {
-            // MOV ESP, r32 → store source register to ctx->gp[GP_ESP]
+            // MOV ESP, r32 â†’ store source register to ctx->gp[GP_ESP]
             uint8_t src_enc = 0;
             if (!reg32_enc(ops[1].reg.value, src_enc)) return false;
             // MOV [R13+16], src_reg:  REX.B=0x41, 0x89, mod=01 reg=src rm=5(R13), disp8=16
@@ -677,7 +195,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
             return true;
         }
         if (src_esp && !dst_esp) {
-            // MOV r32, ESP → load ctx->gp[GP_ESP] into destination register
+            // MOV r32, ESP â†’ load ctx->gp[GP_ESP] into destination register
             uint8_t dst_enc = 0;
             if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
             // MOV dst_reg, [R13+16]:  REX.B=0x41, 0x8B, mod=01 reg=dst rm=5(R13), disp8=16
@@ -687,7 +205,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
             return true;
         }
         if (dst_esp && src_esp) {
-            return true; // MOV ESP, ESP → no-op
+            return true; // MOV ESP, ESP â†’ no-op
         }
         // No ESP involvement: verbatim copy
         e.copy(raw, insn.length);
@@ -708,7 +226,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     if (ops[other_idx].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     uint8_t guest_enc = 0;
     if (!guest_reg_enc(ops[other_idx].reg.value, guest_enc)) {
-        // High-byte register (AH/CH/DH/BH) — can't use REX, route through C helper.
+        // High-byte register (AH/CH/DH/BH) â€” can't use REX, route through C helper.
         uint32_t gp_idx = 0xFF;
         ZydisRegister r = ops[other_idx].reg.value;
         if      (r == ZYDIS_REGISTER_AH) gp_idx = GP_EAX;
@@ -734,8 +252,8 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
 
     // ESP special case: guest ESP is not in a host register.
-    // MOV ESP, [mem] → load from guest memory, store to ctx->gp[GP_ESP].
-    // MOV [mem], ESP → read ctx->gp[GP_ESP], store to guest memory.
+    // MOV ESP, [mem] â†’ load from guest memory, store to ctx->gp[GP_ESP].
+    // MOV [mem], ESP â†’ read ctx->gp[GP_ESP], store to guest memory.
     if (guest_enc == GP_ESP) {
         if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
         emit_paging_translate(e, /*is_write=*/!is_load);
@@ -760,7 +278,7 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_alu_esp_reg — Handle any reg-reg / reg-imm ALU instruction where one
+// emit_alu_esp_reg â€” Handle any reg-reg / reg-imm ALU instruction where one
 // operand is ESP.  Since guest ESP is not in a host register, we load it from
 // ctx into R14D, re-encode the instruction with R14D substituted for ESP,
 // then store R14D back to ctx->gp[GP_ESP] if ESP was the destination.
@@ -797,7 +315,7 @@ static bool emit_alu_esp_reg(Emitter& e,
     // Use Zydis raw info to locate the ModRM byte.
     // The ModRM byte offset is after prefixes + opcodes.
     // For short-form INC/DEC (0x40-0x47, 0x48-0x4F in 32-bit), there is no
-    // ModRM — the register is in the opcode itself.
+    // ModRM â€” the register is in the opcode itself.
 
     if (insn.mnemonic == ZYDIS_MNEMONIC_INC &&
         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
@@ -817,14 +335,14 @@ static bool emit_alu_esp_reg(Emitter& e,
     }
 
     // For instructions with a ModRM byte (mod=11), we re-encode with R14.
-    if (!insn.raw.modrm.offset) return false; // no ModRM → unsupported
+    if (!insn.raw.modrm.offset) return false; // no ModRM â†’ unsupported
 
     uint8_t modrm = raw[insn.raw.modrm.offset];
     uint8_t mod = (modrm >> 6) & 3;
     uint8_t reg = (modrm >> 3) & 7;
     uint8_t rm  = modrm & 7;
 
-    if (mod != 3) return false; // not reg-reg form — shouldn't happen here
+    if (mod != 3) return false; // not reg-reg form â€” shouldn't happen here
 
     // Determine which field(s) have ESP (encoding 4) and need R14 (encoding 6).
     uint8_t rex = 0x40; // base REX prefix (may not be needed if no extended regs)
@@ -881,7 +399,7 @@ static bool emit_alu_esp_reg(Emitter& e,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_alu_mem — ALU r,[m] / [m],r / [m],imm
+// emit_handler_alu_mem â€” ALU r,[m] / [m],r / [m],imm
 // For instructions with no mem operand (reg-reg), falls back to clean copy.
 // Memory forms use the generic rewriter to execute ALU on [R12+R14].
 // ---------------------------------------------------------------------------
@@ -890,7 +408,7 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           GuestContext* /*ctx*/, bool save_flags) {
     int mem_idx = -1;
     if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
-        // No mem operand → clean copy, unless ESP is involved.
+        // No mem operand â†’ clean copy, unless ESP is involved.
         // Guest ESP is not in a host register; intercept ESP operands.
         bool has_esp = false;
         for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
@@ -947,13 +465,13 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_flagmem — SETcc [mem] / CMOVcc r, [mem]
+// emit_handler_flagmem â€” SETcc [mem] / CMOVcc r, [mem]
 //
 // These instructions READ EFLAGS *and* access memory.  The SUB/ADD RSP
 // sequences in save_flags/restore_flags would clobber guest flags, so we
 // must save/restore EFLAGS around the memory dispatch:
 //
-//   EA → R14
+//   EA â†’ R14
 //   PUSHFQ                 ; save guest EFLAGS
 //   <fastmem or slow path> ; memory access (may clobber flags)
 //   POPFQ                  ; restore EFLAGS before SETcc/CMOVcc
@@ -979,7 +497,7 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
         return true;
     }
 
-    // Memory form — flag-preserving bounds check
+    // Memory form â€” flag-preserving bounds check
     if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
     emit_paging_translate(e, /*is_write=*/mem_idx == 0); // SETcc writes, CMOVcc reads
 
@@ -1004,7 +522,7 @@ bool emit_handler_flagmem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_enter — ENTER imm16, imm8 (create stack frame via C helper)
+// emit_handler_enter â€” ENTER imm16, imm8 (create stack frame via C helper)
 // ---------------------------------------------------------------------------
 bool emit_handler_enter(Emitter& e, const ZydisDecodedInstruction& insn,
                         const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
@@ -1026,7 +544,7 @@ bool emit_handler_enter(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_xlatb — XLATB: AL = [EBX + zero_extend(AL)]
+// emit_handler_xlatb â€” XLATB: AL = [EBX + zero_extend(AL)]
 // Calls C helper which reads the byte and returns it; we then store to AL.
 // ---------------------------------------------------------------------------
 bool emit_handler_xlatb(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
@@ -1047,7 +565,7 @@ bool emit_handler_xlatb(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_test_mem — TEST r,[m] / [m],r  (read-only)
+// emit_handler_test_mem â€” TEST r,[m] / [m],r  (read-only)
 // Memory forms use the generic rewriter.
 // ---------------------------------------------------------------------------
 bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
@@ -1073,7 +591,7 @@ bool emit_handler_test_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_push — PUSH r32 / PUSH imm (dispatch based on operand)
+// emit_handler_push â€” PUSH r32 / PUSH imm (dispatch based on operand)
 // ---------------------------------------------------------------------------
 bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
                        const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -1123,7 +641,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
         return true;
     }
 
-    // PUSH [mem] — read from memory, push onto guest stack
+    // PUSH [mem] â€” read from memory, push onto guest stack
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!emit_ea_to_r14(e, ops[0])) return false;
         if (save_flags) emit_save_flags(e);
@@ -1140,7 +658,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_pop — POP r32
+// emit_handler_pop â€” POP r32
 // ---------------------------------------------------------------------------
 bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                       const ZydisDecodedOperand* ops, const uint8_t* /*raw*/,
@@ -1175,7 +693,7 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
         return true;
     }
 
-    // POP [mem] — pop from guest stack, write to memory address
+    // POP [mem] â€” pop from guest stack, write to memory address
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!emit_ea_to_r14(e, ops[0])) return false;
         if (save_flags) emit_save_flags(e);
@@ -1192,7 +710,7 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_push_imm — PUSH imm routes through the general PUSH handler.
+// emit_handler_push_imm â€” PUSH imm routes through the general PUSH handler.
 // ---------------------------------------------------------------------------
 bool emit_handler_push_imm(Emitter& e, const ZydisDecodedInstruction& insn,
                            const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -1201,7 +719,7 @@ bool emit_handler_push_imm(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_pushad — PUSHAD: push all 8 GP regs onto guest stack.
+// emit_handler_pushad â€” PUSHAD: push all 8 GP regs onto guest stack.
 // ---------------------------------------------------------------------------
 bool emit_handler_pushad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                          const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
@@ -1216,7 +734,7 @@ bool emit_handler_pushad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_popad — POPAD: pop all 8 GP regs from guest stack (skip ESP).
+// emit_handler_popad â€” POPAD: pop all 8 GP regs from guest stack (skip ESP).
 // ---------------------------------------------------------------------------
 bool emit_handler_popad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                         const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
@@ -1231,7 +749,7 @@ bool emit_handler_popad(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_leave — LEAVE = MOV ESP, EBP; POP EBP
+// emit_handler_leave â€” LEAVE = MOV ESP, EBP; POP EBP
 // ---------------------------------------------------------------------------
 bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                         const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
@@ -1242,7 +760,7 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     e.emit8(uint8_t(0x45u | (GP_EBP << 3)));  // mod=01, reg=EBP=5, rm=R13&7=5
     e.emit8(gp_offset(GP_ESP));
 
-    // Step 2: POP EBP — read dword from [ESP], write to EBP, ESP += 4
+    // Step 2: POP EBP â€” read dword from [ESP], write to EBP, ESP += 4
     emit_load_esp_to_r14(e);
     emit_paging_translate(e, /*is_write=*/false);
 
@@ -1256,7 +774,7 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_pushfd — PUSHFD: push EFLAGS onto guest stack.
+// emit_handler_pushfd â€” PUSHFD: push EFLAGS onto guest stack.
 //
 // 1. Capture host EFLAGS into R14 (PUSHFQ + POP R14).
 // 2. Save all GP registers, call pushfd_helper(ctx, R14D), restore GP.
@@ -1268,7 +786,7 @@ bool emit_handler_leave(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 bool emit_handler_pushfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
                          const ZydisDecodedOperand* /*ops*/, const uint8_t* /*raw*/,
                          GuestContext* /*ctx*/, bool save_flags) {
-    // Capture EFLAGS → R14D
+    // Capture EFLAGS â†’ R14D
     e.emit8(0x9C);                      // PUSHFQ
     e.emit8(0x41); e.emit8(0x5E);      // POP R14
 
@@ -1285,13 +803,13 @@ bool emit_handler_pushfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_popfd — POPFD: pop EFLAGS from guest stack.
+// emit_handler_popfd â€” POPFD: pop EFLAGS from guest stack.
 //
-// 1. Save all GP, call popfd_helper(ctx) → returns EFLAGS in EAX.
+// 1. Save all GP, call popfd_helper(ctx) â†’ returns EFLAGS in EAX.
 // 2. PUSH RAX + POPFQ to set host EFLAGS from returned value.
 // 3. Restore all GP registers (MOV does not affect EFLAGS).
 //
-// POPFD DEFINES new EFLAGS, so save_flags from a prior instruction is moot —
+// POPFD DEFINES new EFLAGS, so save_flags from a prior instruction is moot â€”
 // we still wrap to protect the call sequence, but the final POPFQ sets the
 // new flag state.
 // ---------------------------------------------------------------------------
@@ -1303,18 +821,18 @@ bool emit_handler_popfd(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     emit_call_abs(e, reinterpret_cast<void*>(popfd_helper));
     // EAX = popped EFLAGS value
     e.emit8(0x50);                      // PUSH RAX
-    e.emit8(0x9D);                      // POPFQ  — sets host EFLAGS
+    e.emit8(0x9D);                      // POPFQ  â€” sets host EFLAGS
     emit_load_all_gp(e);               // MOVs don't touch flags
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_string — MOVS/STOS/LODS/CMPS/SCAS (± REP/REPE/REPNE).
+// emit_handler_string â€” MOVS/STOS/LODS/CMPS/SCAS (Â± REP/REPE/REPNE).
 //
-// 1. Capture host EFLAGS → R14 (for DF direction bit).
+// 1. Capture host EFLAGS â†’ R14 (for DF direction bit).
 // 2. Save GP, call the appropriate C helper(ctx, eflags, elem_size, rep_mode).
-// 3. CMPS/SCAS: helper returns new EFLAGS in EAX → save to R14.
-//    MOVS/STOS/LODS: helper returns input EFLAGS unchanged → R14 is still good.
+// 3. CMPS/SCAS: helper returns new EFLAGS in EAX â†’ save to R14.
+//    MOVS/STOS/LODS: helper returns input EFLAGS unchanged â†’ R14 is still good.
 // 4. Load GP (ESI/EDI/ECX updated by helper), PUSH R14 + POPFQ to set flags.
 // ---------------------------------------------------------------------------
 bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
@@ -1376,7 +894,7 @@ bool emit_handler_string(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_movzx_mem — MOVZX r32, [m] (byte/word source)
+// emit_handler_movzx_mem â€” MOVZX r32, [m] (byte/word source)
 // ---------------------------------------------------------------------------
 bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                             const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -1406,7 +924,7 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
         emit_pad_to(e, patch_start, 5);
         e.add_mem_site(patch_start, e.fault_eip,
                        (uint8_t)(e.pos - patch_start));
-        // AND dst, 0xFFFF0000; OR dst, R14D — merge into low 16 bits
+        // AND dst, 0xFFFF0000; OR dst, R14D â€” merge into low 16 bits
         e.emit8(0x81); e.emit8(uint8_t(0xE0u | dst_enc)); e.emit32(0xFFFF0000u);
         e.emit8(0x44); e.emit8(0x09); e.emit8(uint8_t(0xC0u | (6u << 3) | dst_enc));
         return true;
@@ -1431,7 +949,7 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_movsx_mem — MOVSX r32, [m] (byte/word source)
+// emit_handler_movsx_mem â€” MOVSX r32, [m] (byte/word source)
 // ---------------------------------------------------------------------------
 bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                             const ZydisDecodedOperand* ops, const uint8_t* raw,
@@ -1468,7 +986,7 @@ bool emit_handler_movsx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
 }
 
 // ---------------------------------------------------------------------------
-// emit_handler_fpu_mem — x87 instructions with memory operand forms.
+// emit_handler_fpu_mem â€” x87 instructions with memory operand forms.
 // Register-only forms (FADD ST(i),ST(0) etc.) are verbatim-copied.
 // Memory forms use the generic rewriter to access [R12+R14].
 // ---------------------------------------------------------------------------
@@ -1544,7 +1062,7 @@ void TraceBuilder::emit_jmp_exit(Emitter& e,
             if (emit_ea_to_r14(e, op)) {
                 // Save guest regs (preserves all original values in ctx)
                 emit_save_all_gp(e);
-                // Call read_guest_mem32(ctx, R14D) → EAX = target
+                // Call read_guest_mem32(ctx, R14D) â†’ EAX = target
                 emit_ccall_arg0_ctx(e);
                 emit_ccall_arg1_pa(e);
                 emit_call_abs(e, reinterpret_cast<void*>(read_guest_mem32));
@@ -1605,7 +1123,7 @@ void TraceBuilder::emit_call_exit(Emitter& e,
             if (emit_ea_to_r14(e, op)) {
                 // Save guest regs (preserves all original values in ctx)
                 emit_save_all_gp(e);
-                // Call call_mem_helper(ctx, R14D, pc_after) → EAX = target
+                // Call call_mem_helper(ctx, R14D, pc_after) â†’ EAX = target
                 emit_ccall_arg0_ctx(e);
                 emit_ccall_arg1_pa(e);
                 emit_ccall_arg2_imm(e, pc_after);
@@ -1636,9 +1154,9 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/,
     // Step 2: R14D = ctx->esp (ESP was never in a host register; read from ctx).
     emit_load_esp_to_r14(e);
 
-    // Step 3: fastmem load (padded to ≥5 bytes for CALL rel32 patching).
+    // Step 3: fastmem load (padded to â‰¥5 bytes for CALL rel32 patching).
     emit_paging_translate(e, /*is_write=*/false);
-    // EAX = [R12 + R14]  — return address from guest stack.
+    // EAX = [R12 + R14]  â€” return address from guest stack.
     uint32_t patch_start = (uint32_t)e.pos;
     emit_fastmem_op(e, GP_EAX, 32, true);
     emit_pad_to(e, patch_start, 5);
@@ -1651,14 +1169,14 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/,
     emit_add_ctx_esp(e, 4 + extra_pop);
 
     // Step 6: ctx->next_eip = EAX  (direct write; bypass gpreg slot).
-    //   MOV [R13+next_eip], EAX  →  REX.B=0x41  MOV-store=0x89  ModRM mod=01 reg=0 rm=5=0x45
+    //   MOV [R13+next_eip], EAX  â†’  REX.B=0x41  MOV-store=0x89  ModRM mod=01 reg=0 rm=5=0x45
     e.emit8(0x41); e.emit8(0x89); e.emit8(0x45); e.emit8(CTX_NEXT_EIP);
 
     // Step 7: restore EAX from ctx->gp[0] (the value saved in Step 1).
     // The trampoline will re-save it, but now it will see the correct value.
     emit_load_gp(e, GP_EAX, gp_offset(GP_EAX));
 
-    e.emit8(0xC3); // RET → trampoline
+    e.emit8(0xC3); // RET â†’ trampoline
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,12 +1200,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             TraceArena&         arena,
                             GuestContext*       ctx) {
     if (code_len == 0) {
-        fprintf(stderr, "[trace] EIP %08X — no code bytes available\n", guest_eip);
+        fprintf(stderr, "[trace] EIP %08X â€” no code bytes available\n", guest_eip);
         return nullptr;
     }
 
     // =================================================================
-    // Phase 1: Pre-scan — decode instructions, extract flag metadata.
+    // Phase 1: Pre-scan â€” decode instructions, extract flag metadata.
     // =================================================================
     struct InsnMeta {
         uint8_t  length;
@@ -1763,7 +1281,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     }
 
     // =================================================================
-    // Phase 3: Emit — re-decode and generate host code.
+    // Phase 3: Emit â€” re-decode and generate host code.
     // =================================================================
     uint8_t* emit_buf = cc.alloc(MAX_TRACE_BYTES);
     if (!emit_buf) { fprintf(stderr, "[trace] code cache full\n"); return nullptr; }
@@ -1790,7 +1308,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, pc, avail, &insn, ops);
         if (!ZYAN_SUCCESS(st)) {
-            // Undecodable instruction → #UD.
+            // Undecodable instruction â†’ #UD.
             emit_save_all_gp(e);
             emit_save_eflags(e);
             emit_write_next_eip_imm(e, guest_pc);
@@ -1832,7 +1350,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 e.emit8(uint8_t(0x40u | (6u << 3) | 5u));
                 e.emit8(CTX_EFLAGS);
                 e.emit8(0x41); e.emit8(0x56);  // PUSH R14
-                e.emit8(0x9D);                  // POPFQ — set host EFLAGS
+                e.emit8(0x9D);                  // POPFQ â€” set host EFLAGS
                 // Reload GP regs from ctx (C call clobbered EAX/ECX/EDX).
                 emit_load_all_gp(e);
                 e.emit8(0xC3);
@@ -1862,15 +1380,15 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 // All three do NOT modify EFLAGS per the ISA, but we are at a
                 // trace boundary so corrupting flags is acceptable.
                 if (insn.mnemonic == ZYDIS_MNEMONIC_LOOP) {
-                    // DEC ECX (ModRM form: 0xFF /1 → 0xFF 0xC9)
+                    // DEC ECX (ModRM form: 0xFF /1 â†’ 0xFF 0xC9)
                     e.emit8(0xFF); e.emit8(0xC9);
-                    // TEST ECX, ECX (0x85 0xC9) — sets ZF if ECX==0
+                    // TEST ECX, ECX (0x85 0xC9) â€” sets ZF if ECX==0
                     e.emit8(0x85); e.emit8(0xC9);
                     emit_epilog_conditional(e, 0x75 /*JNZ*/, taken_eip,
                                             pc_after);
                 } else if (insn.mnemonic == ZYDIS_MNEMONIC_LOOPE) {
                     // Check original ZF before DEC clobbers it.
-                    // ZF==0 → not taken (skip to DEC + fallthrough).
+                    // ZF==0 â†’ not taken (skip to DEC + fallthrough).
                     e.emit8(0x0F); e.emit8(0x85);  // JNZ rel32
                     uint8_t* zf_fail = e.reserve_rel32();
                     e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
@@ -1883,7 +1401,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                     emit_epilog_static(e, pc_after);
                 } else {
                     // LOOPNE: check original ZF before DEC clobbers it.
-                    // ZF==1 → not taken (skip to DEC + fallthrough).
+                    // ZF==1 â†’ not taken (skip to DEC + fallthrough).
                     e.emit8(0x0F); e.emit8(0x84);  // JZ rel32
                     uint8_t* zf_fail = e.reserve_rel32();
                     e.emit8(0xFF); e.emit8(0xC9);  // DEC ECX
@@ -1929,12 +1447,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             emit_save_eflags(e);
             emit_write_next_eip_imm(e, guest_pc);
             emit_set_stop_reason(e, STOP_PRIVILEGED);
-            e.emit8(0xC3); // RET — run loop calls handle_privileged()
+            e.emit8(0xC3); // RET â€” run loop calls handle_privileged()
             done_flag = true;
             goto advance;
         }
 
-        // ---- MOV CRn / MOV DRn — privileged, but shares MNEMONIC_MOV ----
+        // ---- MOV CRn / MOV DRn â€” privileged, but shares MNEMONIC_MOV ----
         if (insn.mnemonic == ZYDIS_MNEMONIC_MOV) {
             bool has_cr_dr = false;
             for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
@@ -1981,7 +1499,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             if (ic && ic->handler) {
                 bool save = (insn_idx < n_insns) && meta[insn_idx].need_save;
                 if (!ic->handler(e, insn, ops, pc, ctx, save)) {
-                    // Handler rejected this form → #UD.
+                    // Handler rejected this form â†’ #UD.
                     emit_save_all_gp(e);
                     emit_save_eflags(e);
                     emit_write_next_eip_imm(e, guest_pc);
@@ -2041,12 +1559,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 }
 
 // ---------------------------------------------------------------------------
-// generate_mmio_helpers — pre-generate shared MMIO slow-path stubs.
+// generate_mmio_helpers â€” pre-generate shared MMIO slow-path stubs.
 //
 // Layout:
 //   3 shared tails (read_tail, write_tail, write_imm_tail) ~56 bytes each.
-//   24 read helpers  = 8 regs × 3 sizes (1, 2, 4 bytes)
-//   24 write helpers = 8 regs × 3 sizes
+//   24 read helpers  = 8 regs Ã— 3 sizes (1, 2, 4 bytes)
+//   24 write helpers = 8 regs Ã— 3 sizes
 //   3 write_imm entries = 3 sizes (reads imm from R15D, set by per-site thunk)
 //
 // Each helper entry:
@@ -2113,7 +1631,7 @@ void generate_mmio_helpers(uint8_t* page, size_t page_cap, MmioHelpers& out) {
         }
         emit_ccall_arg3_imm(e, size);   // arg3 = size  (immediate)
 
-        // JMP rel32 → shared tail
+        // JMP rel32 â†’ shared tail
         uint8_t* tail = is_write_imm ? write_imm_tail
                       : is_load      ? read_tail
                                      : write_tail;

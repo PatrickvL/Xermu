@@ -17,9 +17,9 @@
 //   --mcpx: (optional with --bios) Load a 512-byte MCPX ROM dump.
 // ---------------------------------------------------------------------------
 
-#include "executor.hpp"
-#include "xbox.hpp"
-#include "xbe_loader.hpp"
+#include "cpu/executor.hpp"
+#include "xbox/xbox.hpp"
+#include "xbox/hle/hle_kernel.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

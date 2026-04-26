@@ -38,24 +38,27 @@ the appropriate device emulator. Clean memory accesses go through
 │   ├── xbox5838.bin              Xbox BIOS ROM (256 KB)
 │   └── xbox dash orig_5960/      Dashboard XBE + assets
 └── src/
-    ├── context.hpp               GuestContext struct, register indices, StopReason
-    ├── platform.hpp              OS memory (4 GB fastmem window, RWX slabs)
-    ├── mmio.hpp                  MMIO region dispatch table
-    ├── code_cache.hpp            32 MB executable slab allocator
-    ├── trace.hpp                 Trace struct, TraceCache hash table
-    ├── emitter.hpp               Byte emitter, EA synthesis, fastmem helpers
-    ├── trace_builder.hpp         TraceBuilder, TraceArena, FaultBitmaps, SoftTlb
-    ├── trace_builder.cpp         Decode → classify → emit loop
-    ├── executor.hpp              Executor struct, dispatch_trace decl
-    ├── executor.cpp              Run loop, VEH fault handler, interrupt delivery
-    ├── fault_handler.hpp         VEH-based MMIO fault decode & dispatch
-    ├── insn_dispatch.hpp         Instruction-level MMIO read/write dispatch
-    ├── dispatch_trace.asm        MASM trampoline (MSVC)
     ├── main.cpp                  BIOS boot / XBE loader entry point
-    ├── pe_loader.hpp             Win32 PE loader (for testing with native PEs)
-    ├── xbe_loader.hpp            XBE loader + HLE kernel (xboxkrnl.exe stubs)
-    ├── xbox.hpp                  Xbox hardware constants and memory map
-    ├── xbox/
+    ├── cpu/                      Intel Pentium III Coppermine JIT engine
+    │   ├── context.hpp           GuestContext struct, register indices, StopReason
+    │   ├── platform.hpp          OS memory (4 GB fastmem window, RWX slabs)
+    │   ├── mmio.hpp              MMIO region dispatch table
+    │   ├── code_cache.hpp        32 MB executable slab allocator
+    │   ├── trace.hpp             Trace struct, TraceCache hash table
+    │   ├── emitter.hpp           Byte emitter, EA synthesis, fastmem helpers
+    │   ├── trace_builder.hpp     TraceBuilder, TraceArena, FaultBitmaps, SoftTlb
+    │   ├── trace_builder.cpp     Decode → classify → emit loop
+    │   ├── insn_dispatch.hpp     Per-instruction emit handlers (386–SSE)
+    │   ├── jit_helpers.hpp       Declarations for extern "C" JIT slow-path helpers
+    │   ├── jit_helpers.cpp       MMIO dispatch, VA translation, ESP/string helpers
+    │   ├── executor.hpp          Executor struct, I/O dispatch, HLE callback
+    │   ├── executor.cpp          Run loop, interrupt delivery, SMC, block linking
+    │   ├── privileged.cpp        Privileged instruction emulation (HLT, IN/OUT, …)
+    │   ├── veh_handler.cpp       Windows VEH: fastmem faults, MMIO hot-patching
+    │   ├── fault_handler.hpp     VEH declarations + global executor pointer
+    │   └── dispatch_trace.asm    MASM x86-64 trampoline (MSVC)
+    ├── xbox/                     Xbox hardware device emulation
+    │   ├── xbox.hpp              Umbrella header — includes all device headers
     │   ├── address_map.hpp       Physical address map definitions
     │   ├── setup.hpp             Hardware init (PCI, MMIO ranges, RAM mirrors)
     │   ├── nv2a.hpp              NV2A GPU register emulation
@@ -70,14 +73,18 @@ the appropriate device emulator. Clean memory accesses go through
     │   ├── pit.hpp               8254 PIT timer
     │   ├── ioapic.hpp            I/O APIC
     │   ├── pci.hpp               PCI config space
+    │   ├── pe_loader.hpp         Win32 PE loader (for testing with native PEs)
     │   ├── ram_mirror.hpp        RAM mirror/tiling logic
-    │   └── misc_io.hpp           Miscellaneous I/O ports
-    ├── test_pe_loader.cpp        PE loader unit test
-    ├── test_pgraph.cpp           PGRAPH state unit test
+    │   ├── misc_io.hpp           Miscellaneous I/O ports
+    │   └── hle/                  Xbox kernel HLE (High-Level Emulation)
+    │       ├── xbe_loader.hpp    XBE file parser, section loader, thunk resolver
+    │       └── hle_kernel.hpp    Kernel ordinal handler (~150 stubs), XbeHeap
     └── tests/
         ├── harness.inc           NASM test macros (ASSERT_EQ, PASS, etc.)
         ├── test_runner.cpp       Test runner: loads .bin, runs in JIT, checks exit
-        └── *.asm                 50 NASM test files (ALU, FPU, SSE, MMIO, HLE, …)
+        ├── test_pe_loader.cpp    PE loader unit test
+        ├── test_pgraph.cpp       PGRAPH state unit test
+        └── *.asm                 50+ NASM test files (ALU, FPU, SSE, MMIO, HLE, …)
 ```
 
 ## Building

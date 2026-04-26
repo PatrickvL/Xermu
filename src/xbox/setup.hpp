@@ -15,7 +15,7 @@
 #include "pic.hpp"
 #include "pit.hpp"
 #include "misc_io.hpp"
-#include "../executor.hpp"
+#include "cpu/executor.hpp"
 #include <cstring>
 
 namespace xbox {

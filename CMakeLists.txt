@@ -23,20 +23,23 @@ FetchContent_MakeAvailable(zydis)
 # Common source files (shared between executables)
 # ---------------------------------------------------------------------------
 set(COMMON_SOURCES
-    src/trace_builder.cpp
-    src/executor.cpp
+    src/cpu/trace_builder.cpp
+    src/cpu/executor.cpp
+    src/cpu/jit_helpers.cpp
+    src/cpu/privileged.cpp
+    src/cpu/veh_handler.cpp
 )
 
 if(MSVC)
     enable_language(ASM_MASM)
-    list(APPEND COMMON_SOURCES src/dispatch_trace.asm)
+    list(APPEND COMMON_SOURCES src/cpu/dispatch_trace.asm)
 endif()
 
 # ---------------------------------------------------------------------------
 # Main executable (self-tests with embedded byte arrays)
 # ---------------------------------------------------------------------------
 add_executable(guided_executor ${COMMON_SOURCES} src/main.cpp)
-target_include_directories(guided_executor PRIVATE src)
+target_include_directories(guided_executor PRIVATE src src/cpu)
 target_link_libraries(guided_executor PRIVATE Zydis)
 
 if(MSVC)
@@ -52,7 +55,7 @@ endif()
 # Test runner executable (loads flat 32-bit .bin files)
 # ---------------------------------------------------------------------------
 add_executable(test_runner ${COMMON_SOURCES} src/tests/test_runner.cpp)
-target_include_directories(test_runner PRIVATE src)
+target_include_directories(test_runner PRIVATE src src/cpu)
 target_link_libraries(test_runner PRIVATE Zydis)
 
 if(MSVC)
@@ -67,8 +70,8 @@ endif()
 # ---------------------------------------------------------------------------
 # PE loader unit test (standalone — no JIT, no Zydis)
 # ---------------------------------------------------------------------------
-add_executable(test_pe_loader src/test_pe_loader.cpp)
-target_include_directories(test_pe_loader PRIVATE src)
+add_executable(test_pe_loader src/tests/test_pe_loader.cpp)
+target_include_directories(test_pe_loader PRIVATE src src/cpu)
 if(MSVC)
     target_compile_options(test_pe_loader PRIVATE /W3)
 else()
@@ -78,8 +81,8 @@ endif()
 # ---------------------------------------------------------------------------
 # PGRAPH state shadow unit test (standalone — no JIT, no Zydis)
 # ---------------------------------------------------------------------------
-add_executable(test_pgraph src/test_pgraph.cpp)
-target_include_directories(test_pgraph PRIVATE src)
+add_executable(test_pgraph src/tests/test_pgraph.cpp)
+target_include_directories(test_pgraph PRIVATE src src/cpu)
 if(MSVC)
     target_compile_options(test_pgraph PRIVATE /W3)
 else()

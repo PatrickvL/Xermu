@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // VEH fault handler declarations for 4 GB fastmem window.
 //
-// The actual handler is defined in executor.cpp (which has full Executor access).
+// The actual handler is defined in veh_handler.cpp (which has full Executor access).
 // This header provides the global executor pointer and registration helpers.
 // ---------------------------------------------------------------------------
 

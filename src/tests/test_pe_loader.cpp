@@ -5,7 +5,7 @@
 // and verifies headers, section content, and export resolution.
 // ---------------------------------------------------------------------------
 
-#include "pe_loader.hpp"
+#include "xbox/pe_loader.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
