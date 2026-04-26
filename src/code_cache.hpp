@@ -4,36 +4,43 @@
 #include <cassert>
 #include <cstdint>
 
-static constexpr size_t CODE_CACHE_BYTES = 32u * 1024u * 1024u; // 32 MB for JIT code
-static constexpr size_t STUB_SLAB_BYTES  = 1u  * 1024u * 1024u; // 1 MB for MMIO slow-path stubs
+static constexpr size_t CODE_CACHE_BYTES   = 32u * 1024u * 1024u; // 32 MB for JIT code
+static constexpr size_t HELPER_PAGE_BYTES  = 4096u;               // pre-generated MMIO helpers
+static constexpr size_t THUNK_SLAB_BYTES   = 64u * 1024u;         // write-imm per-site thunks
 
 struct CodeCache {
-    uint8_t* base      = nullptr;
-    size_t   cap       = 0;
-    size_t   used      = 0;
+    uint8_t* base       = nullptr;
+    size_t   cap        = 0;
+    size_t   used       = 0;
 
-    // Stub slab: occupies the top of the same RWX allocation, after the JIT
-    // code area.  Proximity guarantees CALL rel32 reaches from any JIT trace.
-    uint8_t* stub_base = nullptr;
-    size_t   stub_cap  = 0;
-    size_t   stub_used = 0;
+    // Helper page: pre-generated shared MMIO slow-path stubs (48 read/write +
+    // 3 write_imm tails).  Sits right after the JIT code area.
+    uint8_t* helper_page = nullptr;
 
-    bool init(size_t jit_capacity  = CODE_CACHE_BYTES,
-              size_t stub_capacity = STUB_SLAB_BYTES) {
-        const size_t total = jit_capacity + stub_capacity;
+    // Thunk slab: small per-site thunks for write-imm (MOV R15D,imm + JMP).
+    // Sits after the helper page in the same RWX allocation.
+    uint8_t* thunk_base = nullptr;
+    size_t   thunk_cap  = 0;
+    size_t   thunk_used = 0;
+
+    bool init(size_t jit_capacity   = CODE_CACHE_BYTES,
+              size_t helper_bytes   = HELPER_PAGE_BYTES,
+              size_t thunk_capacity = THUNK_SLAB_BYTES) {
+        const size_t total = jit_capacity + helper_bytes + thunk_capacity;
         base = static_cast<uint8_t*>(platform::alloc_exec(total));
         if (!base) return false;
-        cap       = jit_capacity;
-        used      = 0;
-        stub_base = base + jit_capacity;
-        stub_cap  = stub_capacity;
-        stub_used = 0;
+        cap         = jit_capacity;
+        used        = 0;
+        helper_page = base + jit_capacity;
+        thunk_base  = helper_page + helper_bytes;
+        thunk_cap   = thunk_capacity;
+        thunk_used  = 0;
         return true;
     }
 
     void destroy() {
         if (base) {
-            platform::free_exec(base, cap + stub_cap);
+            platform::free_exec(base, cap + HELPER_PAGE_BYTES + thunk_cap);
             base = nullptr;
         }
     }
@@ -47,19 +54,19 @@ struct CodeCache {
         return p;
     }
 
-    // Carve out n bytes in the stub slab, 16-byte aligned. Returns null on overflow.
-    uint8_t* alloc_stub(size_t n) {
-        size_t a = (stub_used + 15u) & ~15ull;
-        if (a + n > stub_cap) return nullptr;
-        uint8_t* p = stub_base + a;
-        stub_used = a + n;
+    // Carve out n bytes in the thunk slab, 16-byte aligned. Returns null on overflow.
+    uint8_t* alloc_thunk(size_t n) {
+        size_t a = (thunk_used + 15u) & ~15ull;
+        if (a + n > thunk_cap) return nullptr;
+        uint8_t* p = thunk_base + a;
+        thunk_used = a + n;
         return p;
     }
 
-    void reset() { used = 0; stub_used = 0; }
+    void reset() { used = 0; thunk_used = 0; }
 
-    // Check if a host address is within the code cache or stub slab.
+    // Check if a host address is within the code cache, helper page, or thunk slab.
     bool contains(const uint8_t* addr) const {
-        return addr >= base && addr < base + cap + stub_cap;
+        return addr >= base && addr < base + cap + HELPER_PAGE_BYTES + thunk_cap;
     }
 };

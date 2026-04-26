@@ -1,6 +1,5 @@
 #pragma once
 #include "context.hpp"
-#include "trace.hpp"
 #include <cstdint>
 #include <cstring>
 #include <cassert>
@@ -28,30 +27,22 @@ struct Emitter {
     int num_pending_links = 0;
 
     // Memory-op site table: accumulated during emit, transferred to Trace.
-    // host_offset is provided explicitly by the caller (offset of the fastmem insn).
+    // host_offset is provided explicitly by the caller (offset of the patchable region).
     struct MemSite {
-        uint32_t     host_offset;
-        uint32_t     guest_eip;
-        SlowPathKind sp_kind;
-        uint8_t      sp_reg_enc;
-        uint8_t      sp_size;
-        uint8_t      skip_len;
-        bool         sp_save_flags;
-        uint32_t     sp_imm;
+        uint32_t host_offset;
+        uint32_t guest_eip;
+        uint8_t  patch_len;
     };
     static constexpr int MAX_MEM_SITES = 64;
     MemSite mem_sites[MAX_MEM_SITES] = {};
     int num_mem_sites = 0;
 
-    // Record a mem_site at host_off (caller must compute this as e.pos before
-    // the fastmem instruction is emitted).
-    void add_mem_site(uint32_t host_off, uint32_t geip,
-                      SlowPathKind kind = SP_NONE, uint8_t reg_enc = 0,
-                      uint8_t size = 0, uint8_t skip = 0,
-                      bool save_flags = false, uint32_t imm = 0) {
+    // Record a mem_site.  For patchable sites, host_off is the start of the
+    // patchable region and plen is the total bytes (fastmem insn + pad NOPs).
+    // Non-patchable sites (ALU/FPU/SSE) pass plen=0.
+    void add_mem_site(uint32_t host_off, uint32_t geip, uint8_t plen = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { host_off, geip, kind, reg_enc,
-                                           size, skip, save_flags, imm };
+            mem_sites[num_mem_sites++] = { host_off, geip, plen };
     }
 
     void add_pending_link(uint8_t* site, uint32_t target) {
@@ -90,12 +81,11 @@ struct Emitter {
     }
 };
 
-// Emit a 5-byte NOP sled (five 0x90 single-byte NOPs) immediately before a
-// patchable fastmem instruction.  The VEH patches this sled to CALL rel32
-// (0xE8 + 4-byte offset) on the first MMIO fault, redirecting to a generated
-// slow-path stub without rebuilding the trace.
-inline void emit_nop_sled(Emitter& e) {
-    e.emit8(0x90); e.emit8(0x90); e.emit8(0x90); e.emit8(0x90); e.emit8(0x90);
+// Pad the current emission point up to `min_len` bytes from `start_pos`
+// with single-byte NOPs (0x90).  Used to ensure patchable fastmem regions
+// are at least 5 bytes (enough for a CALL rel32).
+inline void emit_pad_to(Emitter& e, size_t start_pos, size_t min_len) {
+    while (e.pos - start_pos < min_len) e.emit8(0x90);
 }
 
 // ---------------------------------------------------------------------------

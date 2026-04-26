@@ -84,20 +84,40 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Generate a slow-path MMIO dispatch stub for the given patchable mem site.
+// Pre-generated MMIO slow-path helper page.
 //
-// The stub is called via CALL rel32 from the 5-byte NOP sled that precedes
-// the fastmem instruction.  On entry:
-//   [RSP]  = return address = address of fastmem instruction in host code
-//   R13    = GuestContext*
-//   R14D   = physical address of the memory operation
-//   host GP registers hold current guest register values
+// 48 shared helpers (24 read + 24 write) indexed by [reg_enc][size_idx],
+// plus 3 write_imm tails indexed by [size_idx].  All fit in one 4 KB page
+// allocated alongside the JIT code cache (guaranteeing CALL rel32 reach).
 //
-// The stub saves GP regs, calls the appropriate MMIO helper, restores GP
-// regs, advances the return address past the fastmem instruction by
-// site.skip_len bytes, then returns.
+// Each helper:  PUSHFQ → save_all_gp → setup_args → call mmio_fn →
+//               load_all_gp → POPFQ → RET.
 //
-// Returns the number of bytes written into buf[0..cap), or 0 on failure.
+// The VEH decodes the faulting fastmem instruction to determine (direction,
+// reg, size), looks up the helper address, and patches CALL rel32 in place.
+//
+// For write-imm sites: a tiny per-site thunk (MOV R15D,imm + JMP tail) is
+// generated from the thunk slab; the shared write_imm tail reads R15D.
 // ---------------------------------------------------------------------------
-size_t generate_slow_path_stub(uint8_t* buf, size_t cap,
-                                const Trace::MemOpSite& site);
+struct MmioHelpers {
+    uint8_t* read_helpers[8][3]  = {};  // [reg_enc][size_idx]  size_idx: 0=1B, 1=2B, 2=4B
+    uint8_t* write_helpers[8][3] = {};  // [reg_enc][size_idx]
+    uint8_t* write_imm_tails[3]  = {};  // [size_idx]  (thunks JMP here)
+
+    uint8_t* lookup_read(uint8_t reg_enc, uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return read_helpers[reg_enc & 7][si];
+    }
+    uint8_t* lookup_write(uint8_t reg_enc, uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return write_helpers[reg_enc & 7][si];
+    }
+    uint8_t* lookup_write_imm(uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return write_imm_tails[si];
+    }
+};
+
+// Emit all shared MMIO helpers into the code-cache helper page.
+// Must be called once after CodeCache::init().
+void generate_mmio_helpers(uint8_t* page, size_t page_cap, MmioHelpers& out);
