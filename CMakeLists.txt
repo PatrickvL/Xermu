@@ -34,7 +34,7 @@ FetchContent_Declare(sdl3
 set(SDL_SHARED  OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC  ON  CACHE BOOL "" FORCE)
 set(SDL_TEST    OFF CACHE BOOL "" FORCE)
-set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+set(SDL_VULKAN  ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(sdl3)
 
 # ---------------------------------------------------------------------------
