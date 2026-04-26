@@ -33,18 +33,22 @@ struct Trace {
     }
 
     // Memory-op site table: maps host code offset → guest EIP for VEH lookup.
-    // Populated during trace build at each memory-op emit site.
+    // Patchable sites have patch_len ≥ 5: the VEH decodes the intact fastmem
+    // instruction bytes to derive (direction, reg, size), selects a pre-generated
+    // helper, and overwrites the region with CALL rel32 + NOP fill.
+    // Non-patchable sites (ALU/FPU/SSE) have patch_len == 0.
     static constexpr int MAX_MEM_SITES = 64;
     struct MemOpSite {
-        uint32_t host_offset;   // offset from host_code where the mem op starts
-        uint32_t guest_eip;     // guest instruction that emitted this memory op
+        uint32_t host_offset;   // offset of patchable region from host_code
+        uint32_t guest_eip;     // guest instruction EIP
+        uint8_t  patch_len;     // patchable bytes (≥5) or 0 if not patchable
     };
     MemOpSite mem_sites[MAX_MEM_SITES] = {};
     int       num_mem_sites = 0;
 
-    void add_mem_site(uint32_t host_off, uint32_t geip) {
+    void add_mem_site(uint32_t host_off, uint32_t geip, uint8_t plen = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { host_off, geip };
+            mem_sites[num_mem_sites++] = { host_off, geip, plen };
     }
 
     // Lookup guest EIP by host code address. Returns 0 on miss.

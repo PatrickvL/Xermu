@@ -54,8 +54,8 @@ struct Executor {
     TraceCache     tcache;
     TraceArena     arena;
     TraceBuilder   builder;
-    FaultBitmaps   fb;               // per-code-page fault bitmaps for VEH rebuild
     SoftTlb        tlb;              // Software TLB for VA→PA (when CR0.PG=1)
+    MmioHelpers    mmio_helpers;     // pre-generated MMIO slow-path helpers
 
     // Per-page bitmap: tracks which RAM pages are write-protected for SMC detection.
     // When a trace is built for a page, the page is marked read-only.

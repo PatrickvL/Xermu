@@ -15,47 +15,6 @@ struct TraceArena {
 };
 
 // ---------------------------------------------------------------------------
-// Per-code-page fault bitmap: 1 bit per byte offset (512 bytes per page).
-// When a memory-access instruction faults (VEH), its guest EIP is marked.
-// On trace rebuild, marked instructions emit the slow-path CALL instead
-// of the optimistic bare fastmem op.
-//
-// Bitmaps are allocated on demand and released when the code page is
-// written to (invalidating all traces on that page).
-// ---------------------------------------------------------------------------
-struct FaultBitmaps {
-    static constexpr size_t PAGES = 1u << 20; // 4 GB / 4 KB = 1M pages
-    uint8_t* maps[PAGES] = {};
-
-    bool test(uint32_t guest_pa) const {
-        uint32_t page = guest_pa >> 12;
-        uint32_t off  = guest_pa & 0xFFF;
-        auto* m = maps[page];
-        return m && (m[off >> 3] & (1u << (off & 7)));
-    }
-
-    void set(uint32_t guest_pa) {
-        uint32_t page = guest_pa >> 12;
-        uint32_t off  = guest_pa & 0xFFF;
-        if (!maps[page]) {
-            maps[page] = new uint8_t[512]();
-        }
-        maps[page][off >> 3] |= (1u << (off & 7));
-    }
-
-    void clear_page(uint32_t pa) {
-        uint32_t page = pa >> 12;
-        delete[] maps[page];
-        maps[page] = nullptr;
-    }
-
-    ~FaultBitmaps() {
-        for (size_t i = 0; i < PAGES; ++i)
-            delete[] maps[i];
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Software TLB for VA→PA translation when paging (CR0.PG) is enabled.
 // Direct-mapped, indexed by VPN & MASK. Separate read/write arrays so that
 // write permission is checked only on stores.
@@ -94,8 +53,7 @@ struct TraceBuilder {
                  const uint8_t*     ram,
                  CodeCache&         cc,
                  TraceArena&        arena,
-                 GuestContext*      ctx,
-                 const FaultBitmaps* fb = nullptr);
+                 GuestContext*      ctx);
 
     // has_mem_operand is used by emit handlers — needs to be accessible
     static bool has_mem_operand(const ZydisDecodedOperand* ops, uint8_t count,
@@ -124,3 +82,42 @@ private:
     // Emit a RET trace exit (reads return addr from guest stack).
     void emit_ret_exit(Emitter& e, GuestContext* ctx);
 };
+
+// ---------------------------------------------------------------------------
+// Pre-generated MMIO slow-path helper page.
+//
+// 48 shared helpers (24 read + 24 write) indexed by [reg_enc][size_idx],
+// plus 3 write_imm tails indexed by [size_idx].  All fit in one 4 KB page
+// allocated alongside the JIT code cache (guaranteeing CALL rel32 reach).
+//
+// Each helper:  PUSHFQ → save_all_gp → setup_args → call mmio_fn →
+//               load_all_gp → POPFQ → RET.
+//
+// The VEH decodes the faulting fastmem instruction to determine (direction,
+// reg, size), looks up the helper address, and patches CALL rel32 in place.
+//
+// For write-imm sites: a tiny per-site thunk (MOV R15D,imm + JMP tail) is
+// generated from the thunk slab; the shared write_imm tail reads R15D.
+// ---------------------------------------------------------------------------
+struct MmioHelpers {
+    uint8_t* read_helpers[8][3]  = {};  // [reg_enc][size_idx]  size_idx: 0=1B, 1=2B, 2=4B
+    uint8_t* write_helpers[8][3] = {};  // [reg_enc][size_idx]
+    uint8_t* write_imm_tails[3]  = {};  // [size_idx]  (thunks JMP here)
+
+    uint8_t* lookup_read(uint8_t reg_enc, uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return read_helpers[reg_enc & 7][si];
+    }
+    uint8_t* lookup_write(uint8_t reg_enc, uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return write_helpers[reg_enc & 7][si];
+    }
+    uint8_t* lookup_write_imm(uint8_t size_bytes) const {
+        int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;
+        return write_imm_tails[si];
+    }
+};
+
+// Emit all shared MMIO helpers into the code-cache helper page.
+// Must be called once after CodeCache::init().
+void generate_mmio_helpers(uint8_t* page, size_t page_cap, MmioHelpers& out);

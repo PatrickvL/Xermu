@@ -67,48 +67,132 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Step 4: Look up guest EIP from MemOpSite table.
-    uint32_t guest_eip = faulting_trace->lookup_guest_eip(rip);
-    if (!guest_eip) {
-        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP\n",
-                faulting_trace->guest_eip);
+    // Step 4: Look up the MemOpSite for this faulting instruction.
+    uint32_t rip_off = (uint32_t)(rip - faulting_trace->host_code);
+    Trace::MemOpSite* site = nullptr;
+    for (int i = 0; i < faulting_trace->num_mem_sites; ++i) {
+        if (faulting_trace->mem_sites[i].host_offset == rip_off) {
+            site = &faulting_trace->mem_sites[i];
+            break;
+        }
+    }
+
+    if (!site) {
+        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP %p\n",
+                faulting_trace->guest_eip, (void*)rip);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Step 5: Set fault bitmap bit.
-    exec->fb.set(guest_eip);
-
-    // Step 6: Rebuild the trace with bitmap-set slow paths.
-    Trace* new_trace = exec->builder.build(
-        faulting_trace->code_pa,
-        exec->ram,
-        exec->cc,
-        exec->arena,
-        &exec->ctx,
-        &exec->fb
-    );
-
-    if (!new_trace) {
-        fprintf(stderr, "[veh] rebuild failed for trace @%08X\n",
-                faulting_trace->guest_eip);
+    // Non-patchable site (ALU/FPU/SSE MMIO) — cannot be handled.
+    if (site->patch_len == 0) {
+        fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — non-patchable op\n",
+                site->guest_eip);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Update trace cache and invalidate old trace.
-    new_trace->guest_eip = faulting_trace->guest_eip;
-    exec->tcache.insert(new_trace);  // overwrites old slot
-    faulting_trace->valid = false;
+    // Step 5: Decode the faulting fastmem instruction to derive the helper.
+    // The instruction bytes are still intact (we read before patching).
+    //
+    // Fastmem encodings (all use [R12+R14] via SIB 0x34):
+    //   [66] 43 opcode ModRM 34 [imm...]
+    //   REX.R=1 (0x47) signals esp_in_r8 (dest = ESP via R8D)
+    //
+    // Decode: direction (load/store), register, size → helper address.
 
-    // Step 7: Redirect to the faulting instruction's position in the new trace.
-    // The new trace has a slow-path CALL at the same guest EIP; skip there
-    // so that already-executed instructions are not re-executed.
-    uint32_t new_off = new_trace->lookup_host_offset(guest_eip);
-    if (new_off != ~0u) {
-        ctx_regs->Rip = (DWORD64)(uintptr_t)(new_trace->host_code + new_off);
+    const uint8_t* ip = rip;
+    uint8_t  decoded_reg  = 0;
+    uint8_t  decoded_size = 4;
+    bool     decoded_load = true;
+    bool     decoded_write_imm = false;
+
+    // Check for 0x66 operand-size prefix (16-bit).
+    bool has_66 = (ip[0] == 0x66);
+    const uint8_t* p = has_66 ? ip + 1 : ip;
+
+    uint8_t rex   = p[0];           // REX byte (0x43 or 0x47)
+    uint8_t opc   = p[1];           // primary opcode
+    bool    rex_r = (rex & 0x04);   // REX.R set → ESP-in-R8 for MOVZX/MOVSX
+
+    if (opc == 0x0F) {
+        // Two-byte opcode: MOVZX or MOVSX
+        uint8_t opc2 = p[2];
+        uint8_t modrm = p[3];
+        decoded_reg  = (modrm >> 3) & 7;
+        decoded_load = true;
+        decoded_write_imm = false;
+        if (opc2 == 0xB6 || opc2 == 0xBE) decoded_size = 1; // byte src
+        else                                decoded_size = 2; // word src
+        if (rex_r) decoded_reg = GP_ESP; // R8 dest → ESP
     } else {
-        // Fallback: start of trace (should not happen).
-        ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
+        uint8_t modrm = p[2];
+        decoded_reg = (modrm >> 3) & 7;
+
+        switch (opc) {
+        case 0x8B: decoded_load = true;  decoded_size = has_66 ? 2 : 4; break;
+        case 0x89: decoded_load = false; decoded_size = has_66 ? 2 : 4; break;
+        case 0x8A: decoded_load = true;  decoded_size = 1; break;
+        case 0x88: decoded_load = false; decoded_size = 1; break;
+        case 0xC7: decoded_load = false; decoded_write_imm = true;
+                   decoded_size = has_66 ? 2 : 4; break;
+        case 0xC6: decoded_load = false; decoded_write_imm = true;
+                   decoded_size = 1; break;
+        default:
+            fprintf(stderr, "[veh] unknown fastmem opcode %02X at RIP %p\n",
+                    opc, (void*)rip);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     }
+
+    // Step 6: Resolve the helper target.
+    uint8_t* call_target = nullptr;
+
+    if (decoded_write_imm) {
+        // Extract the immediate from the (still-intact) instruction bytes.
+        // Layout: [66?] 43 C7/C6 04 34 imm...
+        const uint8_t* imm_ptr = p + 4; // after REX opcode ModRM SIB
+        uint32_t imm_val = 0;
+        memcpy(&imm_val, imm_ptr, decoded_size);
+
+        // Allocate a per-site thunk: MOV R15D,imm32 + JMP write_imm_tail.
+        uint8_t* thunk = exec->cc.alloc_thunk(16);
+        if (!thunk) {
+            fprintf(stderr, "[veh] thunk slab exhausted\n");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // MOV R15D, imm32: 41 BF imm32 (6 bytes)
+        thunk[0] = 0x41; thunk[1] = 0xBF;
+        memcpy(thunk + 2, &imm_val, 4);
+        // JMP rel32: E9 rel32 (5 bytes)
+        uint8_t* write_imm_helper = exec->mmio_helpers.lookup_write_imm(decoded_size);
+        thunk[6] = 0xE9;
+        int32_t jmp_rel = (int32_t)(write_imm_helper - (thunk + 6 + 5));
+        memcpy(thunk + 7, &jmp_rel, 4);
+
+        call_target = thunk;
+    } else if (decoded_load) {
+        call_target = exec->mmio_helpers.lookup_read(decoded_reg, decoded_size);
+    } else {
+        call_target = exec->mmio_helpers.lookup_write(decoded_reg, decoded_size);
+    }
+
+    if (!call_target) {
+        fprintf(stderr, "[veh] no helper for reg=%d size=%d\n",
+                decoded_reg, decoded_size);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Step 7: Patch the patchable region with CALL rel32 + trailing NOPs.
+    // The CALL's return address (rip + 5) lands in the NOP'd tail, which
+    // slides execution to the code after the patchable region.
+    uint8_t patch_len = site->patch_len;
+    int32_t call_rel = (int32_t)(call_target - (rip + 5));
+    rip[0] = 0xE8;
+    memcpy(rip + 1, &call_rel, 4);
+    for (int i = 5; i < patch_len; ++i)
+        rip[i] = 0x90;
+
+    // Step 8: Redirect RIP to the patched CALL so it executes on resume.
+    ctx_regs->Rip = (DWORD64)(uintptr_t)rip;
 
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -251,6 +335,9 @@ bool Executor::init(MmioMap* mmio) {
 
     if (!cc.init()) return false;
 
+    // Pre-generate shared MMIO slow-path helpers into the helper page.
+    generate_mmio_helpers(cc.helper_page, HELPER_PAGE_BYTES, mmio_helpers);
+
     memset(&ctx, 0, sizeof(ctx));
     ctx.fastmem_base = (uint64_t)(uintptr_t)ram;
     ctx.mmio         = mmio;
@@ -359,8 +446,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
         }
     }
 
-    // Clear the fault bitmap for this page (fresh start on rebuild).
-    fb.clear_page(page);
+    // No fault bitmap to clear — NOP sleds in invalidated traces are dead code.
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1277,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Build if missing.
         if (!t) {
             t = builder.build(code_pa, ram,
-                              cc, arena, &ctx, &fb);
+                              cc, arena, &ctx);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;

@@ -15,7 +15,6 @@ struct Emitter {
     size_t   cap;
     bool     paging   = false; // true when CR0.PG is set at build time
     uint32_t fault_eip = 0;    // guest EIP for #PF exit on translate fault
-    bool     slow_path = false; // true when fault bitmap says this insn needs MMIO slow path
 
     // Pending link slots collected during trace emission.
     // Transferred to the Trace after building.
@@ -28,17 +27,22 @@ struct Emitter {
     int num_pending_links = 0;
 
     // Memory-op site table: accumulated during emit, transferred to Trace.
+    // host_offset is provided explicitly by the caller (offset of the patchable region).
     struct MemSite {
         uint32_t host_offset;
         uint32_t guest_eip;
+        uint8_t  patch_len;
     };
     static constexpr int MAX_MEM_SITES = 64;
     MemSite mem_sites[MAX_MEM_SITES] = {};
     int num_mem_sites = 0;
 
-    void add_mem_site(uint32_t guest_eip_val) {
+    // Record a mem_site.  For patchable sites, host_off is the start of the
+    // patchable region and plen is the total bytes (fastmem insn + pad NOPs).
+    // Non-patchable sites (ALU/FPU/SSE) pass plen=0.
+    void add_mem_site(uint32_t host_off, uint32_t geip, uint8_t plen = 0) {
         if (num_mem_sites < MAX_MEM_SITES)
-            mem_sites[num_mem_sites++] = { (uint32_t)pos, guest_eip_val };
+            mem_sites[num_mem_sites++] = { host_off, geip, plen };
     }
 
     void add_pending_link(uint8_t* site, uint32_t target) {
@@ -76,6 +80,13 @@ struct Emitter {
         memcpy(site, &delta, 4);
     }
 };
+
+// Pad the current emission point up to `min_len` bytes from `start_pos`
+// with single-byte NOPs (0x90).  Used to ensure patchable fastmem regions
+// are at least 5 bytes (enough for a CALL rel32).
+inline void emit_pad_to(Emitter& e, size_t start_pos, size_t min_len) {
+    while (e.pos - start_pos < min_len) e.emit8(0x90);
+}
 
 // ---------------------------------------------------------------------------
 // x86-64 REX prefix constants (0x40 | W<<3 | R<<2 | X<<1 | B)
