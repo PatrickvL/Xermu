@@ -1864,6 +1864,32 @@ Test: `tests/div_error.asm` — 3 assertions: DIV ECX/0, IDIV ECX/0, DIV CX/0
 (16-bit).  Each #DE fires a guest ISR that increments a counter and uses a
 skip table to resume after the faulting instruction via IRETD.
 
+#### 5.25 Non-Patchable MMIO Emulation ✅ DONE
+
+Some guest instructions (ALU, TEST, BT/BTS/BTR/BTC, INC/DEC, NOT, NEG, shifts,
+SETcc, CMOVcc, FPU/SSE) produce non-patchable fastmem sites (`patch_len = 0`)
+because their host encodings cannot be replaced by a simple `CALL rel32` to an
+MMIO helper.  Previously these crashed when hitting an MMIO address.
+
+The VEH handler now software-emulates non-patchable MMIO instructions:
+
+1. Decode the faulting host instruction with a 64-bit Zydis decoder.
+2. Read the MMIO register (`mmio->read(R14, size)`) and/or the source register
+   from the EXCEPTION_POINTERS CONTEXT.
+3. Compute the result and status flags (CF/PF/AF/ZF/SF/OF) in C++.
+4. Write back: MMIO write (if destination is memory) or register update in
+   CONTEXT (if destination is a register).
+5. Advance RIP past the instruction; return `CONTINUE_EXECUTION`.
+
+Covered mnemonics: AND, OR, XOR, ADD, SUB, CMP, TEST, INC, DEC, NOT, NEG,
+BT, BTS, BTR, BTC, SHL, SHR, SAR, MOV (fallback).
+
+A test MMIO device (4 KB register file at PA 0x08000000) is registered in the
+non-Xbox test harness to provide a read/write backing store.
+
+Test: `tests/mmio_alu.asm` — 14 assertions exercising OR, AND, XOR, TEST, ADD,
+SUB, INC, DEC, NOT, NEG, BTS, BTR, CMP on MMIO registers.
+
 ---
 
 ## 6. Bugs Fixed During Development

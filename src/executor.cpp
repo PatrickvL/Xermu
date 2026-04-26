@@ -141,10 +141,345 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Non-patchable site (ALU/FPU/SSE MMIO) — cannot be handled.
+    // Non-patchable site (ALU/TEST/SETcc/CMOVcc/FPU/SSE MMIO).
+    // Software-emulate: decode host instruction, perform MMIO read/write,
+    // update registers + EFLAGS in CONTEXT, advance RIP.
     if (site->patch_len == 0) {
-        fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — non-patchable op\n",
-                site->guest_eip);
+        uint32_t mmio_pa = (uint32_t)ctx_regs->R14;
+        auto* mmio = exec->ctx.mmio;
+
+        // Decode the host instruction with a 64-bit Zydis decoder.
+        ZydisDecoder dec64;
+        ZydisDecoderInit(&dec64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+        ZydisDecodedInstruction hinsn;
+        ZydisDecodedOperand hops[ZYDIS_MAX_OPERAND_COUNT];
+        ZyanStatus zst = ZydisDecoderDecodeFull(&dec64, rip, 15, &hinsn, hops);
+        if (ZYAN_FAILED(zst))
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        // Map host 64-bit register to a pointer into the CONTEXT struct.
+        auto reg_ptr64 = [&](ZydisRegister r) -> DWORD64* {
+            switch (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, r)) {
+            case ZYDIS_REGISTER_RAX: return &ctx_regs->Rax;
+            case ZYDIS_REGISTER_RCX: return &ctx_regs->Rcx;
+            case ZYDIS_REGISTER_RDX: return &ctx_regs->Rdx;
+            case ZYDIS_REGISTER_RBX: return &ctx_regs->Rbx;
+            case ZYDIS_REGISTER_RBP: return &ctx_regs->Rbp;
+            case ZYDIS_REGISTER_RSI: return &ctx_regs->Rsi;
+            case ZYDIS_REGISTER_RDI: return &ctx_regs->Rdi;
+            case ZYDIS_REGISTER_R8:  return &ctx_regs->R8;
+            default: return nullptr;
+            }
+        };
+
+        // Read a guest register value (masked to operand size).
+        auto read_reg = [&](ZydisRegister r, unsigned sz) -> uint32_t {
+            DWORD64* p = reg_ptr64(r);
+            if (!p) return 0;
+            uint64_t v = *p;
+            // For 8-bit high registers (AH/CH/DH/BH), shift right 8.
+            if (r == ZYDIS_REGISTER_AH || r == ZYDIS_REGISTER_CH ||
+                r == ZYDIS_REGISTER_DH || r == ZYDIS_REGISTER_BH)
+                v >>= 8;
+            return (uint32_t)(v & ((1ULL << (sz * 8)) - 1));
+        };
+
+        // Write a value to a guest register.
+        auto write_reg = [&](ZydisRegister r, uint32_t val, unsigned sz) {
+            DWORD64* p = reg_ptr64(r);
+            if (!p) return;
+            if (r == ZYDIS_REGISTER_AH || r == ZYDIS_REGISTER_CH ||
+                r == ZYDIS_REGISTER_DH || r == ZYDIS_REGISTER_BH) {
+                *p = (*p & ~0xFF00ULL) | ((uint64_t)(val & 0xFF) << 8);
+            } else if (sz == 1) {
+                *p = (*p & ~0xFFULL) | (val & 0xFF);
+            } else if (sz == 2) {
+                *p = (*p & ~0xFFFFULL) | (val & 0xFFFF);
+            } else {
+                *p = val; // 32-bit write zero-extends to 64 in x64
+            }
+        };
+
+        // Compute standard flags for result of given size.
+        auto compute_logical_flags = [](uint32_t result, unsigned sz) -> uint32_t {
+            uint32_t fl = 0;
+            uint32_t mask = (sz == 4) ? 0xFFFFFFFF : (1u << (sz * 8)) - 1;
+            result &= mask;
+            if (result == 0) fl |= 0x40;   // ZF
+            if (result & (1u << (sz * 8 - 1))) fl |= 0x80; // SF
+            // PF: parity of low byte
+            uint8_t pb = (uint8_t)result;
+            pb ^= pb >> 4; pb ^= pb >> 2; pb ^= pb >> 1;
+            if (!(pb & 1)) fl |= 0x04;     // PF (set if even parity)
+            return fl;
+        };
+
+        // Compute full arithmetic flags (CF, OF, AF, ZF, SF, PF).
+        auto compute_add_flags = [&](uint32_t a, uint32_t b, unsigned sz) -> uint32_t {
+            uint64_t sum = (uint64_t)a + b;
+            uint32_t result = (uint32_t)sum;
+            uint32_t fl = compute_logical_flags(result, sz);
+            unsigned bits = sz * 8;
+            if (sum >> bits) fl |= 0x01; // CF
+            // OF: sign of a == sign of b && sign of result != sign of a
+            uint32_t sign_mask = 1u << (bits - 1);
+            if (~(a ^ b) & (a ^ result) & sign_mask) fl |= 0x800; // OF
+            if ((a ^ b ^ result) & 0x10) fl |= 0x10; // AF
+            return fl;
+        };
+
+        auto compute_sub_flags = [&](uint32_t a, uint32_t b, unsigned sz) -> uint32_t {
+            uint32_t result = a - b;
+            uint32_t fl = compute_logical_flags(result, sz);
+            unsigned bits = sz * 8;
+            if (a < b) fl |= 0x01; // CF (borrow)
+            uint32_t sign_mask = 1u << (bits - 1);
+            if ((a ^ b) & (a ^ result) & sign_mask) fl |= 0x800; // OF
+            if ((a ^ b ^ result) & 0x10) fl |= 0x10; // AF
+            return fl;
+        };
+
+        // Update EFLAGS: preserve non-arithmetic flags, replace status flags.
+        constexpr uint32_t STATUS_MASK = 0x8D5; // CF|PF|AF|ZF|SF|OF
+        auto set_status_flags = [&](uint32_t fl) {
+            ctx_regs->EFlags = (ctx_regs->EFlags & ~STATUS_MASK) | (fl & STATUS_MASK);
+        };
+
+        // Determine operand size.  For non-patchable fastmem the encoding is:
+        //   [66?] REX opcode ModRM SIB [disp] [imm]
+        // Zydis gives us operand sizes directly.
+        unsigned op_size = 4;
+        // Find memory operand to determine size.
+        for (int i = 0; i < (int)hinsn.operand_count_visible; ++i) {
+            if (hops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                op_size = hops[i].size / 8;
+                if (op_size == 0) op_size = 4;
+                break;
+            }
+        }
+
+        // Identify the instruction category and emulate.
+        auto mnem = hinsn.mnemonic;
+
+        // --- TEST reg/imm, [mem] or TEST [mem], reg/imm ---
+        if (mnem == ZYDIS_MNEMONIC_TEST) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            uint32_t other = 0;
+            for (int i = 0; i < (int)hinsn.operand_count_visible; ++i) {
+                if (hops[i].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    other = read_reg(hops[i].reg.value, op_size);
+                else if (hops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+                    other = (uint32_t)hops[i].imm.value.u;
+            }
+            uint32_t result = mem_val & other;
+            set_status_flags(compute_logical_flags(result, op_size));
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- CMP [mem], reg/imm  or  CMP reg, [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_CMP) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            // CMP op0, op1 → op0 - op1
+            uint32_t a, b;
+            if (hops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                a = mem_val;
+                if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    b = read_reg(hops[1].reg.value, op_size);
+                else
+                    b = (uint32_t)hops[1].imm.value.u;
+            } else {
+                a = read_reg(hops[0].reg.value, op_size);
+                b = mem_val;
+            }
+            set_status_flags(compute_sub_flags(a, b, op_size));
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- Logical ALU: AND/OR/XOR [mem], reg/imm  or  reg, [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_AND || mnem == ZYDIS_MNEMONIC_OR ||
+            mnem == ZYDIS_MNEMONIC_XOR) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            bool mem_is_dst = (hops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+            uint32_t other;
+            if (mem_is_dst) {
+                if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    other = read_reg(hops[1].reg.value, op_size);
+                else
+                    other = (uint32_t)hops[1].imm.value.u;
+            } else {
+                other = read_reg(hops[0].reg.value, op_size);
+            }
+            uint32_t result;
+            if (mnem == ZYDIS_MNEMONIC_AND) result = mem_val & other;
+            else if (mnem == ZYDIS_MNEMONIC_OR) result = mem_val | other;
+            else result = mem_val ^ other;
+
+            set_status_flags(compute_logical_flags(result, op_size));
+            if (mem_is_dst)
+                mmio->write(mmio_pa, result, op_size);
+            else
+                write_reg(hops[0].reg.value, result, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- Arithmetic ALU: ADD/SUB [mem], reg/imm  or  reg, [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_ADD || mnem == ZYDIS_MNEMONIC_SUB) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            bool mem_is_dst = (hops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+            uint32_t a, b;
+            if (mem_is_dst) {
+                a = mem_val;
+                if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    b = read_reg(hops[1].reg.value, op_size);
+                else
+                    b = (uint32_t)hops[1].imm.value.u;
+            } else {
+                a = read_reg(hops[0].reg.value, op_size);
+                b = mem_val;
+            }
+            uint32_t result;
+            uint32_t fl;
+            if (mnem == ZYDIS_MNEMONIC_ADD) {
+                result = a + b;
+                fl = compute_add_flags(a, b, op_size);
+            } else {
+                result = a - b;
+                fl = compute_sub_flags(a, b, op_size);
+            }
+            set_status_flags(fl);
+            if (mem_is_dst)
+                mmio->write(mmio_pa, result, op_size);
+            else
+                write_reg(hops[0].reg.value, result, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- BT/BTS/BTR/BTC [mem], reg/imm ---
+        if (mnem == ZYDIS_MNEMONIC_BT  || mnem == ZYDIS_MNEMONIC_BTS ||
+            mnem == ZYDIS_MNEMONIC_BTR || mnem == ZYDIS_MNEMONIC_BTC) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            uint32_t bit;
+            if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                bit = read_reg(hops[1].reg.value, op_size);
+            else
+                bit = (uint32_t)hops[1].imm.value.u;
+            bit &= (op_size * 8 - 1);
+            uint32_t mask = 1u << bit;
+            // CF = selected bit
+            uint32_t fl = (ctx_regs->EFlags & ~0x01u) | ((mem_val >> bit) & 1);
+            ctx_regs->EFlags = fl;
+            if (mnem == ZYDIS_MNEMONIC_BTS)
+                mmio->write(mmio_pa, mem_val | mask, op_size);
+            else if (mnem == ZYDIS_MNEMONIC_BTR)
+                mmio->write(mmio_pa, mem_val & ~mask, op_size);
+            else if (mnem == ZYDIS_MNEMONIC_BTC)
+                mmio->write(mmio_pa, mem_val ^ mask, op_size);
+            // BT: no write-back
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- INC/DEC [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_INC || mnem == ZYDIS_MNEMONIC_DEC) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            uint32_t result;
+            uint32_t fl;
+            if (mnem == ZYDIS_MNEMONIC_INC) {
+                result = mem_val + 1;
+                fl = compute_add_flags(mem_val, 1, op_size);
+            } else {
+                result = mem_val - 1;
+                fl = compute_sub_flags(mem_val, 1, op_size);
+            }
+            // INC/DEC preserve CF.
+            fl = (fl & ~0x01u) | (ctx_regs->EFlags & 0x01u);
+            set_status_flags(fl);
+            mmio->write(mmio_pa, result, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- NOT [mem] (no flags affected) ---
+        if (mnem == ZYDIS_MNEMONIC_NOT) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            mmio->write(mmio_pa, ~mem_val, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- NEG [mem] ---
+        if (mnem == ZYDIS_MNEMONIC_NEG) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            uint32_t result = (uint32_t)(-(int32_t)mem_val);
+            uint32_t fl = compute_sub_flags(0, mem_val, op_size);
+            set_status_flags(fl);
+            mmio->write(mmio_pa, result, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- MOV [mem], reg/imm  or  MOV reg, [mem] (shouldn't normally be
+        //     non-patchable, but handle for safety) ---
+        if (mnem == ZYDIS_MNEMONIC_MOV) {
+            if (hops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                uint32_t val;
+                if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    val = read_reg(hops[1].reg.value, op_size);
+                else
+                    val = (uint32_t)hops[1].imm.value.u;
+                mmio->write(mmio_pa, val, op_size);
+            } else {
+                uint32_t val = mmio->read(mmio_pa, op_size);
+                write_reg(hops[0].reg.value, val, op_size);
+            }
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // --- SHL/SHR/SAR [mem], imm/CL ---
+        if (mnem == ZYDIS_MNEMONIC_SHL || mnem == ZYDIS_MNEMONIC_SHR ||
+            mnem == ZYDIS_MNEMONIC_SAR) {
+            uint32_t mem_val = mmio->read(mmio_pa, op_size);
+            uint32_t count;
+            if (hops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                count = read_reg(hops[1].reg.value, 1);
+            else
+                count = (uint32_t)hops[1].imm.value.u;
+            count &= 0x1F;
+            if (count == 0) {
+                ctx_regs->Rip += hinsn.length;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            unsigned bits = op_size * 8;
+            uint32_t result;
+            uint32_t fl = 0;
+            if (mnem == ZYDIS_MNEMONIC_SHL) {
+                result = mem_val << count;
+                fl |= (mem_val >> (bits - count)) & 1; // CF = last bit shifted out
+                if (count == 1)
+                    fl |= ((result >> (bits - 1)) ^ ((result >> (bits - 1)) & 1)) ? 0 : 0; // OF
+            } else if (mnem == ZYDIS_MNEMONIC_SHR) {
+                result = mem_val >> count;
+                fl |= (mem_val >> (count - 1)) & 1; // CF
+            } else { // SAR
+                int32_t sval = (int32_t)(mem_val << (32 - bits)) >> (32 - bits); // sign extend
+                result = (uint32_t)(sval >> count);
+                fl |= (mem_val >> (count - 1)) & 1; // CF
+            }
+            fl |= compute_logical_flags(result, op_size) & ~0x01u; // ZF/SF/PF, keep CF from above
+            set_status_flags(fl);
+            mmio->write(mmio_pa, result, op_size);
+            ctx_regs->Rip += hinsn.length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // Unhandled non-patchable mnemonic — fall through to crash.
+        fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — unhandled non-patchable op (mnemonic=%d)\n",
+                site->guest_eip, (int)mnem);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 

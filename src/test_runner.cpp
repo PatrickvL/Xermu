@@ -38,6 +38,27 @@ static void stub_mmio_write(uint32_t pa, uint32_t v, unsigned, void*) {
 }
 
 // ---------------------------------------------------------------------------
+// Test MMIO device: 4 KB register file at GUEST_RAM_SIZE (0x08000000).
+// Simple read/write backing store for non-patchable MMIO tests.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t TEST_MMIO_BASE = GUEST_RAM_SIZE;
+static constexpr uint32_t TEST_MMIO_SIZE = 4096;
+static uint8_t test_mmio_regs[TEST_MMIO_SIZE];
+
+static uint32_t test_mmio_read(uint32_t pa, unsigned sz, void*) {
+    uint32_t off = pa - TEST_MMIO_BASE;
+    if (off + sz > TEST_MMIO_SIZE) return 0xFFFFFFFFu;
+    uint32_t v = 0;
+    memcpy(&v, &test_mmio_regs[off], sz);
+    return v;
+}
+static void test_mmio_write(uint32_t pa, uint32_t v, unsigned sz, void*) {
+    uint32_t off = pa - TEST_MMIO_BASE;
+    if (off + sz > TEST_MMIO_SIZE) return;
+    memcpy(&test_mmio_regs[off], &v, sz);
+}
+
+// ---------------------------------------------------------------------------
 // I/O port handlers
 // ---------------------------------------------------------------------------
 
@@ -186,7 +207,11 @@ int main(int argc, char** argv) {
     if (xbox_mode) {
         hw = xbox::xbox_setup(*exec);
     } else {
-        stub_mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
+        memset(test_mmio_regs, 0, sizeof(test_mmio_regs));
+        stub_mmio.add(TEST_MMIO_BASE, TEST_MMIO_SIZE,
+                      test_mmio_read, test_mmio_write);
+        stub_mmio.add(TEST_MMIO_BASE + TEST_MMIO_SIZE,
+                      ~0u - (TEST_MMIO_BASE + TEST_MMIO_SIZE),
                       stub_mmio_read, stub_mmio_write);
         if (!exec->init(&stub_mmio)) {
             fprintf(stderr, "Executor init failed\n");

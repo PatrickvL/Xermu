@@ -139,6 +139,7 @@ set(TEST_ASM_FILES
     tests/fastmem.asm
     tests/smc_stress.asm
     tests/div_error.asm
+    tests/mmio_alu.asm
 )
 
 if(NASM_EXECUTABLE)
