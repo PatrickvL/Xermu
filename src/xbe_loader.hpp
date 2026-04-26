@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -102,6 +103,28 @@ static constexpr uint8_t  HLE_INT_VECTOR      = 0x20; // INT 20h = HLE trap
 // Each HLE stub is 8 bytes:   MOV EAX, ordinal (5 bytes) + INT 0x20 (2 bytes) + RET (1 byte)
 static constexpr uint32_t HLE_STUB_SIZE  = 8;
 static constexpr uint32_t HLE_STUB_BASE  = 0x00080000u; // guest PA for stub table
+
+// Kernel data exports area — data variables the XBE reads by pointer
+// Located after HLE stubs (which end at HLE_STUB_BASE + 379*8 = 0x80BD8)
+static constexpr uint32_t KDATA_BASE     = 0x00081000u;
+
+// Layout of kernel data area at KDATA_BASE:
+//   +0x000: KeTickCount (ULONG = 4 bytes)
+//   +0x004: XboxHardwareInfo (Flags:ULONG + GpuRevision:UCHAR + McpRevision:UCHAR + pad:UCHAR[2] = 8 bytes)
+//   +0x00C: XboxKrnlVersion (Major:USHORT + Minor:USHORT + Build:USHORT + Qfe:USHORT = 8 bytes)
+//   +0x014: LaunchDataPage (ULONG = 4 bytes, a pointer — 0 = none)
+//   +0x018: XeImageFileName (ANSI_STRING: Length:USHORT + MaxLength:USHORT + Buffer:ULONG = 8 bytes)
+//   +0x020: XeImageFileName buffer (up to 256 bytes)
+static constexpr uint32_t KDATA_KeTickCount        = KDATA_BASE + 0x000;
+static constexpr uint32_t KDATA_XboxHardwareInfo   = KDATA_BASE + 0x004;
+static constexpr uint32_t KDATA_XboxKrnlVersion    = KDATA_BASE + 0x00C;
+static constexpr uint32_t KDATA_LaunchDataPage     = KDATA_BASE + 0x014;
+static constexpr uint32_t KDATA_XeImageFileName    = KDATA_BASE + 0x018;
+static constexpr uint32_t KDATA_XeImageFileNameBuf = KDATA_BASE + 0x020;
+
+// Forward declarations (defined after KernelOrdinal enum below)
+inline uint32_t kernel_data_addr(uint32_t ordinal);
+inline void init_kernel_data(uint8_t* ram);
 
 // Write kernel HLE stub table into guest RAM at HLE_STUB_BASE.
 // Returns the VA of stub for a given ordinal: HLE_STUB_BASE + ordinal * HLE_STUB_SIZE.
@@ -241,6 +264,9 @@ inline XbeInfo load_xbe(uint8_t* ram, const uint8_t* file_data, size_t file_size
     // Write HLE stub table
     write_hle_stubs(ram);
 
+    // Initialize kernel data exports
+    init_kernel_data(ram);
+
     // Resolve kernel thunk table
     uint32_t thunk_offset = info.kernel_thunk_va;
     if (thunk_offset + 4 <= GUEST_RAM_SIZE) {
@@ -252,8 +278,11 @@ inline XbeInfo load_xbe(uint8_t* ram, const uint8_t* file_data, size_t file_size
 
             if (entry & 0x80000000u) {
                 uint32_t ordinal = entry & 0x7FFFFFFFu;
-                uint32_t stub_va = hle_stub_addr(ordinal);
-                memcpy(ram + off, &stub_va, 4);
+                // Data exports get the address of the actual data;
+                // function exports get the address of the HLE stub.
+                uint32_t data_va = kernel_data_addr(ordinal);
+                uint32_t resolved_va = data_va ? data_va : hle_stub_addr(ordinal);
+                memcpy(ram + off, &resolved_va, 4);
                 ++resolved;
             }
         }
@@ -323,79 +352,211 @@ inline void stdcall_cleanup(Executor& exec, int n_args) {
 }
 
 // Named kernel ordinals used in the handler below
+// Reference: https://xboxdevwiki.net/Kernel#Kernel_exports
 enum KernelOrdinal : uint32_t {
     ORD_AvGetSavedDataAddress          = 1,
+    ORD_AvSendTVEncoderOption          = 2,
     ORD_AvSetDisplayMode               = 3,
     ORD_AvSetSavedDataAddress          = 4,
-    ORD_DbgPrint                       = 7,
-    ORD_ExAllocatePool                 = 15,
-    ORD_ExAllocatePoolWithTag          = 16,
+    ORD_DbgBreakPoint                  = 5,
+    ORD_DbgPrint                       = 8,
+    ORD_HalReadSMCTrayState            = 9,
+    ORD_ExAcquireReadWriteLockExclusive= 12,
+    ORD_ExAcquireReadWriteLockShared   = 13,
+    ORD_ExAllocatePool                 = 14,
+    ORD_ExAllocatePoolWithTag          = 15,
     ORD_ExFreePool                     = 17,
-    ORD_ExQueryPoolBlockSize           = 20,
+    ORD_ExInitializeReadWriteLock      = 18,
+    ORD_ExQueryPoolBlockSize           = 23,
+    ORD_ExQueryNonVolatileSetting      = 24,
+    ORD_ExSaveNonVolatileSetting       = 29,
+    ORD_FscSetCacheSize                 = 37,
+    ORD_HalGetInterruptVector          = 44,
+    ORD_HalReadSMBusValue              = 45,
+    ORD_HalReadWritePCISpace           = 46,
+    ORD_HalRegisterShutdownNotification= 47,
     ORD_HalReturnToFirmware            = 49,
-    ORD_InterlockedCompareExchange     = 58,
-    ORD_InterlockedDecrement           = 59,
-    ORD_InterlockedIncrement           = 60,
-    ORD_InterlockedExchange            = 61,
+    ORD_HalWriteSMBusValue             = 50,
+    ORD_InterlockedCompareExchange     = 51,
+    ORD_InterlockedDecrement           = 52,
+    ORD_InterlockedIncrement           = 53,
+    ORD_InterlockedExchange            = 54,
+    ORD_InterlockedExchangeAdd         = 55,
+    ORD_IoCreateDevice                 = 65,
+    ORD_IoCreateFile                   = 66,
+    ORD_IoCreateSymbolicLink           = 67,
+    ORD_IoDeleteDevice                 = 68,
+    ORD_IoDeleteSymbolicLink           = 69,
+    ORD_IoDismountVolume               = 90,
+    ORD_IoDismountVolumeByName         = 91,
+    ORD_KeBugCheck                     = 95,
+    ORD_KeBugCheckEx                   = 96,
+    ORD_KeCancelTimer                  = 97,
+    ORD_KeConnectInterrupt             = 98,
+    ORD_KeDelayExecutionThread         = 99,
+    ORD_KeEnterCriticalRegion          = 101,
+    ORD_KeGetCurrentIrql               = 103,
     ORD_KeGetCurrentThread             = 104,
+    ORD_KeInitializeApc                = 105,
     ORD_KeInitializeDpc                = 107,
     ORD_KeInitializeEvent              = 108,
-    ORD_KeInitializeMutex              = 112,
-    ORD_KeInitializeSemaphore          = 114,
-    ORD_KeInitializeTimerEx            = 116,
+    ORD_KeInitializeInterrupt          = 109,
+    ORD_KeInitializeMutant             = 110,
+    ORD_KeInitializeQueue              = 111,
+    ORD_KeInitializeSemaphore          = 112,
+    ORD_KeInitializeTimerEx            = 113,
+    ORD_KeInsertQueueDpc               = 119,
+    ORD_KeLeaveCriticalRegion          = 122,
     ORD_KeQueryPerformanceCounter      = 126,
     ORD_KeQueryPerformanceFrequency    = 127,
-    ORD_KeQuerySystemTime              = 131,
-    ORD_KeResetEvent                   = 133,
-    ORD_KeSetEvent                     = 144,
-    ORD_KeSetTimer                     = 145,
-    ORD_KeSetTimerEx                   = 146,
-    ORD_KeCancelTimer                  = 96,
-    ORD_KeReleaseMutex                 = 132,
-    ORD_KeReleaseSemaphore             = 134,
+    ORD_KeQuerySystemTime              = 128,
+    ORD_KeRaiseIrqlToDpcLevel          = 129,
+    ORD_KeReleaseMutant                = 131,
+    ORD_KeReleaseSemaphore             = 132,
+    ORD_KeResetEvent                   = 138,
+    ORD_KeSetBasePriorityThread        = 143,
+    ORD_KeSetEvent                     = 145,
+    ORD_KeSetTimer                     = 149,
+    ORD_KeSetTimerEx                   = 150,
+    ORD_KeStallExecutionProcessor      = 151,
     ORD_KeTickCount                    = 156,
-    ORD_KeWaitForSingleObject          = 157,
     ORD_KeWaitForMultipleObjects       = 158,
+    ORD_KeWaitForSingleObject          = 159,
+    ORD_KfRaiseIrql                    = 160,
+    ORD_KfLowerIrql                    = 161,
+    ORD_KiUnlockDispatcherDatabase     = 163,
+    ORD_LaunchDataPage                 = 164,
     ORD_MmAllocateContiguousMemory     = 165,
     ORD_MmAllocateContiguousMemoryEx   = 166,
+    ORD_MmAllocateSystemMemory         = 167,
+    ORD_MmClaimGpuInstanceMemory       = 168,
+    ORD_MmCreateKernelStack            = 169,
+    ORD_MmDeleteKernelStack            = 170,
     ORD_MmFreeContiguousMemory         = 171,
+    ORD_MmFreeSystemMemory             = 172,
     ORD_MmGetPhysicalAddress           = 173,
-    ORD_MmMapIoSpace                   = 174,
+    ORD_MmIsAddressValid               = 174,
+    ORD_MmLockUnlockBufferPages        = 175,
+    ORD_MmMapIoSpace                   = 177,
+    ORD_MmQueryStatistics              = 181,
+    ORD_MmSetAddressProtect            = 182,
     ORD_MmUnmapIoSpace                 = 183,
     ORD_NtAllocateVirtualMemory        = 184,
+    ORD_NtClearEvent                   = 186,
     ORD_NtClose                        = 187,
-    ORD_NtCreateEvent                  = 188,
-    ORD_NtCreateMutant                 = 190,
+    ORD_NtCreateEvent                  = 189,
+    ORD_NtCreateFile                   = 190,
+    ORD_NtCreateMutant                 = 192,
     ORD_NtCreateSemaphore              = 193,
+    ORD_NtDeviceIoControlFile           = 196,
     ORD_NtFreeVirtualMemory            = 199,
-    ORD_NtSetEvent                     = 210,
-    ORD_NtClearEvent                   = 211,
-    ORD_NtWaitForSingleObject          = 218,
-    ORD_NtWaitForMultipleObjects       = 219,
+    ORD_NtOpenFile                     = 202,
+    ORD_NtQueryInformationFile         = 211,
+    ORD_NtQueryFullAttributesFile      = 210,
+    ORD_NtQueryVolumeInformationFile   = 218,
+    ORD_NtReadFile                     = 219,
+    ORD_NtSetEvent                     = 225,
+    ORD_NtSetInformationFile           = 226,
+    ORD_NtWaitForSingleObject          = 233,
+    ORD_NtWaitForSingleObjectEx        = 234,
+    ORD_NtWaitForMultipleObjectsEx     = 235,
+    ORD_NtWriteFile                    = 236,
+    ORD_NtYieldExecution               = 238,
     ORD_ObReferenceObjectByHandle      = 246,
-    ORD_ObDereferenceObject            = 244,
+    ORD_ObfDereferenceObject           = 250,
+    ORD_ObfReferenceObject             = 251,
     ORD_PsCreateSystemThread           = 254,
+    ORD_PsCreateSystemThreadEx         = 255,
     ORD_PsTerminateSystemThread        = 258,
-    ORD_RtlEnterCriticalSection        = 264,
-    ORD_RtlLeaveCriticalSection        = 267,
-    ORD_RtlInitAnsiString             = 268,
-    ORD_RtlInitializeCriticalSection   = 270,
-    ORD_RtlInitUnicodeString           = 272,
-    ORD_RtlCompareMemory               = 261,
-    ORD_RtlCopyMemory                  = 262,
-    ORD_RtlFillMemory                  = 265,
-    ORD_RtlZeroMemory                  = 285,
-    ORD_RtlMoveMemory                  = 275,
-    ORD_RtlEqualString                 = 273,
+    ORD_RtlAnsiStringToUnicodeString   = 260,
+    ORD_RtlCompareMemory               = 268,
+    ORD_RtlCopyUnicodeString           = 273,
+    ORD_RtlCreateUnicodeString         = 274,
+    ORD_RtlEnterCriticalSection        = 277,
+    ORD_RtlEnterCriticalSectionAndRegion=278,
+    ORD_RtlEqualString                 = 279,
+    ORD_RtlFillMemory                  = 284,
+    ORD_RtlFreeAnsiString             = 286,
+    ORD_RtlFreeUnicodeString          = 287,
+    ORD_RtlInitAnsiString             = 289,
+    ORD_RtlInitUnicodeString           = 290,
+    ORD_RtlInitializeCriticalSection   = 291,
+    ORD_RtlLeaveCriticalSection        = 294,
+    ORD_RtlLeaveCriticalSectionAndRegion=295,
+    ORD_RtlMoveMemory                  = 298,
+    ORD_RtlNtStatusToDosError          = 301,
+    ORD_RtlTryEnterCriticalSection     = 306,
+    ORD_RtlUnicodeStringToAnsiString   = 308,
+    ORD_RtlZeroMemory                  = 320,
+    ORD_XboxHardwareInfo               = 322,
+    ORD_XboxKrnlVersion                = 324,
+    ORD_XeImageFileName                = 326,
     ORD_XeLoadSection                  = 327,
+    ORD_XeUnloadSection                = 328,
+    ORD_HalBootSMCVideoMode            = 356,
 };
 
+// Returns the guest VA for a data export ordinal, or 0 if it's not a data export
+inline uint32_t kernel_data_addr(uint32_t ordinal) {
+    switch (ordinal) {
+    case ORD_KeTickCount:       return KDATA_KeTickCount;
+    case ORD_XboxHardwareInfo:  return KDATA_XboxHardwareInfo;
+    case ORD_XboxKrnlVersion:   return KDATA_XboxKrnlVersion;
+    case ORD_LaunchDataPage:    return KDATA_LaunchDataPage;
+    case ORD_XeImageFileName:   return KDATA_XeImageFileName;
+    default:                    return 0;
+    }
+}
+
+// Initialize kernel data exports in guest RAM
+inline void init_kernel_data(uint8_t* ram) {
+    // Zero the area first
+    memset(ram + KDATA_BASE, 0, 0x120);
+
+    // KeTickCount: start at 1
+    uint32_t tick = 1;
+    memcpy(ram + KDATA_KeTickCount, &tick, 4);
+
+    // XboxHardwareInfo: Flags=0x20 (INTERNAL_USB_HUB), GpuRevision=0xA1, McpRevision=0xD4
+    uint32_t hw_flags = 0x00000020u;
+    memcpy(ram + KDATA_XboxHardwareInfo, &hw_flags, 4);
+    ram[KDATA_XboxHardwareInfo + 4] = 0xA1; // GPU revision (NV2A A1)
+    ram[KDATA_XboxHardwareInfo + 5] = 0xD4; // MCP revision (X3)
+
+    // XboxKrnlVersion: 1.0.5838.1
+    uint16_t ver[4] = { 1, 0, 5838, 1 };
+    memcpy(ram + KDATA_XboxKrnlVersion, ver, 8);
+
+    // LaunchDataPage: NULL (no launch data)
+    uint32_t null_ptr = 0;
+    memcpy(ram + KDATA_LaunchDataPage, &null_ptr, 4);
+
+    // XeImageFileName: "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe"
+    const char* img_name = "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe";
+    uint16_t name_len = (uint16_t)strlen(img_name);
+    uint16_t max_len = name_len + 1;
+    memcpy(ram + KDATA_XeImageFileName, &name_len, 2);
+    memcpy(ram + KDATA_XeImageFileName + 2, &max_len, 2);
+    uint32_t buf_addr = KDATA_XeImageFileNameBuf;
+    memcpy(ram + KDATA_XeImageFileName + 4, &buf_addr, 4);
+    memcpy(ram + KDATA_XeImageFileNameBuf, img_name, name_len + 1);
+}
+
 // Simple bump allocator for guest heap (contiguous memory requests)
+struct PendingThread {
+    uint32_t start_routine;
+    uint32_t start_context;
+};
+
 struct XbeHeap {
     uint32_t next_alloc;  // next free PA
     uint32_t limit;       // end of allocatable region
+    uint32_t next_handle; // fake handle counter
 
-    XbeHeap() : next_alloc(0x01000000u), limit(GUEST_RAM_SIZE) {}
+    // Pending threads created by PsCreateSystemThread(Ex)
+    std::vector<PendingThread> pending_threads;
+
+    XbeHeap() : next_alloc(0x01000000u), limit(GUEST_RAM_SIZE), next_handle(0x100) {}
 
     uint32_t alloc(uint32_t size, uint32_t align = 0x1000) {
         uint32_t base = (next_alloc + align - 1) & ~(align - 1);
@@ -407,6 +568,14 @@ struct XbeHeap {
 
 inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     auto* heap = static_cast<XbeHeap*>(user);
+
+    // Trace every HLE call — include return address from stack
+    uint32_t ret_addr = 0;
+    uint32_t hle_esp = exec.ctx.gp[GP_ESP];
+    if (hle_esp + 4 <= GUEST_RAM_SIZE)
+        memcpy(&ret_addr, exec.ram + hle_esp, 4);
+    fprintf(stderr, "[hle] ordinal %u  EIP=0x%08X  ESP=0x%08X  EBP=0x%08X  ret=0x%08X\n",
+            ordinal, exec.ctx.eip, hle_esp, exec.ctx.gp[GP_EBP], ret_addr);
 
     switch (ordinal) {
     case ORD_AvGetSavedDataAddress:
@@ -500,10 +669,97 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 1);
         return true;
 
-    case ORD_HalReturnToFirmware:
-        // Halt the guest — this is the "reboot" call.
-        exec.ctx.halted = true;
+    // ---- Hal / Ex / Rtl stubs needed by dashboard init ----
+
+    case ORD_HalReadSMBusValue: {
+        // NTSTATUS HalReadSMBusValue(UCHAR Addr, UCHAR Cmd, BOOLEAN WordFlag, ULONG *DataValue)
+        uint32_t data_ptr = stack_arg(exec, 3);
+        if (data_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t val = 0;
+            memcpy(exec.ram + data_ptr, &val, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 4);
+        return true;
+    }
+
+    case ORD_HalWriteSMBusValue:
+        // NTSTATUS HalWriteSMBusValue(UCHAR Addr, UCHAR Cmd, BOOLEAN WordFlag, ULONG DataValue)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        return true;
+
+    case ORD_HalRegisterShutdownNotification:
+        // void HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN Register)
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_ExQueryNonVolatileSetting: {
+        // NTSTATUS ExQueryNonVolatileSetting(DWORD ValueIndex, DWORD *Type,
+        //          PVOID Value, DWORD ValueLength, DWORD *ResultLength)
+        uint32_t value_index = stack_arg(exec, 0);
+        uint32_t type_ptr    = stack_arg(exec, 1);
+        uint32_t value_ptr   = stack_arg(exec, 2);
+        uint32_t value_len   = stack_arg(exec, 3);
+        uint32_t result_ptr  = stack_arg(exec, 4);
+
+        // Default: return a DWORD of 0
+        uint32_t result_val = 0;
+        uint32_t result_size = 4;
+        uint32_t type = 4; // REG_DWORD
+
+        // Provide specific values for known settings
+        switch (value_index) {
+        case 0x04: result_val = 0x00000100; break; // AVRegion: NTSC-M
+        case 0x07: result_val = 1; break;          // Language: English
+        case 0x08: result_val = 0; break;          // DvdRegion: region free
+        case 0x09: result_val = 0; break;          // TimeZone bias: UTC
+        case 0x0A: result_val = 0; break;          // TimeZone std name (empty)
+        default: break;
+        }
+
+        if (type_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + type_ptr, &type, 4);
+        if (value_ptr + result_size <= GUEST_RAM_SIZE && result_size <= value_len)
+            memcpy(exec.ram + value_ptr, &result_val, result_size);
+        if (result_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + result_ptr, &result_size, 4);
+
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 5);
+        return true;
+    }
+
+    case ORD_RtlNtStatusToDosError: {
+        // ULONG RtlNtStatusToDosError(NTSTATUS Status)
+        uint32_t status = stack_arg(exec, 0);
+        uint32_t dos_error = (status == 0) ? 0 : 317; // ERROR_MR_MID_NOT_FOUND
+        exec.ctx.gp[GP_EAX] = dos_error;
         stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_HalReturnToFirmware:
+        // If there are pending threads, run the next one instead of halting.
+        stdcall_cleanup(exec, 1);
+        if (!heap->pending_threads.empty()) {
+            PendingThread t = heap->pending_threads.front();
+            heap->pending_threads.erase(heap->pending_threads.begin());
+            fprintf(stderr, "[hle] HalReturnToFirmware: running pending thread routine=0x%08X\n",
+                    t.start_routine);
+            uint32_t esp = exec.ctx.gp[GP_ESP];
+            uint32_t halt_addr = hle_stub_addr(ORD_HalReturnToFirmware);
+            // Push start context as argument
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &t.start_context, 4);
+            // Push return address
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
+            exec.ctx.gp[GP_ESP] = esp;
+            exec.ctx.eip = t.start_routine;
+        } else {
+            exec.ctx.halted = true;
+        }
         return true;
 
     case ORD_KeGetCurrentThread:
@@ -573,47 +829,133 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     case ORD_KeSetTimer:
         // BOOLEAN KeSetTimer(PKTIMER, LARGE_INTEGER DueTime, PKDPC Dpc)
+        // LARGE_INTEGER is 8 bytes = 2 stack slots → 4 args total
         exec.ctx.gp[GP_EAX] = 0; // was not already in queue
-        stdcall_cleanup(exec, 3);
+        stdcall_cleanup(exec, 4);
         return true;
 
     case ORD_KeSetTimerEx:
         // BOOLEAN KeSetTimerEx(PKTIMER, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)
+        // LARGE_INTEGER is 8 bytes = 2 stack slots → 5 args total
         exec.ctx.gp[GP_EAX] = 0;
-        stdcall_cleanup(exec, 4);
+        stdcall_cleanup(exec, 5);
         return true;
 
-    case ORD_KeTickCount:
-        // This is actually a variable, not a function. Return a counter.
-        exec.ctx.gp[GP_EAX] = 1;
-        return true;
-
-    case ORD_PsCreateSystemThread:
-        // Stub: return STATUS_SUCCESS but don't actually create a thread.
+    case ORD_PsCreateSystemThread: {
+        // PsCreateSystemThread(OUT PHANDLE, ..., IN PKSTART_ROUTINE StartRoutine,
+        //                      IN PVOID StartContext)
+        // stdcall: 7 args. Args[0]=PHANDLE, Args[5]=StartRoutine, Args[6]=StartContext
+        uint32_t handle_ptr    = stack_arg(exec, 0);
+        uint32_t start_routine = stack_arg(exec, 5);
+        uint32_t start_context = stack_arg(exec, 6);
+        uint32_t handle = heap->next_handle++;
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + handle_ptr, &handle, 4);
+        heap->pending_threads.push_back({start_routine, start_context});
+        fprintf(stderr, "[hle] PsCreateSystemThread: routine=0x%08X ctx=0x%08X handle=0x%X\n",
+                start_routine, start_context, handle);
         exec.ctx.gp[GP_EAX] = 0;
         stdcall_cleanup(exec, 7);
         return true;
+    }
+
+    case ORD_PsCreateSystemThreadEx: {
+        // PsCreateSystemThreadEx(OUT PHANDLE ThreadHandle, SIZE_T ThreadExtensionSize,
+        //   SIZE_T KernelStackSize, SIZE_T TlsDataSize, OUT PHANDLE ThreadId,
+        //   PKSTART_ROUTINE StartRoutine, PVOID StartContext,
+        //   BOOLEAN CreateSuspended, BOOLEAN DebuggerThread, PKSYSTEM_ROUTINE SystemRoutine)
+        // stdcall: 10 args.
+        uint32_t handle_ptr    = stack_arg(exec, 0);
+        uint32_t tid_ptr       = stack_arg(exec, 4);
+        uint32_t start_routine = stack_arg(exec, 5);
+        uint32_t start_context = stack_arg(exec, 6);
+        uint32_t handle = heap->next_handle++;
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + handle_ptr, &handle, 4);
+        if (tid_ptr && tid_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t tid = handle;
+            memcpy(exec.ram + tid_ptr, &tid, 4);
+        }
+        heap->pending_threads.push_back({start_routine, start_context});
+        fprintf(stderr, "[hle] PsCreateSystemThreadEx: routine=0x%08X ctx=0x%08X handle=0x%X\n",
+                start_routine, start_context, handle);
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 10);
+        return true;
+    }
 
     case ORD_PsTerminateSystemThread:
-        exec.ctx.gp[GP_EAX] = 0;
+        // Current thread exits. Run next pending thread if any.
         stdcall_cleanup(exec, 1);
+        if (!heap->pending_threads.empty()) {
+            PendingThread t = heap->pending_threads.front();
+            heap->pending_threads.erase(heap->pending_threads.begin());
+            fprintf(stderr, "[hle] PsTerminateSystemThread: switching to thread routine=0x%08X ctx=0x%08X\n",
+                    t.start_routine, t.start_context);
+            // Set up a call frame: push context as arg, set EIP to routine
+            uint32_t esp = exec.ctx.gp[GP_ESP];
+            // Push a return address that will halt (use HalReturnToFirmware stub)
+            uint32_t halt_addr = hle_stub_addr(ORD_HalReturnToFirmware);
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
+            // Push start context as argument
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &t.start_context, 4);
+            // Push the return address (HalReturnToFirmware, so thread exit halts)
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
+            exec.ctx.gp[GP_ESP] = esp;
+            exec.ctx.eip = t.start_routine;
+        } else {
+            exec.ctx.halted = true;
+        }
+        exec.ctx.gp[GP_EAX] = 0;
         return true;
 
-    case ORD_RtlEnterCriticalSection:
+    case ORD_RtlEnterCriticalSection: {
         // void RtlEnterCriticalSection(PRTL_CRITICAL_SECTION)
         // Single-threaded stub: always succeeds immediately.
+        // RTL_CRITICAL_SECTION: {DebugInfo(0), LockCount(4), RecursionCount(8),
+        //                        OwningThread(0xC), LockSemaphore(0x10), SpinCount(0x14)}
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            int32_t lock = 0; // locked
+            memcpy(exec.ram + cs + 0x04, &lock, 4);
+            int32_t rec = 1;
+            memcpy(exec.ram + cs + 0x08, &rec, 4);
+        }
         stdcall_cleanup(exec, 1);
         return true;
+    }
 
-    case ORD_RtlLeaveCriticalSection:
+    case ORD_RtlLeaveCriticalSection: {
         // void RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION)
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            int32_t lock = -1; // unlocked
+            memcpy(exec.ram + cs + 0x04, &lock, 4);
+            int32_t rec = 0;
+            memcpy(exec.ram + cs + 0x08, &rec, 4);
+            uint32_t zero = 0;
+            memcpy(exec.ram + cs + 0x0C, &zero, 4); // OwningThread = 0
+        }
         stdcall_cleanup(exec, 1);
         return true;
+    }
 
-    case ORD_RtlInitializeCriticalSection:
+    case ORD_RtlInitializeCriticalSection: {
         // void RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION)
+        // Initialize all fields: DebugInfo=0, LockCount=-1, RecursionCount=0,
+        // OwningThread=0, LockSemaphore=0, SpinCount=0
+        uint32_t cs = stack_arg(exec, 0);
+        if (cs + 0x18 <= GUEST_RAM_SIZE) {
+            memset(exec.ram + cs, 0, 0x18);
+            int32_t neg1 = -1;
+            memcpy(exec.ram + cs + 0x04, &neg1, 4); // LockCount = -1 (unlocked)
+        }
         stdcall_cleanup(exec, 1);
         return true;
+    }
 
     case ORD_RtlInitAnsiString: {
         // void RtlInitAnsiString(PANSI_STRING Dest, PCSTR Src)
@@ -665,7 +1007,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 3);
         return true;
 
-    case ORD_KeInitializeMutex:
+    case ORD_KeInitializeMutant:
         // void KeInitializeMutex(PKMUTEX, ULONG Level)
         stdcall_cleanup(exec, 2);
         return true;
@@ -692,7 +1034,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 1);
         return true;
 
-    case ORD_KeReleaseMutex:
+    case ORD_KeReleaseMutant:
         // LONG KeReleaseMutex(PKMUTEX, BOOLEAN Wait)
         exec.ctx.gp[GP_EAX] = 0; // previous count
         stdcall_cleanup(exec, 2);
@@ -772,7 +1114,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 3);
         return true;
 
-    case ORD_NtWaitForMultipleObjects:
+    case ORD_NtWaitForMultipleObjectsEx:
         // NTSTATUS NtWaitForMultipleObjects(ULONG Count, PHANDLE Handles,
         //          WAIT_TYPE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
         exec.ctx.gp[GP_EAX] = 0;
@@ -788,7 +1130,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 6);
         return true;
 
-    case ORD_ObDereferenceObject:
+    case ORD_ObfDereferenceObject:
         // void ObDereferenceObject(PVOID Object)
         stdcall_cleanup(exec, 1);
         return true;
@@ -914,7 +1256,6 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
     }
 
-    case ORD_RtlCopyMemory:
     case ORD_RtlMoveMemory: {
         // void RtlCopyMemory(VOID *Dest, const VOID *Src, SIZE_T Length)
         // RtlMoveMemory handles overlaps (memmove).
@@ -968,6 +1309,216 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
             eq = (memcmp(exec.ram + buf1, exec.ram + buf2, len1) == 0);
         exec.ctx.gp[GP_EAX] = eq ? 1u : 0u;
         stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    // ---- I/O Manager stubs ----
+
+    case ORD_IoCreateDevice:
+        // NTSTATUS IoCreateDevice(PDRIVER_OBJECT, ULONG, PSTRING, ULONG,
+        //                         BOOLEAN, PDEVICE_OBJECT*)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 6);
+        return true;
+
+    case ORD_IoCreateFile: {
+        // NTSTATUS IoCreateFile(OUT PHANDLE, ACCESS, OBJ_ATTRS, IO_STATUS,
+        //     PLARGE_INT, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG)
+        // Write a fake handle
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        uint32_t h = heap->next_handle++;
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + handle_ptr, &h, 4);
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 14);
+        return true;
+    }
+
+    case ORD_IoCreateSymbolicLink:
+        // NTSTATUS IoCreateSymbolicLink(PSTRING SymbolicLinkName, PSTRING DeviceName)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 2);
+        return true;
+
+    case ORD_IoDeleteDevice:
+        // void IoDeleteDevice(PDEVICE_OBJECT)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_IoDeleteSymbolicLink:
+        // NTSTATUS IoDeleteSymbolicLink(PSTRING SymbolicLinkName)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    // ---- Additional Ke stubs ----
+
+    case ORD_KeGetCurrentIrql:
+        // KIRQL KeGetCurrentIrql(void)
+        exec.ctx.gp[GP_EAX] = 0; // PASSIVE_LEVEL
+        return true; // no args to clean
+
+    case ORD_KeDelayExecutionThread:
+        // NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeEnterCriticalRegion:
+        // void KeEnterCriticalRegion(void) — no args
+        return true;
+
+    case ORD_HalGetInterruptVector: {
+        // ULONG HalGetInterruptVector(ULONG BusInterruptLevel, OUT PKIRQL Irql)
+        uint32_t irql_ptr = stack_arg(exec, 1);
+        if (irql_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t irql = 0; // PASSIVE_LEVEL
+            memcpy(exec.ram + irql_ptr, &irql, 4);
+        }
+        exec.ctx.gp[GP_EAX] = stack_arg(exec, 0) + 0x30; // fake vector
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_KeConnectInterrupt:
+        // BOOLEAN KeConnectInterrupt(PKINTERRUPT)
+        exec.ctx.gp[GP_EAX] = 1; // TRUE
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_KeInitializeInterrupt:
+        // void KeInitializeInterrupt(PKINTERRUPT, PKSERVICE_ROUTINE, PVOID, ULONG,
+        //     KIRQL, KINTERRUPT_MODE, BOOLEAN ShareVector)
+        stdcall_cleanup(exec, 7);
+        return true;
+
+    case ORD_KeStallExecutionProcessor:
+        // void KeStallExecutionProcessor(ULONG MicroSeconds)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_NtOpenFile: {
+        // NTSTATUS NtOpenFile(OUT PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+        //     PIO_STATUS_BLOCK, ULONG ShareAccess, ULONG OpenOptions)
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        uint32_t h = heap->next_handle++;
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + handle_ptr, &h, 4);
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 6);
+        return true;
+    }
+
+    case ORD_NtReadFile: {
+        // NTSTATUS NtReadFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID,
+        //     PIO_STATUS_BLOCK, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset)
+        // Return 0 bytes read
+        uint32_t iosb_ptr = stack_arg(exec, 4);
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            uint32_t zero = 0;
+            memcpy(exec.ram + iosb_ptr, &zero, 4); // Status = SUCCESS
+            memcpy(exec.ram + iosb_ptr + 4, &zero, 4); // Information = 0
+        }
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 8);
+        return true;
+    }
+
+    case ORD_NtSetInformationFile:
+        // NTSTATUS NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    case ORD_KeRaiseIrqlToDpcLevel:
+        // KIRQL KeRaiseIrqlToDpcLevel(void)
+        exec.ctx.gp[GP_EAX] = 0; // return old IRQL (PASSIVE_LEVEL)
+        return true;
+
+    case ORD_KfLowerIrql:
+        // void KfLowerIrql(KIRQL NewIrql) — fastcall, arg in CL
+        return true;
+
+    case ORD_MmLockUnlockBufferPages:
+        // void MmLockUnlockBufferPages(PVOID, ULONG, BOOLEAN)
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_KeBugCheck:
+        fprintf(stderr, "[hle] KeBugCheck(0x%08X)\n", exec.ctx.gp[GP_EAX]);
+        exec.ctx.halted = true;
+        return true;
+
+    case ORD_KeBugCheckEx:
+        fprintf(stderr, "[hle] KeBugCheckEx(0x%08X, ...)\n", stack_arg(exec, 0));
+        exec.ctx.halted = true;
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    case ORD_HalReadSMCTrayState: {
+        // NTSTATUS HalReadSMCTrayState(PULONG TrayState, PULONG TrayStateChangeCount)
+        // TrayState: 0=no media, 1=tray open, etc.  Return "media present"
+        uint32_t state_ptr = stack_arg(exec, 0);
+        uint32_t count_ptr = stack_arg(exec, 1);
+        if (state_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t state = 0x10; // TRAY_CLOSED_MEDIA_PRESENT
+            memcpy(exec.ram + state_ptr, &state, 4);
+        }
+        if (count_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t count = 0;
+            memcpy(exec.ram + count_ptr, &count, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_IoDismountVolumeByName:
+        // NTSTATUS IoDismountVolumeByName(PSTRING VolumeName)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_NtCreateFile: {
+        // NTSTATUS NtCreateFile(OUT PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+        //     POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
+        //     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+        //     ULONG CreateDisposition, ULONG CreateOptions)
+        uint32_t handle_ptr = stack_arg(exec, 0);
+        uint32_t h = heap->next_handle++;
+        if (handle_ptr + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + handle_ptr, &h, 4);
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 9);
+        return true;
+    }
+
+    case ORD_ExInitializeReadWriteLock:
+        // void ExInitializeReadWriteLock(PERWLOCK ReadWriteLock)
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_FscSetCacheSize:
+        // NTSTATUS FscSetCacheSize(ULONG NumberOfPages)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_NtDeviceIoControlFile: {
+        // NTSTATUS NtDeviceIoControlFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+        //     PIO_STATUS_BLOCK, ULONG IoControlCode, PVOID InputBuffer,
+        //     ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 10);
+        return true;
+    }
+
+    case ORD_NtQueryFullAttributesFile: {
+        // NTSTATUS NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
+        //     PFILE_NETWORK_OPEN_INFORMATION FileInformation)
+        // Return STATUS_OBJECT_NAME_NOT_FOUND for now — file doesn't exist
+        exec.ctx.gp[GP_EAX] = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        stdcall_cleanup(exec, 2);
         return true;
     }
 

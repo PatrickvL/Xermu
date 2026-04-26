@@ -85,7 +85,7 @@ private:
                         GuestContext* ctx);
 
     // Emit a RET trace exit (reads return addr from guest stack).
-    void emit_ret_exit(Emitter& e, GuestContext* ctx);
+    void emit_ret_exit(Emitter& e, GuestContext* ctx, uint16_t extra_pop = 0);
 };
 
 // ---------------------------------------------------------------------------

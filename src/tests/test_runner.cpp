@@ -247,9 +247,28 @@ int main(int argc, char** argv) {
 
     exec->load_guest(load_pa, buf.get(), file_size);
 
+    // Detect XBE and use the proper loader in xbox mode.
+    xbe::XbeInfo xbe_info {};
+    bool is_xbe = (file_size >= 4 && memcmp(buf.get(), "XBEH", 4) == 0);
+    if (is_xbe && xbox_mode) {
+        xbe_info = xbe::load_xbe(exec->ram, buf.get(), file_size);
+        if (!xbe_info.valid) {
+            fprintf(stderr, "XBE load failed\n");
+            exec->destroy();
+            delete hw;
+            return 2;
+        }
+        load_pa = xbe_info.entry_point;
+        printf("[test_runner] XBE entry point: 0x%08X\n", load_pa);
+    }
+
     // Stack with sentinel return address.
     // In xbox mode, 0x80000 is used for HLE stubs, so stack goes higher.
     uint32_t stack_top = xbox_mode ? 0x000A'0000u : 0x0008'0000u;
+    if (is_xbe && xbe_info.valid && xbe_info.stack_size > 0) {
+        // XBE specifies stack reserve. Allocate at a high address.
+        stack_top = 0x00B0'0000u;  // 11 MB — well above HLE stubs and image
+    }
     static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
     exec->ctx.gp[GP_ESP] = stack_top;
     memcpy(exec->ram + stack_top, &SENTINEL_EIP, 4);
@@ -257,9 +276,46 @@ int main(int argc, char** argv) {
 
     // Segment bases: FS points to a scratch area for tests.
     // The Xbox kernel uses FS for KPCR; tests can store/load via FS:[offset].
-    static constexpr uint32_t FS_BASE = 0x0007'0000;
-    exec->ctx.fs_base = FS_BASE;
+    // For XBE mode, KPCR must be outside the XBE image range
+    // (image spans ~0x10000..0x200000). Place at 0xD00000 (13MB).
+    // For non-XBE tests, the old 0x70000 is fine.
+    uint32_t fs_base = (xbox_mode && is_xbe) ? 0x00D0'0000u : 0x0007'0000u;
+    exec->ctx.fs_base = fs_base;
     exec->ctx.gs_base = 0;
+
+    // In XBE mode, set up a minimal KPCR + KTHREAD at fs_base.
+    if (xbox_mode && is_xbe) {
+        uint32_t kthread_base = fs_base + 0x1000;
+        // Zero the KPCR and KTHREAD areas
+        memset(exec->ram + fs_base, 0, 0x2000);
+
+        // KPCR.NtTib.ExceptionList = -1 (end of chain)
+        uint32_t neg1 = 0xFFFFFFFF;
+        memcpy(exec->ram + fs_base + 0x00, &neg1, 4);
+        // KPCR.NtTib.StackBase
+        memcpy(exec->ram + fs_base + 0x04, &stack_top, 4);
+        // KPCR.NtTib.StackLimit
+        uint32_t stack_limit = stack_top - 0x10000;
+        memcpy(exec->ram + fs_base + 0x08, &stack_limit, 4);
+        // KPCR.NtTib.Self = fs_base (self-referencing)
+        uint32_t fs_self = fs_base;
+        memcpy(exec->ram + fs_base + 0x18, &fs_self, 4);
+        // KPCR.SelfPcr = fs_base
+        memcpy(exec->ram + fs_base + 0x1C, &fs_self, 4);
+        // KPCR.CurrentThread (at offset 0x28 in Xbox KPCR)
+        uint32_t kt = kthread_base;
+        memcpy(exec->ram + fs_base + 0x28, &kt, 4);
+        // KPCR.Prcb (at offset 0x20)
+        uint32_t prcb = fs_base + 0x28; // Prcb starts at offset 0x28
+        memcpy(exec->ram + fs_base + 0x20, &prcb, 4);
+
+        // Minimal KTHREAD at kthread_base
+        // KTHREAD.TlsData at offset 0x28 (pointer to TLS area)
+        uint32_t tls_data = kthread_base + 0x200; // TLS slot area
+        memcpy(exec->ram + kthread_base + 0x28, &tls_data, 4);
+        // Zero the TLS slot area
+        memset(exec->ram + kthread_base + 0x200, 0, 0x100);
+    }
 
     // Register I/O ports (in non-xbox mode; xbox_setup already registers them).
     if (!xbox_mode)
@@ -277,8 +333,34 @@ int main(int argc, char** argv) {
         exec->register_io(0xEB, nullptr, io_irq_trigger_write, &hw->pic);
     }
 
-    // Run.
+    // Run — dispatch pending threads after each halt.
     exec->run(load_pa, /*max_steps=*/10'000'000);
+
+    // In XBE mode, the entry point may create threads and then exit.
+    // Keep running pending threads until none are left.
+    while (xbox_mode && !hle_heap.pending_threads.empty()) {
+        xbe::PendingThread t = hle_heap.pending_threads.front();
+        hle_heap.pending_threads.erase(hle_heap.pending_threads.begin());
+        fprintf(stderr, "[test_runner] dispatching pending thread routine=0x%08X ctx=0x%08X\n",
+                t.start_routine, t.start_context);
+
+        // Set up stack frame for the thread's start routine
+        exec->ctx.halted = false;
+        exec->ctx.stop_reason = STOP_NONE;
+        uint32_t esp = exec->ctx.gp[GP_ESP];
+        // Push start_context as argument
+        esp -= 4;
+        if (esp + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec->ram + esp, &t.start_context, 4);
+        // Push a "halt" return address (HLE_STUB_BASE, ordinal 0 → unhandled → halts)
+        uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
+        esp -= 4;
+        if (esp + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec->ram + esp, &halt_ret, 4);
+        exec->ctx.gp[GP_ESP] = esp;
+
+        exec->run(t.start_routine, /*max_steps=*/500'000'000);
+    }
 
     // Result: EAX = 0 is PASS, non-zero is fail code.
     uint32_t result = exec->ctx.gp[GP_EAX];

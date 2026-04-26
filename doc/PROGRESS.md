@@ -292,6 +292,39 @@
 - **Result**: 51/51 pass
 - **Status**: DONE
 
+### Step 25: XBE dashboard execution — HLE stubs + JIT fixes (HEAD)
+- **KPCR address fix**: Moved FS_BASE from 0x70000 to 0xD00000 for XBE mode.
+  Old address overlapped XBE .text section (0x12000–0xCF408), zeroing code
+  that included the `__SEH_prolog` function.
+- **RET imm16 fix**: `emit_ret_exit()` now correctly adds the immediate
+  operand to ESP (`ESP += 4 + extra_pop`) instead of just `ESP += 4`.
+- **High-byte register MOV fix**: Added C-helper path for MOV with AH/CH/DH/BH
+  and memory operands. These registers conflict with REX prefix in x86-64,
+  so the fastmem rewrite can't use R12/R14 directly.
+- **MOVZX 16-bit destination fix**: MOVZX AX/CX/DX/BX with memory source
+  now correctly preserves upper 16 bits of the 32-bit register.
+- **~30 new HLE kernel stubs**: IoCreateDevice/File/SymbolicLink,
+  IoDeleteDevice/SymbolicLink, IoDismountVolumeByName, HalReadSMCTrayState,
+  HalGetInterruptVector, NtCreateFile/Event/Mutant, NtOpenFile, NtReadFile,
+  NtSetInformationFile, NtDeviceIoControlFile, NtQueryFullAttributesFile,
+  NtClearEvent, NtWaitForMultipleObjectsEx, ObReferenceObjectByHandle,
+  ObfDereferenceObject, KeGetCurrentIrql/Thread, KeDelayExecutionThread,
+  KeEnterCriticalRegion, KeConnectInterrupt, KeInitializeInterrupt,
+  KeStallExecutionProcessor, KeRaiseIrqlToDpcLevel, KfLowerIrql,
+  KeBugCheck/Ex, MmLockUnlockBufferPages, ExInitializeReadWriteLock,
+  FscSetCacheSize.
+- **ESP/LEA test**: New esp_lea.asm with 8 test cases verifying LEA/MOV
+  with ESP base work correctly in JIT.
+- **XBE execution**: xboxdash.xbe now executes 305 HLE calls with zero
+  unhandled kernel ordinals. Performs file I/O (NtOpenFile/NtReadFile/
+  NtSetInformationFile/NtClose cycles), interrupt setup, critical section
+  operations, timer management. All spawned threads complete normally.
+- **Files**: src/executor.cpp, src/trace_builder.cpp, src/trace_builder.hpp,
+  src/test_runner.cpp, src/xbe_loader.hpp, tests/esp_lea.asm, tests/hle.asm,
+  CMakeLists.txt
+- **Result**: 52/52 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -323,3 +356,4 @@
 | eedec47 | 48   | 0    | PTE/PDE bit constants    |
 | (HEAD)  | 48   | 0    | FPU/SSE + BUS_FLOAT      |
 | (HEAD)  | 51   | 0    | BIOS boot infrastructure |
+| (HEAD)  | 52   | 0    | XBE HLE stubs + JIT fixes|

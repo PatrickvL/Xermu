@@ -1492,6 +1492,13 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_INT3:
     case ZYDIS_MNEMONIC_INT1:
         // Debug traps: deliver through IDT.
+        // In HLE/XBE mode with no IDT set up, treat INT3 as "thread exit":
+        // halt so the test_runner can dispatch pending threads.
+        if (hle_handler && ctx.idtr_limit == 0) {
+            ctx.eip += insn.length;
+            ctx.halted = true;
+            return;
+        }
         // INT3 is vector 3, return address = instruction AFTER the INT3.
         // INT1 is vector 1.
         deliver_interrupt(insn.mnemonic == ZYDIS_MNEMONIC_INT3 ? 3 : 1,
@@ -1684,8 +1691,8 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
                                   bool has_error, uint32_t error_code) {
     uint32_t idt_offset = (uint32_t)vector * 8;
     if (idt_offset + 7 > ctx.idtr_limit) {
-        fprintf(stderr, "[exec] IDT vector %u exceeds limit (%u)\n",
-                vector, ctx.idtr_limit);
+        fprintf(stderr, "[exec] IDT vector %u exceeds limit (%u) at EIP=0x%08X\n",
+                vector, ctx.idtr_limit, return_eip);
         ctx.halted = true;
         return;
     }
@@ -1728,6 +1735,16 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
                           | (ctx.virtual_if ? 0x200u : 0u)
                           | 0x02u;  // bit 1 always set
     uint32_t esp = ctx.gp[GP_ESP];
+
+    // Stack bounds check: if ESP is too low to push the interrupt frame
+    // (12-16 bytes), halt to prevent infinite fault loops.
+    uint32_t frame_size = has_error ? 16 : 12;
+    if (esp < frame_size || esp > GUEST_RAM_SIZE) {
+        fprintf(stderr, "[exec] stack overflow delivering vector %u (ESP=0x%08X)\n",
+                vector, esp);
+        ctx.halted = true;
+        return;
+    }
 
     auto push32 = [&](uint32_t val) {
         esp -= 4;
@@ -2003,6 +2020,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     uint64_t steps = 0;
     Trace* prev_trace = nullptr;
 
+    // Debug ring buffer: last 64 trace entries for diagnosing crashes.
+    static constexpr int TRACE_RING_SIZE = 64;
+    struct TraceEntry { uint32_t eip; uint32_t esp; uint32_t ebp; };
+    TraceEntry trace_ring[TRACE_RING_SIZE] = {};
+    int trace_ring_idx = 0;
+
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) {
             fprintf(stderr, "[exec] max_steps (%llu) reached at EIP=%08X\n",
@@ -2029,6 +2052,36 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         }
 
         uint32_t eip = ctx.eip;
+
+        // Record trace entry in ring buffer for diagnostics.
+        trace_ring[trace_ring_idx] = { eip, ctx.gp[GP_ESP], ctx.gp[GP_EBP] };
+        trace_ring_idx = (trace_ring_idx + 1) % TRACE_RING_SIZE;
+
+        // In HLE mode, if EIP is outside guest RAM and not in the MMIO
+        // device region (0xF0000000+), it's a bad jump — halt with diagnostic.
+        if (hle_handler && eip >= GUEST_RAM_SIZE && eip < 0xF0000000u) {
+            fprintf(stderr, "[exec] bad jump to EIP=0x%08X (outside guest RAM) ESP=0x%08X\n", eip, ctx.gp[GP_ESP]);
+            // Dump recent trace history
+            fprintf(stderr, "[exec] recent trace history (oldest first):\n");
+            for (int i = 0; i < TRACE_RING_SIZE; ++i) {
+                int idx = (trace_ring_idx + i) % TRACE_RING_SIZE;
+                if (trace_ring[idx].eip == 0 && trace_ring[idx].esp == 0) continue;
+                fprintf(stderr, "  EIP=0x%08X ESP=0x%08X EBP=0x%08X\n",
+                        trace_ring[idx].eip, trace_ring[idx].esp, trace_ring[idx].ebp);
+            }
+            // Dump stack for context
+            uint32_t esp = ctx.gp[GP_ESP];
+            fprintf(stderr, "[exec] stack @ESP=0x%08X:", esp);
+            for (int i = 0; i < 8; ++i) {
+                uint32_t val = 0;
+                if (esp + i * 4 + 4 <= GUEST_RAM_SIZE)
+                    memcpy(&val, ram + esp + i * 4, 4);
+                fprintf(stderr, " %08X", val);
+            }
+            fprintf(stderr, "\n");
+            ctx.halted = true;
+            break;
+        }
 
         // When paging is enabled, translate EIP (VA) to PA for code fetch.
         // The trace cache keys on the guest VA (ctx.eip).
@@ -2142,6 +2195,30 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Invalid opcode (#UD, vector 6): trace builder couldn't translate.
         if (ctx.stop_reason == STOP_INVALID_OPCODE) {
             prev_trace = nullptr;
+            // In HLE mode with no IDT, halt — don't try to deliver through IDT.
+            if (hle_handler && ctx.idtr_limit == 0) {
+                uint32_t eip = ctx.eip;
+                uint32_t esp = ctx.gp[GP_ESP];
+                fprintf(stderr, "[exec] #UD at EIP=0x%08X EBP=0x%08X bytes:", eip, ctx.gp[GP_EBP]);
+                for (int i = 0; i < 16 && eip + i < GUEST_RAM_SIZE; ++i)
+                    fprintf(stderr, " %02X", ram[eip + i]);
+                fprintf(stderr, "\n[exec] stack @ESP=0x%08X:", esp);
+                for (int i = 0; i < 8; ++i) {
+                    uint32_t val = 0;
+                    if (esp + i * 4 + 4 <= GUEST_RAM_SIZE)
+                        memcpy(&val, ram + esp + i * 4, 4);
+                    fprintf(stderr, " %08X", val);
+                }
+                fprintf(stderr, "\n[exec] recent trace history:\n");
+                for (int i = 0; i < TRACE_RING_SIZE; ++i) {
+                    int idx = (trace_ring_idx + i) % TRACE_RING_SIZE;
+                    if (trace_ring[idx].eip == 0 && trace_ring[idx].esp == 0) continue;
+                    fprintf(stderr, "  EIP=0x%08X ESP=0x%08X EBP=0x%08X\n",
+                            trace_ring[idx].eip, trace_ring[idx].esp, trace_ring[idx].ebp);
+                }
+                ctx.halted = true;
+                break;
+            }
             deliver_interrupt(6, ctx.eip);
             continue;
         }

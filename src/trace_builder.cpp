@@ -213,6 +213,21 @@ void mov_esp_from_mem(GuestContext* ctx, uint32_t pa) {
     ctx->gp[GP_ESP] = read_guest_mem32(ctx, pa);
 }
 
+// High-byte register MOV helpers (AH/CH/DH/BH can't use REX in x86-64).
+// gp_idx = 0..3 for AH/CH/DH/BH (maps to EAX/ECX/EDX/EBX).
+void mov_highbyte_from_mem(GuestContext* ctx, uint32_t pa, uint32_t gp_idx) {
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint8_t byte = (pa < GUEST_RAM_SIZE) ? base[pa] : 0;
+    ctx->gp[gp_idx] = (ctx->gp[gp_idx] & 0xFFFF00FFu) | ((uint32_t)byte << 8);
+}
+void mov_highbyte_to_mem(GuestContext* ctx, uint32_t pa, uint32_t gp_idx) {
+    uint8_t byte = (uint8_t)(ctx->gp[gp_idx] >> 8);
+    if (pa < GUEST_RAM_SIZE) {
+        auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+        base[pa] = byte;
+    }
+}
+
 // MOV [mem], ESP helper: write ctx->gp[GP_ESP] to PA.
 void mov_esp_to_mem(GuestContext* ctx, uint32_t pa) {
     write_guest_mem32(ctx, pa, ctx->gp[GP_ESP]);
@@ -692,7 +707,31 @@ bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     // MOV r, [m]  or  MOV [m], r
     if (ops[other_idx].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     uint8_t guest_enc = 0;
-    if (!guest_reg_enc(ops[other_idx].reg.value, guest_enc)) return false;
+    if (!guest_reg_enc(ops[other_idx].reg.value, guest_enc)) {
+        // High-byte register (AH/CH/DH/BH) — can't use REX, route through C helper.
+        uint32_t gp_idx = 0xFF;
+        ZydisRegister r = ops[other_idx].reg.value;
+        if      (r == ZYDIS_REGISTER_AH) gp_idx = GP_EAX;
+        else if (r == ZYDIS_REGISTER_CH) gp_idx = GP_ECX;
+        else if (r == ZYDIS_REGISTER_DH) gp_idx = GP_EDX;
+        else if (r == ZYDIS_REGISTER_BH) gp_idx = GP_EBX;
+        else return false; // truly unsupported register
+
+        if (!emit_ea_to_r14(e, ops[mem_idx])) return false;
+        emit_paging_translate(e, /*is_write=*/!is_load);
+        if (save_flags) emit_save_flags(e);
+        emit_save_all_gp(e);
+        emit_ccall_arg0_ctx(e);
+        emit_ccall_arg1_pa(e);
+        emit_ccall_arg2_imm(e, gp_idx);
+        if (is_load)
+            emit_call_abs(e, reinterpret_cast<void*>(mov_highbyte_from_mem));
+        else
+            emit_call_abs(e, reinterpret_cast<void*>(mov_highbyte_to_mem));
+        emit_load_all_gp(e);
+        if (save_flags) emit_restore_flags(e);
+        return true;
+    }
 
     // ESP special case: guest ESP is not in a host register.
     // MOV ESP, [mem] → load from guest memory, store to ctx->gp[GP_ESP].
@@ -1355,7 +1394,23 @@ bool emit_handler_movzx_mem(Emitter& e, const ZydisDecodedInstruction& insn,
     }
 
     uint8_t dst_enc = 0;
-    if (!reg32_enc(ops[0].reg.value, dst_enc)) return false;
+    if (!reg32_enc(ops[0].reg.value, dst_enc)) {
+        // 16-bit dest (e.g. MOVZX AX, BYTE [mem]): upper 16 bits preserved.
+        if (!guest_reg_enc(ops[0].reg.value, dst_enc)) return false;
+        if (!emit_ea_to_r14(e, ops[1])) return false;
+        emit_paging_translate(e, /*is_write=*/false);
+        uint32_t patch_start = (uint32_t)e.pos;
+        // MOVZX R14D, BYTE [R12+R14]
+        e.emit8(0x43); e.emit8(0x0F); e.emit8(0xB6);
+        e.emit8(uint8_t((6u << 3) | 4u)); e.emit8(0x34);
+        emit_pad_to(e, patch_start, 5);
+        e.add_mem_site(patch_start, e.fault_eip,
+                       (uint8_t)(e.pos - patch_start));
+        // AND dst, 0xFFFF0000; OR dst, R14D — merge into low 16 bits
+        e.emit8(0x81); e.emit8(uint8_t(0xE0u | dst_enc)); e.emit32(0xFFFF0000u);
+        e.emit8(0x44); e.emit8(0x09); e.emit8(uint8_t(0xC0u | (6u << 3) | dst_enc));
+        return true;
+    }
 
     unsigned src_bits = ops[1].size; // 8 or 16
     bool esp_dst = (dst_enc == GP_ESP);
@@ -1573,7 +1628,8 @@ void TraceBuilder::emit_call_exit(Emitter& e,
 // from guest stack, write it directly to ctx->next_eip, restore EAX from ctx.
 // ---------------------------------------------------------------------------
 
-void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
+void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/,
+                                  uint16_t extra_pop) {
     // Step 1: save all live guest GP regs (EAX = in-trace value, e.g. sum=55).
     emit_save_all_gp(e);
 
@@ -1589,8 +1645,10 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/) {
     e.add_mem_site(patch_start, e.fault_eip,
                    (uint8_t)(e.pos - patch_start));
 
-    // Step 4: ctx->esp += 4.
-    emit_add_ctx_esp(e, 4);
+    // Step 4: ctx->esp += 4 + extra_pop.
+    // For RET imm16, extra_pop is the immediate value (bytes to pop after
+    // removing the return address, matching stdcall/thiscall conventions).
+    emit_add_ctx_esp(e, 4 + extra_pop);
 
     // Step 6: ctx->next_eip = EAX  (direct write; bypass gpreg slot).
     //   MOV [R13+next_eip], EAX  →  REX.B=0x41  MOV-store=0x89  ModRM mod=01 reg=0 rm=5=0x45
@@ -1751,9 +1809,18 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
         if (icf & ICF_TERMINATOR) {
             done_flag = true;
             switch (insn.mnemonic) {
-            case ZYDIS_MNEMONIC_RET:
-                emit_ret_exit(e, ctx);
+            case ZYDIS_MNEMONIC_RET: {
+                // RET or RET imm16: pop return address, optionally pop extra bytes.
+                uint16_t extra = 0;
+                for (int oi = 0; oi < (int)insn.operand_count; ++oi) {
+                    if (ops[oi].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        extra = (uint16_t)(uint32_t)ops[oi].imm.value.u;
+                        break;
+                    }
+                }
+                emit_ret_exit(e, ctx, extra);
                 break;
+            }
             case ZYDIS_MNEMONIC_IRETD:
                 // IRET: pop EIP, CS, EFLAGS via C helper
                 emit_save_all_gp(e);

@@ -51,7 +51,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Test runner executable (loads flat 32-bit .bin files)
 # ---------------------------------------------------------------------------
-add_executable(test_runner ${COMMON_SOURCES} src/test_runner.cpp)
+add_executable(test_runner ${COMMON_SOURCES} src/tests/test_runner.cpp)
 target_include_directories(test_runner PRIVATE src)
 target_link_libraries(test_runner PRIVATE Zydis)
 
@@ -92,55 +92,56 @@ endif()
 find_program(NASM_EXECUTABLE nasm)
 
 set(TEST_ASM_FILES
-    tests/alu.asm
-    tests/memory.asm
-    tests/flow.asm
-    tests/fpu.asm
-    tests/sse.asm
-    tests/advanced.asm
-    tests/string.asm
-    tests/segment.asm
-    tests/indirect.asm
-    tests/privileged.asm
-    tests/misc.asm
-    tests/smc.asm
-    tests/interrupt.asm
-    tests/paging.asm
-    tests/xbox.asm
-    tests/hle.asm
-    tests/linking.asm
-    tests/pic.asm
-    tests/pit.asm
-    tests/nv2a_timer.asm
-    tests/pcrtc.asm
-    tests/smbus.asm
-    tests/nv2a_gpu.asm
-    tests/esp_mem.asm
-    tests/apu.asm
-    tests/ide.asm
-    tests/usb.asm
-    tests/mtrr.asm
-    tests/gdt_tss.asm
-    tests/flash.asm
-    tests/pfifo.asm
-    tests/ioapic.asm
-    tests/pci.asm
-    tests/pvideo.asm
-    tests/pbus.asm
-    tests/pramdac.asm
-    tests/ptimer_alarm.asm
-    tests/smbus_smc.asm
-    tests/ide_dma.asm
-    tests/usb_ohci.asm
-    tests/flash_cmd.asm
-    tests/apu_voice.asm
-    tests/nv2a_pmc.asm
-    tests/xbox_io.asm
-    tests/fastmem.asm
-    tests/smc_stress.asm
-    tests/div_error.asm
-    tests/mmio_alu.asm
-    tests/ud2.asm
+    src/tests/alu.asm
+    src/tests/memory.asm
+    src/tests/flow.asm
+    src/tests/fpu.asm
+    src/tests/sse.asm
+    src/tests/advanced.asm
+    src/tests/string.asm
+    src/tests/segment.asm
+    src/tests/indirect.asm
+    src/tests/privileged.asm
+    src/tests/misc.asm
+    src/tests/smc.asm
+    src/tests/interrupt.asm
+    src/tests/paging.asm
+    src/tests/xbox.asm
+    src/tests/hle.asm
+    src/tests/linking.asm
+    src/tests/pic.asm
+    src/tests/pit.asm
+    src/tests/nv2a_timer.asm
+    src/tests/pcrtc.asm
+    src/tests/smbus.asm
+    src/tests/nv2a_gpu.asm
+    src/tests/esp_mem.asm
+    src/tests/esp_lea.asm
+    src/tests/apu.asm
+    src/tests/ide.asm
+    src/tests/usb.asm
+    src/tests/mtrr.asm
+    src/tests/gdt_tss.asm
+    src/tests/flash.asm
+    src/tests/pfifo.asm
+    src/tests/ioapic.asm
+    src/tests/pci.asm
+    src/tests/pvideo.asm
+    src/tests/pbus.asm
+    src/tests/pramdac.asm
+    src/tests/ptimer_alarm.asm
+    src/tests/smbus_smc.asm
+    src/tests/ide_dma.asm
+    src/tests/usb_ohci.asm
+    src/tests/flash_cmd.asm
+    src/tests/apu_voice.asm
+    src/tests/nv2a_pmc.asm
+    src/tests/xbox_io.asm
+    src/tests/fastmem.asm
+    src/tests/smc_stress.asm
+    src/tests/div_error.asm
+    src/tests/mmio_alu.asm
+    src/tests/ud2.asm
 )
 
 if(NASM_EXECUTABLE)
@@ -154,11 +155,11 @@ if(NASM_EXECUTABLE)
             OUTPUT  ${bin_file}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/tests
             COMMAND ${NASM_EXECUTABLE} -f bin
-                    -I${CMAKE_CURRENT_SOURCE_DIR}/tests/
+                    -I${CMAKE_CURRENT_SOURCE_DIR}/src/tests/
                     -o ${bin_file}
                     ${CMAKE_CURRENT_SOURCE_DIR}/${asm_file}
             DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${asm_file}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/harness.inc
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/tests/harness.inc
             COMMENT "Assembling ${asm_file} → ${test_name}.bin"
         )
         list(APPEND TEST_BINS ${bin_file})
