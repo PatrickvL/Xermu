@@ -200,29 +200,8 @@ int main(int argc, char** argv) {
         // Test-only IRQ trigger port
         sys.exec->register_io(0xEB, nullptr, io_irq_trigger_write, &sys.hw->pic);
 
-        // Run XBE entry point
-        sys.exec->run(sys.entry_eip, 10'000'000);
-
-        // Dispatch pending threads
-        while (!sys.hle_heap.pending_threads.empty()) {
-            xbe::PendingThread t = sys.hle_heap.pending_threads.front();
-            sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
-            fprintf(stderr, "[test_runner] dispatching pending thread routine=0x%08X ctx=0x%08X\n",
-                    t.start_routine, t.start_context);
-
-            sys.exec->ctx.halted = false;
-            sys.exec->ctx.stop_reason = STOP_NONE;
-            uint32_t esp = sys.exec->ctx.gp[GP_ESP];
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE)
-                memcpy(sys.exec->ram + esp, &t.start_context, 4);
-            uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE)
-                memcpy(sys.exec->ram + esp, &halt_ret, 4);
-            sys.exec->ctx.gp[GP_ESP] = esp;
-            sys.exec->run(t.start_routine, 500'000'000);
-        }
+        // Run to completion (handles threads + DPCs via run_step)
+        while (xbox::run_step(sys, 10'000'000)) {}
 
         uint32_t result = sys.exec->ctx.gp[GP_EAX];
         printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",

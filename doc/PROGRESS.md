@@ -379,3 +379,61 @@
 | (HEAD)  | 51   | 0    | BIOS boot infrastructure |
 | (HEAD)  | 52   | 0    | XBE HLE stubs + JIT fixes|
 | (HEAD)  | 52   | 0    | GUI main + restructuring |
+
+### Step 27: LLE kernel mode + auto-detection (1cd842e)
+- **pe_loader.hpp**: `load_pe()` loads PE32 (i386) into guest RAM at preferred
+  base.  `resolve_export_by_ordinal()` maps ordinal→VA via PE export table.
+  `#undef` Windows SDK `IMAGE_SCN_*` macros before defining our own.
+- **boot_lle_kernel()**: Loads xboxkrnl.exe as PE, loads XBE, re-resolves
+  kernel thunks from real kernel exports (fallback to HLE stubs).
+- **Auto-detection**: `find_data_root()` walks up from exe dir to find `data/`.
+  `scan_data_dir()` probes for dashboard XBEs, BIOS ROMs, MCPX, xboxkrnl.exe.
+  GUI shows all detected files with boot buttons.
+- **CLI flags**: `--bios [path]`, `--kernel <path>`, `--mcpx <path>`, positional XBE.
+- **README.md**: Boot modes table, CLI examples, file path reference.
+- **Files**: src/xbox/pe_loader.hpp, src/main.cpp, src/tests/test_runner.cpp,
+  src/xbox/hle/bootstrap.hpp, README.md
+- **Result**: 52/52 pass
+- **Status**: DONE
+
+### Step 28: Fix data/ path resolution (283dedc)
+- `find_data_root()` resolves paths relative to executable, not CWD.
+- **Files**: src/main.cpp
+- **Result**: 52/52 pass
+- **Status**: DONE
+
+### Step 29: Fix BIOS boot crash (5b08df8)
+- `run_step()` now checks `stop_reason` for `STOP_INVALID_OPCODE` and
+  `STOP_DIVIDE_ERROR` as permanent halts, preventing infinite rerun loops.
+- **Files**: src/xbox/hle/bootstrap.hpp
+- **Result**: 52/52 pass
+- **Status**: DONE
+
+### Step 30: DPC timer dispatch + spin-detection yield (HEAD)
+- **DPC queue**: `PendingDpc` struct (routine, context, dpc_va, timer_va) and
+  `pending_dpcs` vector added to `XbeHeap`.
+- **KeInitializeDpc** (107): Writes routine+context to guest KDPC struct.
+- **KeSetTimer/KeSetTimerEx** (148/149): Reads DPC from guest timer struct,
+  pushes to `pending_dpcs` queue.
+- **DPC dispatch**: `run_step()` fires pending DPCs at the top before running
+  guest code — pushes 4 stdcall args + sentinel return, runs inline.
+- **Spin-detection**: Counts rapid `RtlEnterCriticalSection`/`RtlLeaveCriticalSection`
+  calls; after 200, yields (`halted=true`) so `run_step` can fire queued DPCs.
+- **test_runner.cpp**: Simplified XBE loop to `while (run_step(sys, 10M)) {}`.
+- **Files**: src/xbox/hle/hle_kernel.hpp, src/xbox/hle/bootstrap.hpp,
+  src/tests/test_runner.cpp
+- **Result**: 52/52 pass
+- **Status**: DONE
+
+### Step 31: CPU features for LLE kernel execution (HEAD)
+- **Debug registers**: Added `dr[8]` array to `GuestContext`.  `MOV DRn, r32`
+  and `MOV r32, DRn` fully handled in privileged.cpp, including DR4/DR5
+  aliasing to DR6/DR7 when CR4.DE is clear.
+- **RDPMC**: Returns 0 (kernel initialises PMCs but doesn't depend on values).
+- **EA computation fixes**: LGDT, LIDT, SGDT, SIDT, LLDT, LTR, SLDT, STR,
+  INVLPG all switched from simplified EA (base+disp only) to full
+  `compute_ea()` (base+index*scale+disp) with paging support and MMIO
+  fallback for store operations.
+- **Files**: src/cpu/context.hpp, src/cpu/privileged.cpp
+- **Result**: 52/52 pass
+- **Status**: DONE

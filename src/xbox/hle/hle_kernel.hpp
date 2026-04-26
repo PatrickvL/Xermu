@@ -258,6 +258,14 @@ struct PendingThread {
     uint32_t start_context;
 };
 
+// Pending DPC (Deferred Procedure Call) from KeSetTimer/KeSetTimerEx
+struct PendingDpc {
+    uint32_t routine;     // PKDEFERRED_ROUTINE
+    uint32_t context;     // DeferredContext
+    uint32_t dpc_va;      // VA of the KDPC object (Arg1 to routine)
+    uint32_t timer_va;    // VA of the KTIMER object (SystemArgument1)
+};
+
 // Host-backed file handle for guest I/O
 struct HostFile {
     FILE* fp;
@@ -272,6 +280,9 @@ struct XbeHeap {
 
     // Pending threads created by PsCreateSystemThread(Ex)
     std::vector<PendingThread> pending_threads;
+
+    // Pending DPCs queued by KeSetTimer/KeSetTimerEx
+    std::vector<PendingDpc> pending_dpcs;
 
     // Host-backed file system
     std::string xbe_directory;  // host directory containing the XBE
@@ -400,6 +411,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     // Suppress repeated log lines for high-frequency ordinals (wait/delay/critsec)
     static uint32_t last_ordinal = 0;
     static uint32_t repeat_count = 0;
+    static uint32_t spin_count = 0;  // counts rapid Enter/Leave CS pairs
     if (ordinal == last_ordinal &&
         (ordinal == ORD_RtlEnterCriticalSection || ordinal == ORD_RtlLeaveCriticalSection ||
          ordinal == ORD_KeDelayExecutionThread   || ordinal == ORD_KeWaitForSingleObject ||
@@ -414,6 +426,18 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
                 ordinal, exec.ctx.eip, hle_esp, exec.ctx.gp[GP_EBP], ret_addr);
     }
     last_ordinal = ordinal;
+
+    // Detect spin-wait: rapid repeated Enter/Leave CS pattern.
+    // After enough spins, yield to let DPCs/timers fire.
+    if (ordinal == ORD_RtlEnterCriticalSection || ordinal == ORD_RtlLeaveCriticalSection) {
+        spin_count++;
+        if (spin_count > 200) {
+            spin_count = 0;
+            exec.ctx.halted = true;  // yield — run_step will fire DPCs
+        }
+    } else {
+        spin_count = 0;
+    }
 
     switch (ordinal) {
     case ORD_AvGetSavedDataAddress:
@@ -614,10 +638,23 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 1);
         return true;
 
-    case ORD_KeInitializeDpc:
+    case ORD_KeInitializeDpc: {
         // void KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE Routine, PVOID Context)
+        // KDPC layout: Type(0x00,1B), Inserted(0x02,1B), Padding(0x03,1B),
+        //   DpcListEntry(0x04,8B), DeferredRoutine(0x0C,4B),
+        //   DeferredContext(0x10,4B), SystemArgument1(0x14,4B), SystemArgument2(0x18,4B)
+        uint32_t dpc_va  = stack_arg(exec, 0);
+        uint32_t routine = stack_arg(exec, 1);
+        uint32_t context = stack_arg(exec, 2);
+        if (dpc_va + 0x1C <= GUEST_RAM_SIZE) {
+            memset(exec.ram + dpc_va, 0, 0x1C);
+            exec.ram[dpc_va] = 19; // Type = DpcObject
+            memcpy(exec.ram + dpc_va + 0x0C, &routine, 4);
+            memcpy(exec.ram + dpc_va + 0x10, &context, 4);
+        }
         stdcall_cleanup(exec, 3);
         return true;
+    }
 
     case ORD_KeQueryPerformanceCounter: {
         // ULONGLONG KeQueryPerformanceCounter()
@@ -667,19 +704,37 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
     }
 
-    case ORD_KeSetTimer:
-        // BOOLEAN KeSetTimer(PKTIMER, LARGE_INTEGER DueTime, PKDPC Dpc)
-        // LARGE_INTEGER is 8 bytes = 2 stack slots â†’ 4 args total
+    case ORD_KeSetTimer: {
+        // BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
+        uint32_t timer_va = stack_arg(exec, 0);
+        uint32_t dpc_va   = stack_arg(exec, 3); // after 8-byte DueTime
+        if (dpc_va && dpc_va + 0x1C <= GUEST_RAM_SIZE) {
+            uint32_t routine = 0, context = 0;
+            memcpy(&routine, exec.ram + dpc_va + 0x0C, 4);
+            memcpy(&context, exec.ram + dpc_va + 0x10, 4);
+            if (routine)
+                heap->pending_dpcs.push_back({routine, context, dpc_va, timer_va});
+        }
         exec.ctx.gp[GP_EAX] = 0; // was not already in queue
         stdcall_cleanup(exec, 4);
         return true;
+    }
 
-    case ORD_KeSetTimerEx:
-        // BOOLEAN KeSetTimerEx(PKTIMER, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)
-        // LARGE_INTEGER is 8 bytes = 2 stack slots â†’ 5 args total
+    case ORD_KeSetTimerEx: {
+        // BOOLEAN KeSetTimerEx(PKTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)
+        uint32_t timer_va = stack_arg(exec, 0);
+        uint32_t dpc_va   = stack_arg(exec, 4); // after 8-byte DueTime + Period
+        if (dpc_va && dpc_va + 0x1C <= GUEST_RAM_SIZE) {
+            uint32_t routine = 0, context = 0;
+            memcpy(&routine, exec.ram + dpc_va + 0x0C, 4);
+            memcpy(&context, exec.ram + dpc_va + 0x10, 4);
+            if (routine)
+                heap->pending_dpcs.push_back({routine, context, dpc_va, timer_va});
+        }
         exec.ctx.gp[GP_EAX] = 0;
         stdcall_cleanup(exec, 5);
         return true;
+    }
 
     case ORD_PsCreateSystemThread: {
         // PsCreateSystemThread(OUT PHANDLE, ..., IN PKSTART_ROUTINE StartRoutine,

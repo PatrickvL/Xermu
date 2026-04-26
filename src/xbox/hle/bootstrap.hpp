@@ -367,6 +367,31 @@ inline bool boot_lle_kernel(XboxSystem& sys, const BootConfig& cfg,
 inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     if (!sys.running) return false;
 
+    // Fire any pending DPCs before running guest code.
+    // DPC routines are called at DISPATCH_LEVEL between timeslices.
+    while (!sys.hle_heap.pending_dpcs.empty()) {
+        xbe::PendingDpc dpc = sys.hle_heap.pending_dpcs.front();
+        sys.hle_heap.pending_dpcs.erase(sys.hle_heap.pending_dpcs.begin());
+
+        // DPC routine: void (PKDPC, PVOID Context, PVOID SysArg1, PVOID SysArg2)
+        uint32_t esp = sys.exec->ctx.gp[GP_ESP];
+        uint32_t zero = 0;
+        // Push args right-to-left: SysArg2, SysArg1(timer), Context, Dpc
+        esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &zero, 4);
+        esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.timer_va, 4);
+        esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.context, 4);
+        esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.dpc_va, 4);
+        // Push sentinel return address
+        uint32_t sentinel = 0xFFFFFFFFu;
+        esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &sentinel, 4);
+        sys.exec->ctx.gp[GP_ESP] = esp;
+
+        sys.exec->ctx.halted = false;
+        sys.exec->ctx.stop_reason = STOP_NONE;
+        sys.exec->run(dpc.routine, max_steps);
+        // DPC routine has finished (or hit max_steps) — continue
+    }
+
     sys.exec->ctx.halted = false;
     sys.exec->ctx.stop_reason = STOP_NONE;
     sys.exec->run(sys.entry_eip, max_steps);
