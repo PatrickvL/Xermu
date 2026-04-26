@@ -110,11 +110,9 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
 
     // Step 6: Patch the 5-byte NOP sled immediately before the faulting
     // instruction with CALL rel32 → stub.  The NOP sled starts at rip - 5.
+    // CALL rel32 next-IP = nop_sled+5 = rip, so rel32 = stub_ptr - rip.
     uint8_t* nop_sled = rip - 5;
-    intptr_t delta = (intptr_t)site->stub_ptr - (intptr_t)rip; // CALL rel32: target-(rip+5)+5 = target-rip ... wait
-    // CALL rel32 at nop_sled[0..4]: next IP = nop_sled+5 = rip, so
-    // rel32 = stub_ptr - (nop_sled + 5) = stub_ptr - rip
-    delta = (intptr_t)site->stub_ptr - (intptr_t)rip;
+    intptr_t delta = (intptr_t)site->stub_ptr - (intptr_t)rip;
     if (delta < INT32_MIN || delta > INT32_MAX) {
         fprintf(stderr, "[veh] stub too far for rel32 CALL (delta=%td)\n", delta);
         return EXCEPTION_CONTINUE_SEARCH;
