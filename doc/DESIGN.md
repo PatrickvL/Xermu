@@ -191,7 +191,7 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 
 | File                  | Purpose                                        | Status        |
 |-----------------------|------------------------------------------------|---------------|
-| `CMakeLists.txt`      | Build config, Zydis fetch, MASM for MSVC       | ✅ Working    |
+| `CMakeLists.txt`      | Build config, Zydis/SDL3/ImGui/volk fetch, MASM  | ✅ Working    |
 | `platform.hpp`        | OS memory allocation (RWX + RW), aliased fastmem window   | ✅ Working    |
 | `context.hpp`         | `GuestContext` struct, register indices         | ✅ Working    |
 | `mmio.hpp`            | MMIO region dispatch table                     | ✅ Working    |
@@ -204,7 +204,8 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 | `executor.hpp`        | `Executor` struct, `dispatch_trace` decl       | ✅ Working    |
 | `executor.cpp`        | ASM trampoline (GCC/Clang), run loop           | ✅ Working    |
 | `dispatch_trace.asm`  | MASM trampoline for MSVC                       | ✅ Working    |
-| `main.cpp`            | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
+| `main.cpp`            | Xermu GUI: SDL3/ImGui/Vulkan window, XBE/XISO file picker, emulation loop | ✅ Working |
+| `bootstrap.hpp`       | Shared Xbox bootstrap (BootConfig, XboxSystem, boot_hle/lle, run_step) | ✅ Working |
 | `pe_loader.hpp`       | Win32 PE loader (xboxkrnl.exe) + export resolver | ✅ Working    |
 | `xbe_loader.hpp`      | Xbox XBE loader: sections, thunks, TLS, HLE     | ✅ Working    |
 | `xbox.hpp`            | Umbrella header — includes all `src/xbox/` files | ✅ Working    |
@@ -224,7 +225,8 @@ CALL sits between a flag-producing instruction and a later flag-consuming one.
 | `xbox/pit.hpp`        | 8254 PIT (3 channels, rate gen + one-shot)       | ✅ Working    |
 | `xbox/misc_io.hpp`    | Sysctl 0x61 (toggle), POST 0x80, debug 0xE9      | ✅ Working    |
 | `xbox/setup.hpp`      | XboxHardware struct, tick callback, xbox_setup()  | ✅ Working    |
-| `test_runner.cpp`     | NASM test binary loader (flat 32-bit .bin)       | ✅ Working    |
+| `test_runner.cpp`     | Headless test runner (flat .bin, XBE, BIOS) using bootstrap | ✅ Working |
+| `test_basic.cpp`      | Self-tests: sum loop, EFLAGS, LEA/PUSH/MOV, x87 | ✅ ALL PASS   |
 | `tests/harness.inc`   | NASM test macros (ASSERT_EQ, ASSERT_FLAGS, PASS) | ✅ Working    |
 | `tests/alu.asm`       | ALU test suite (52 assertions)                   | ✅ ALL PASS   |
 | `tests/memory.asm`    | Memory/XCHG/CMPXCHG/XADD/BT/BSF/SHLD (76)       | ✅ ALL PASS   |

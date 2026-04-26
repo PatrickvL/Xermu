@@ -17,9 +17,7 @@
 //   --mcpx: (optional with --bios) Load a 512-byte MCPX ROM dump.
 // ---------------------------------------------------------------------------
 
-#include "cpu/executor.hpp"
-#include "xbox/xbox.hpp"
-#include "xbox/hle/hle_kernel.hpp"
+#include "xbox/hle/bootstrap.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -62,13 +60,11 @@ static void test_mmio_write(uint32_t pa, uint32_t v, unsigned sz, void*) {
 // I/O port handlers
 // ---------------------------------------------------------------------------
 
-// Port 0xE9: bochs-style debug console — prints the byte to stdout.
 static void io_debug_write(uint16_t, uint32_t val, unsigned, void*) {
     putchar(val & 0xFF);
     fflush(stdout);
 }
 
-// Port 0xEB: test IRQ trigger — writing N raises IRQ N on the PIC.
 static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
     auto* pic = static_cast<xbox::PicPair*>(user);
     if (val < 16) pic->raise_irq((int)val);
@@ -116,80 +112,32 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- LLE boot mode (uses shared bootstrap) ----
     if (bios_mode) {
-        // ---- LLE boot mode ----
-        printf("[test_runner] LLE boot: loading BIOS '%s'\n", bios_path);
+        xbox::BootConfig cfg;
+        cfg.bios_path = bios_path;
+        if (mcpx_path) cfg.mcpx_path = mcpx_path;
 
-        auto exec = std::make_unique<Executor>();
-        auto* hw = xbox::xbox_setup(*exec);
+        xbox::XboxSystem sys;
+        if (!xbox::boot_lle(sys, cfg)) return 2;
 
-        // Load BIOS into flash.
-        if (!hw->flash.load_bios(bios_path)) {
-            fprintf(stderr, "Failed to load BIOS image '%s'\n", bios_path);
-            delete hw;
-            return 2;
-        }
-        printf("[test_runner] BIOS loaded into flash\n");
-
-        // Optionally load MCPX ROM.
-        if (mcpx_path) {
-            if (!hw->flash.load_mcpx(mcpx_path)) {
-                fprintf(stderr, "Failed to load MCPX ROM '%s'\n", mcpx_path);
-                delete hw;
-                return 2;
-            }
-            printf("[test_runner] MCPX ROM loaded\n");
-        }
-
-        // Without MCPX ROM, the init table at PA 0xFFFC0000 (flash offset
-        // 0xC0000) is encrypted/garbage with no 0xEE terminator.  Patch the
-        // first byte to 0xEE so the table immediately terminates and the code
-        // proceeds to the RC4 decryption stage at 0xFFFFFEB4.
-        // The MCPX ROM would normally decrypt and populate this table; without
-        // it, we skip the hardware init commands (our emulator already has
-        // all devices in a known-good initial state).
-        if (!mcpx_path) {
-            constexpr uint32_t init_table_flash_off = 0xC0000;
-            hw->flash.data[init_table_flash_off] = 0xEE;
-            printf("[test_runner] Patched init table with 0xEE (no MCPX ROM)\n");
-        }
-
-        // Boot: interpret the 16-bit real-mode prologue (LGDT/LIDT/PE/far JMP)
-        // to reach the 32-bit protected mode entry point.
-        if (!exec->interpret_real_mode_boot()) {
-            fprintf(stderr, "Real-mode boot stub interpretation failed\n");
-            exec->destroy();
-            delete hw;
-            return 2;
-        }
-
-        printf("[test_runner] Entering protected mode at EIP=0x%08X\n",
-               exec->ctx.eip);
-        printf("[test_runner] GDT: base=0x%08X limit=%u  IDT: base=0x%08X limit=%u\n",
-               exec->ctx.gdtr_base, exec->ctx.gdtr_limit,
-               exec->ctx.idtr_base, exec->ctx.idtr_limit);
-        printf("[test_runner] CR0=0x%08X\n", exec->ctx.cr0);
-
-        exec->run(exec->ctx.eip, /*max_steps=*/100'000'000);
+        // Run to completion
+        sys.exec->run(sys.entry_eip, 100'000'000);
 
         printf("[test_runner] Halted: EIP=0x%08X EAX=0x%08X\n",
-               exec->ctx.eip, exec->ctx.gp[GP_EAX]);
+               sys.exec->ctx.eip, sys.exec->ctx.gp[GP_EAX]);
 
-        // Dump the first 64 bytes at the 2BL load address (0x400000)
-        // to verify whether RC4 decryption produced valid code.
+        // Dump 2BL area for verification
         printf("[test_runner] RAM at 0x400000:");
         for (int i = 0; i < 64; ++i) {
             if (i % 16 == 0) printf("\n  %08X:", 0x400000 + i);
-            printf(" %02X", exec->ram[0x400000 + i]);
+            printf(" %02X", sys.exec->ram[0x400000 + i]);
         }
         printf("\n");
-
-        exec->destroy();
-        delete hw;
         return 0;
     }
 
-    // ---- Test binary mode ----
+    // ---- Test binary / XBE mode ----
     if (argi >= argc) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n");
         return 2;
@@ -200,32 +148,59 @@ int main(int argc, char** argv) {
     if (argi + 1 < argc) load_pa = (uint32_t)strtoul(argv[argi + 1], nullptr, 16);
 
     // Read binary file.
-    FILE* f = fopen(bin_path, "rb");
-    if (!f) {
+    auto buf = xbox::read_file_to_vec(bin_path);
+    if (buf.empty()) {
         fprintf(stderr, "Cannot open '%s'\n", bin_path);
         return 2;
     }
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (file_size <= 0 || (uint32_t)file_size > GUEST_RAM_SIZE - load_pa) {
-        fprintf(stderr, "Invalid file size (%ld) or won't fit at PA 0x%08X\n",
-                file_size, load_pa);
-        fclose(f);
-        return 2;
-    }
-    auto buf = std::make_unique<uint8_t[]>(file_size);
-    if (fread(buf.get(), 1, file_size, f) != (size_t)file_size) {
-        fprintf(stderr, "Read error\n");
-        fclose(f);
-        return 2;
-    }
-    fclose(f);
+    long file_size = (long)buf.size();
 
     printf("[test_runner] Loading '%s' (%ld bytes) at PA 0x%08X\n",
            bin_path, file_size, load_pa);
 
-    // Set up executor.
+    // XBE in xbox mode → use shared bootstrap
+    bool is_xbe = (file_size >= 4 && memcmp(buf.data(), "XBEH", 4) == 0);
+    if (is_xbe && xbox_mode) {
+        xbox::BootConfig cfg;
+        cfg.xbe_path = bin_path;
+
+        xbox::XboxSystem sys;
+        if (!xbox::boot_hle(sys, cfg)) return 2;
+
+        // Test-only IRQ trigger port
+        sys.exec->register_io(0xEB, nullptr, io_irq_trigger_write, &sys.hw->pic);
+
+        // Run XBE entry point
+        sys.exec->run(sys.entry_eip, 10'000'000);
+
+        // Dispatch pending threads
+        while (!sys.hle_heap.pending_threads.empty()) {
+            xbe::PendingThread t = sys.hle_heap.pending_threads.front();
+            sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
+            fprintf(stderr, "[test_runner] dispatching pending thread routine=0x%08X ctx=0x%08X\n",
+                    t.start_routine, t.start_context);
+
+            sys.exec->ctx.halted = false;
+            sys.exec->ctx.stop_reason = STOP_NONE;
+            uint32_t esp = sys.exec->ctx.gp[GP_ESP];
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE)
+                memcpy(sys.exec->ram + esp, &t.start_context, 4);
+            uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE)
+                memcpy(sys.exec->ram + esp, &halt_ret, 4);
+            sys.exec->ctx.gp[GP_ESP] = esp;
+            sys.exec->run(t.start_routine, 500'000'000);
+        }
+
+        uint32_t result = sys.exec->ctx.gp[GP_EAX];
+        printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",
+               result == 0 ? "PASS" : "FAIL", result, sys.exec->ctx.eip);
+        return result == 0 ? 0 : 1;
+    }
+
+    // ---- Flat binary test mode (non-XBE) ----
     auto exec = std::make_unique<Executor>();
     xbox::XboxHardware* hw = nullptr;
     MmioMap stub_mmio;
@@ -245,126 +220,35 @@ int main(int argc, char** argv) {
         }
     }
 
-    exec->load_guest(load_pa, buf.get(), file_size);
-
-    // Detect XBE and use the proper loader in xbox mode.
-    xbe::XbeInfo xbe_info {};
-    bool is_xbe = (file_size >= 4 && memcmp(buf.get(), "XBEH", 4) == 0);
-    if (is_xbe && xbox_mode) {
-        xbe_info = xbe::load_xbe(exec->ram, buf.get(), file_size);
-        if (!xbe_info.valid) {
-            fprintf(stderr, "XBE load failed\n");
-            exec->destroy();
-            delete hw;
-            return 2;
-        }
-        load_pa = xbe_info.entry_point;
-        printf("[test_runner] XBE entry point: 0x%08X\n", load_pa);
-    }
+    exec->load_guest(load_pa, buf.data(), file_size);
 
     // Stack with sentinel return address.
-    // In xbox mode, 0x80000 is used for HLE stubs, so stack goes higher.
     uint32_t stack_top = xbox_mode ? 0x000A'0000u : 0x0008'0000u;
-    if (is_xbe && xbe_info.valid && xbe_info.stack_size > 0) {
-        // XBE specifies stack reserve. Allocate at a high address.
-        stack_top = 0x00B0'0000u;  // 11 MB — well above HLE stubs and image
-    }
     static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
     exec->ctx.gp[GP_ESP] = stack_top;
     memcpy(exec->ram + stack_top, &SENTINEL_EIP, 4);
     exec->ctx.eflags = 0x0000'0202;
 
-    // Segment bases: FS points to a scratch area for tests.
-    // The Xbox kernel uses FS for KPCR; tests can store/load via FS:[offset].
-    // For XBE mode, KPCR must be outside the XBE image range
-    // (image spans ~0x10000..0x200000). Place at 0xD00000 (13MB).
-    // For non-XBE tests, the old 0x70000 is fine.
-    uint32_t fs_base = (xbox_mode && is_xbe) ? 0x00D0'0000u : 0x0007'0000u;
-    exec->ctx.fs_base = fs_base;
+    // FS base for tests (non-XBE)
+    exec->ctx.fs_base = 0x0007'0000u;
     exec->ctx.gs_base = 0;
 
-    // In XBE mode, set up a minimal KPCR + KTHREAD at fs_base.
-    if (xbox_mode && is_xbe) {
-        uint32_t kthread_base = fs_base + 0x1000;
-        // Zero the KPCR and KTHREAD areas
-        memset(exec->ram + fs_base, 0, 0x2000);
-
-        // KPCR.NtTib.ExceptionList = -1 (end of chain)
-        uint32_t neg1 = 0xFFFFFFFF;
-        memcpy(exec->ram + fs_base + 0x00, &neg1, 4);
-        // KPCR.NtTib.StackBase
-        memcpy(exec->ram + fs_base + 0x04, &stack_top, 4);
-        // KPCR.NtTib.StackLimit
-        uint32_t stack_limit = stack_top - 0x10000;
-        memcpy(exec->ram + fs_base + 0x08, &stack_limit, 4);
-        // KPCR.NtTib.Self = fs_base (self-referencing)
-        uint32_t fs_self = fs_base;
-        memcpy(exec->ram + fs_base + 0x18, &fs_self, 4);
-        // KPCR.SelfPcr = fs_base
-        memcpy(exec->ram + fs_base + 0x1C, &fs_self, 4);
-        // KPCR.CurrentThread (at offset 0x28 in Xbox KPCR)
-        uint32_t kt = kthread_base;
-        memcpy(exec->ram + fs_base + 0x28, &kt, 4);
-        // KPCR.Prcb (at offset 0x20)
-        uint32_t prcb = fs_base + 0x28; // Prcb starts at offset 0x28
-        memcpy(exec->ram + fs_base + 0x20, &prcb, 4);
-
-        // Minimal KTHREAD at kthread_base
-        // KTHREAD.TlsData at offset 0x28 (pointer to TLS area)
-        uint32_t tls_data = kthread_base + 0x200; // TLS slot area
-        memcpy(exec->ram + kthread_base + 0x28, &tls_data, 4);
-        // Zero the TLS slot area
-        memset(exec->ram + kthread_base + 0x200, 0, 0x100);
-    }
-
-    // Register I/O ports (in non-xbox mode; xbox_setup already registers them).
     if (!xbox_mode)
         exec->register_io(0xE9, nullptr, io_debug_write);
 
-    // In xbox mode, install HLE kernel stubs and handler.
+    // In xbox mode (non-XBE), install HLE stubs for asm tests that need them.
     static xbe::XbeHeap hle_heap;
     if (xbox_mode) {
         xbe::write_hle_stubs(exec->ram);
-        hle_heap = xbe::XbeHeap();  // reset allocator
+        hle_heap.reset();
         exec->hle_handler = xbe::default_hle_handler;
         exec->hle_user    = &hle_heap;
-
-        // Test-only IRQ trigger port: write N to 0xEB → raise IRQ N on PIC.
         exec->register_io(0xEB, nullptr, io_irq_trigger_write, &hw->pic);
     }
 
-    // Run — dispatch pending threads after each halt.
-    exec->run(load_pa, /*max_steps=*/10'000'000);
+    exec->run(load_pa, 10'000'000);
 
-    // In XBE mode, the entry point may create threads and then exit.
-    // Keep running pending threads until none are left.
-    while (xbox_mode && !hle_heap.pending_threads.empty()) {
-        xbe::PendingThread t = hle_heap.pending_threads.front();
-        hle_heap.pending_threads.erase(hle_heap.pending_threads.begin());
-        fprintf(stderr, "[test_runner] dispatching pending thread routine=0x%08X ctx=0x%08X\n",
-                t.start_routine, t.start_context);
-
-        // Set up stack frame for the thread's start routine
-        exec->ctx.halted = false;
-        exec->ctx.stop_reason = STOP_NONE;
-        uint32_t esp = exec->ctx.gp[GP_ESP];
-        // Push start_context as argument
-        esp -= 4;
-        if (esp + 4 <= GUEST_RAM_SIZE)
-            memcpy(exec->ram + esp, &t.start_context, 4);
-        // Push a "halt" return address (HLE_STUB_BASE, ordinal 0 → unhandled → halts)
-        uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
-        esp -= 4;
-        if (esp + 4 <= GUEST_RAM_SIZE)
-            memcpy(exec->ram + esp, &halt_ret, 4);
-        exec->ctx.gp[GP_ESP] = esp;
-
-        exec->run(t.start_routine, /*max_steps=*/500'000'000);
-    }
-
-    // Result: EAX = 0 is PASS, non-zero is fail code.
     uint32_t result = exec->ctx.gp[GP_EAX];
-
     printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",
            result == 0 ? "PASS" : "FAIL", result, exec->ctx.eip);
 

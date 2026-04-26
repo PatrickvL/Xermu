@@ -325,9 +325,30 @@
 - **Result**: 52/52 pass
 - **Status**: DONE
 
----
-
-## Test Results
+### Step 26: GUI main + project restructuring (HEAD)
+- **Renamed** `main.cpp` → `test_basic.cpp` (5 self-contained JIT tests)
+- **bootstrap.hpp**: New shared module (`BootConfig`, `XboxSystem`,
+  `boot_hle()`, `boot_lle()`, `run_step()`, `setup_kpcr()`,
+  `read_file_to_vec()`) used by both GUI and test runner.
+- **test_runner.cpp**: Rewritten to use `bootstrap.hpp` for XBE and BIOS
+  boot modes.  Flat binary test mode remains standalone.
+- **main.cpp**: New SDL3/ImGui/Vulkan GUI entry point.  Features:
+  - SDL3 window with Vulkan surface (volk dynamic loader, no SDK needed)
+  - ImGui overlay with Dark theme
+  - Auto-detects dashboard XBE / BIOS / MCPX in `data/` directory
+  - File dialog for XBE and XISO selection
+  - HLE and LLE boot via shared bootstrap
+  - Real-time emulation loop (500K steps/frame)
+  - Log window and register status display
+  - Command-line XBE argument support
+- **CMakeLists.txt**: Added SDL3 (release-3.2.14), Dear ImGui (v1.91.8),
+  Vulkan-Headers + volk via FetchContent.  New `xermu` target.  Renamed
+  `guided_executor` → `test_basic`.
+- **Files**: src/main.cpp (new), src/xbox/hle/bootstrap.hpp (new),
+  src/tests/test_basic.cpp (renamed), src/tests/test_runner.cpp (rewritten),
+  CMakeLists.txt
+- **Result**: 52/52 pass
+- **Status**: DONE
 
 | Commit  | Pass | Fail | Notes                    |
 |---------|------|------|--------------------------|
@@ -357,3 +378,4 @@
 | (HEAD)  | 48   | 0    | FPU/SSE + BUS_FLOAT      |
 | (HEAD)  | 51   | 0    | BIOS boot infrastructure |
 | (HEAD)  | 52   | 0    | XBE HLE stubs + JIT fixes|
+| (HEAD)  | 52   | 0    | GUI main + restructuring |

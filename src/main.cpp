@@ -1,365 +1,749 @@
-#include "cpu/executor.hpp"
+// ---------------------------------------------------------------------------
+// main.cpp — Xermu: Xbox emulator with SDL3 / ImGui / Vulkan UI.
+//
+// Creates a window, lets the user select an XBE or XISO to boot, and runs
+// the emulated Xbox system.  Falls back to the dashboard XBE if present.
+// ---------------------------------------------------------------------------
+
+#include "xbox/hle/bootstrap.hpp"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+// Use volk for Vulkan dynamic loading (no SDK required)
+#include <volk.h>
+
+#include "imgui.h"
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_vulkan.h"
+
 #include <cstdio>
-#include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <cassert>
-#include <memory>
+#include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
-// Stub MMIO — catches any access above guest RAM (should not be hit here).
+// Vulkan helpers — minimal single-queue setup for ImGui rendering.
 // ---------------------------------------------------------------------------
 
-static uint32_t stub_mmio_read(uint32_t pa, unsigned /*sz*/, void* /*u*/) {
-    fprintf(stderr, "[mmio] unexpected read  PA=%08X\n", pa);
-    return 0xDEAD'BEEFu;
-}
-static void stub_mmio_write(uint32_t pa, uint32_t v, unsigned /*sz*/, void* /*u*/) {
-    fprintf(stderr, "[mmio] unexpected write PA=%08X val=%08X\n", pa, v);
+struct VulkanContext {
+    VkInstance               instance       = VK_NULL_HANDLE;
+    VkPhysicalDevice         physical       = VK_NULL_HANDLE;
+    VkDevice                 device         = VK_NULL_HANDLE;
+    VkQueue                  queue          = VK_NULL_HANDLE;
+    uint32_t                 queue_family   = 0;
+    VkSurfaceKHR             surface        = VK_NULL_HANDLE;
+    VkDescriptorPool         descriptor_pool= VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debug_messenger= VK_NULL_HANDLE;
+
+    // ImGui render pass resources
+    VkRenderPass             render_pass    = VK_NULL_HANDLE;
+    VkSwapchainKHR           swapchain      = VK_NULL_HANDLE;
+    std::vector<VkImage>     swapchain_images;
+    std::vector<VkImageView> swapchain_views;
+    std::vector<VkFramebuffer> framebuffers;
+    VkCommandPool            cmd_pool       = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cmd_buffers;
+    std::vector<VkSemaphore> image_available;
+    std::vector<VkSemaphore> render_finished;
+    std::vector<VkFence>     in_flight;
+    VkFormat                 swapchain_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D               swapchain_extent = {1280, 720};
+    uint32_t                 frame_count    = 0;
+    uint32_t                 current_frame  = 0;
+};
+
+static void check_vk(VkResult r, const char* msg) {
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[vulkan] %s failed: %d\n", msg, (int)r);
+    }
 }
 
-// Shared executor setup / teardown helpers.
-static MmioMap make_mmio() {
-    MmioMap mmio;
-    mmio.add(GUEST_RAM_SIZE, ~0u - GUEST_RAM_SIZE,
-             stub_mmio_read, stub_mmio_write);
-    return mmio;
-}
+static bool init_vulkan(VulkanContext& vk, SDL_Window* window) {
+    // Initialize volk (dynamically loads vulkan-1.dll)
+    if (volkInitialize() != VK_SUCCESS) {
+        fprintf(stderr, "[vulkan] volkInitialize failed — no Vulkan driver?\n");
+        return false;
+    }
 
-static constexpr uint32_t STACK_TOP    = 0x0008'0000;
-static constexpr uint32_t SENTINEL_EIP = 0xFFFF'FFFFu;
+    // Instance
+    uint32_t sdl_ext_count = 0;
+    const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&sdl_ext_count);
 
-static bool setup_exec(Executor& exec, MmioMap& mmio,
-                        uint32_t load_pa, const uint8_t* code, size_t size) {
-    if (!exec.init(&mmio)) { fprintf(stderr, "init failed\n"); return false; }
-    exec.load_guest(load_pa, code, size);
-    exec.ctx.gp[GP_ESP] = STACK_TOP;
-    memcpy(exec.ram + STACK_TOP, &SENTINEL_EIP, 4);
-    exec.ctx.eflags = 0x0000'0202;
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "Xermu";
+    app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
+    app_info.pEngineName = "Xermu";
+    app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
+    app_info.apiVersion = VK_API_VERSION_1_2;
+
+    VkInstanceCreateInfo inst_info = {};
+    inst_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    inst_info.pApplicationInfo = &app_info;
+    inst_info.enabledExtensionCount = sdl_ext_count;
+    inst_info.ppEnabledExtensionNames = sdl_exts;
+
+    check_vk(vkCreateInstance(&inst_info, nullptr, &vk.instance), "vkCreateInstance");
+    if (!vk.instance) return false;
+    volkLoadInstance(vk.instance);
+
+    // Surface
+    if (!SDL_Vulkan_CreateSurface(window, vk.instance, nullptr, &vk.surface)) {
+        fprintf(stderr, "[vulkan] SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
+        return false;
+    }
+
+    // Physical device — pick first discrete GPU, or first available
+    uint32_t gpu_count = 0;
+    vkEnumeratePhysicalDevices(vk.instance, &gpu_count, nullptr);
+    if (gpu_count == 0) { fprintf(stderr, "[vulkan] No GPUs found\n"); return false; }
+
+    std::vector<VkPhysicalDevice> gpus(gpu_count);
+    vkEnumeratePhysicalDevices(vk.instance, &gpu_count, gpus.data());
+    vk.physical = gpus[0];
+    for (auto& g : gpus) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(g, &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            vk.physical = g;
+            break;
+        }
+    }
+
+    // Queue family — graphics + present
+    uint32_t qf_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(vk.physical, &qf_count, nullptr);
+    std::vector<VkQueueFamilyProperties> qf_props(qf_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(vk.physical, &qf_count, qf_props.data());
+
+    vk.queue_family = UINT32_MAX;
+    for (uint32_t i = 0; i < qf_count; i++) {
+        VkBool32 present_support = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(vk.physical, i, vk.surface, &present_support);
+        if ((qf_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present_support) {
+            vk.queue_family = i;
+            break;
+        }
+    }
+    if (vk.queue_family == UINT32_MAX) {
+        fprintf(stderr, "[vulkan] No suitable queue family\n");
+        return false;
+    }
+
+    // Logical device
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_info = {};
+    queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_info.queueFamilyIndex = vk.queue_family;
+    queue_info.queueCount = 1;
+    queue_info.pQueuePriorities = &priority;
+
+    const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    VkDeviceCreateInfo dev_info = {};
+    dev_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dev_info.queueCreateInfoCount = 1;
+    dev_info.pQueueCreateInfos = &queue_info;
+    dev_info.enabledExtensionCount = 1;
+    dev_info.ppEnabledExtensionNames = dev_exts;
+
+    check_vk(vkCreateDevice(vk.physical, &dev_info, nullptr, &vk.device), "vkCreateDevice");
+    if (!vk.device) return false;
+    volkLoadDevice(vk.device);
+    vkGetDeviceQueue(vk.device, vk.queue_family, 0, &vk.queue);
+
+    // Descriptor pool for ImGui
+    VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 },
+    };
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets = 100;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = pool_sizes;
+    check_vk(vkCreateDescriptorPool(vk.device, &pool_info, nullptr, &vk.descriptor_pool),
+             "vkCreateDescriptorPool");
+
     return true;
 }
 
-// ===========================================================================
-// Test 1: Sum loop + fastmem round-trip
-// ===========================================================================
+static bool create_swapchain(VulkanContext& vk, SDL_Window* window) {
+    VkSurfaceCapabilitiesKHR caps;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.physical, vk.surface, &caps);
 
-// Guest program (32-bit protected mode, load PA = 0x1000):
-//   Sum integers 1..10 into EAX, store to RAM, verify round-trip.
-//   mov  eax, 0           ; sum = 0
-//   mov  ecx, 10          ; i   = 10
-// .loop:
-//   add  eax, ecx         ; sum += i
-//   dec  ecx              ; i--   (DEC ECX short-form 0x49 — re-encoded by JIT)
-//   jnz  .loop            ; loop while i != 0
-//   mov  [0x4000], eax    ; store sum (fastmem write)
-//   mov  edx, [0x4000]    ; reload    (fastmem read — round-trip check)
-//   mov  [0x4004], edx    ; store reload result
-//   mov  ebx, 0xDEADBEEF
-//   ret
+    int w, h;
+    SDL_GetWindowSizeInPixels(window, &w, &h);
+    vk.swapchain_extent = { (uint32_t)w, (uint32_t)h };
 
-static const uint8_t test1_code[] = {
-    0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0
-    0xB9, 0x0A, 0x00, 0x00, 0x00,       // mov ecx, 10
-    0x01, 0xC8,                          // add eax, ecx
-    0x49,                                // dec ecx
-    0x75, 0xFB,                          // jnz -5
-    0x89, 0x05, 0x00, 0x40, 0x00, 0x00, // mov [0x4000], eax
-    0x8B, 0x15, 0x00, 0x40, 0x00, 0x00, // mov edx, [0x4000]
-    0x89, 0x15, 0x04, 0x40, 0x00, 0x00, // mov [0x4004], edx
-    0xBB, 0xEF, 0xBE, 0xAD, 0xDE,       // mov ebx, 0xDEADBEEF
-    0xC3,                                // ret
-};
-static_assert(sizeof(test1_code) == 39);
+    uint32_t image_count = caps.minImageCount + 1;
+    if (caps.maxImageCount > 0 && image_count > caps.maxImageCount)
+        image_count = caps.maxImageCount;
+    vk.frame_count = image_count;
 
-static bool test_sum_loop() {
-    printf("=== Test 1: Sum loop + fastmem round-trip ===\n");
+    VkSwapchainCreateInfoKHR sc_info = {};
+    sc_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sc_info.surface = vk.surface;
+    sc_info.minImageCount = image_count;
+    sc_info.imageFormat = vk.swapchain_format;
+    sc_info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    sc_info.imageExtent = vk.swapchain_extent;
+    sc_info.imageArrayLayers = 1;
+    sc_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sc_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sc_info.preTransform = caps.currentTransform;
+    sc_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    sc_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // vsync
+    sc_info.clipped = VK_TRUE;
+    sc_info.oldSwapchain = vk.swapchain;
 
-    MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<Executor>();
-    if (!setup_exec(*exec, mmio, 0x1000, test1_code, sizeof(test1_code)))
-        return false;
+    check_vk(vkCreateSwapchainKHR(vk.device, &sc_info, nullptr, &vk.swapchain),
+             "vkCreateSwapchainKHR");
 
-    exec->run(0x1000, 100'000);
+    // Swapchain images + views
+    vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &image_count, nullptr);
+    vk.swapchain_images.resize(image_count);
+    vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &image_count, vk.swapchain_images.data());
 
-    uint32_t ram4000 = 0, ram4004 = 0;
-    memcpy(&ram4000, exec->ram + 0x4000, 4);
-    memcpy(&ram4004, exec->ram + 0x4004, 4);
+    vk.swapchain_views.resize(image_count);
+    for (uint32_t i = 0; i < image_count; i++) {
+        VkImageViewCreateInfo iv = {};
+        iv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image = vk.swapchain_images[i];
+        iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format = vk.swapchain_format;
+        iv.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        check_vk(vkCreateImageView(vk.device, &iv, nullptr, &vk.swapchain_views[i]),
+                 "vkCreateImageView");
+    }
 
-    printf("  EAX  = %u  \t(expected 55)\n",           exec->ctx.gp[GP_EAX]);
-    printf("  EBX  = 0x%08X\t(expected 0xDEADBEEF)\n", exec->ctx.gp[GP_EBX]);
-    printf("  ECX  = %u  \t(expected 0)\n",            exec->ctx.gp[GP_ECX]);
-    printf("  [0x4000] = %u  \t(expected 55)\n",       ram4000);
-    printf("  [0x4004] = %u  \t(expected 55)\n",       ram4004);
+    // Render pass
+    VkAttachmentDescription att = {};
+    att.format = vk.swapchain_format;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-    bool ok = exec->ctx.gp[GP_EAX] == 55u
-           && exec->ctx.gp[GP_EBX] == 0xDEADBEEFu
-           && exec->ctx.gp[GP_ECX] == 0u
-           && ram4000              == 55u
-           && ram4004              == 55u;
+    VkAttachmentReference att_ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &att_ref;
 
-    printf("  %s\n", ok ? "PASS" : "FAIL");
-    exec->destroy();
-    return ok;
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = 0;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rp_info = {};
+    rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp_info.attachmentCount = 1;
+    rp_info.pAttachments = &att;
+    rp_info.subpassCount = 1;
+    rp_info.pSubpasses = &subpass;
+    rp_info.dependencyCount = 1;
+    rp_info.pDependencies = &dep;
+    check_vk(vkCreateRenderPass(vk.device, &rp_info, nullptr, &vk.render_pass),
+             "vkCreateRenderPass");
+
+    // Framebuffers
+    vk.framebuffers.resize(image_count);
+    for (uint32_t i = 0; i < image_count; i++) {
+        VkFramebufferCreateInfo fb = {};
+        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass = vk.render_pass;
+        fb.attachmentCount = 1;
+        fb.pAttachments = &vk.swapchain_views[i];
+        fb.width = vk.swapchain_extent.width;
+        fb.height = vk.swapchain_extent.height;
+        fb.layers = 1;
+        check_vk(vkCreateFramebuffer(vk.device, &fb, nullptr, &vk.framebuffers[i]),
+                 "vkCreateFramebuffer");
+    }
+
+    // Command pool + buffers
+    VkCommandPoolCreateInfo cp = {};
+    cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cp.queueFamilyIndex = vk.queue_family;
+    check_vk(vkCreateCommandPool(vk.device, &cp, nullptr, &vk.cmd_pool),
+             "vkCreateCommandPool");
+
+    vk.cmd_buffers.resize(image_count);
+    VkCommandBufferAllocateInfo cb = {};
+    cb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb.commandPool = vk.cmd_pool;
+    cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb.commandBufferCount = image_count;
+    check_vk(vkAllocateCommandBuffers(vk.device, &cb, vk.cmd_buffers.data()),
+             "vkAllocateCommandBuffers");
+
+    // Sync objects
+    vk.image_available.resize(image_count);
+    vk.render_finished.resize(image_count);
+    vk.in_flight.resize(image_count);
+    for (uint32_t i = 0; i < image_count; i++) {
+        VkSemaphoreCreateInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        vkCreateSemaphore(vk.device, &si, nullptr, &vk.image_available[i]);
+        vkCreateSemaphore(vk.device, &si, nullptr, &vk.render_finished[i]);
+        VkFenceCreateInfo fi = {};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vkCreateFence(vk.device, &fi, nullptr, &vk.in_flight[i]);
+    }
+
+    return true;
 }
 
-// ===========================================================================
-// Test 2: EFLAGS preservation across memory dispatch
-// ===========================================================================
+static void cleanup_vulkan(VulkanContext& vk) {
+    if (vk.device) vkDeviceWaitIdle(vk.device);
 
-// Guest program (load PA = 0x2000):
-//   Verify that EFLAGS set by CMP survive across a memory load whose inline
-//   fastmem dispatch would clobber ZF without the fix.
-//
-//   mov  eax, 42          ; value A
-//   mov  ecx, 42          ; value B (equal to A)
-//   mov  [0x4000], eax    ; store A to RAM
-//   cmp  eax, ecx         ; sets ZF=1 (A == B)
-//   mov  edx, [0x4000]    ; memory load — must NOT clobber ZF
-//   je   .equal           ; should be taken (ZF=1)
-//   mov  ebx, 0           ; not-taken path
-//   ret
-// .equal:
-//   mov  ebx, 1           ; taken path
-//   ret
-//
-// Expected: EBX = 1 (JE taken because ZF was preserved)
-// Without fix: EBX = 0 (memory dispatch clobbers ZF → JE not taken)
-
-static const uint8_t test2_code[] = {
-    0xB8, 0x2A, 0x00, 0x00, 0x00,       //  0: mov eax, 42
-    0xB9, 0x2A, 0x00, 0x00, 0x00,       //  5: mov ecx, 42
-    0x89, 0x05, 0x00, 0x40, 0x00, 0x00, // 10: mov [0x4000], eax
-    0x39, 0xC8,                          // 16: cmp eax, ecx     → ZF=1
-    0x8B, 0x15, 0x00, 0x40, 0x00, 0x00, // 18: mov edx, [0x4000]
-    0x74, 0x06,                          // 24: je +6 → offset 32
-    0xBB, 0x00, 0x00, 0x00, 0x00,       // 26: mov ebx, 0  (not taken)
-    0xC3,                                // 31: ret
-    0xBB, 0x01, 0x00, 0x00, 0x00,       // 32: mov ebx, 1  (taken)
-    0xC3,                                // 37: ret
-};
-static_assert(sizeof(test2_code) == 38);
-
-static bool test_eflags_preservation() {
-    printf("=== Test 2: EFLAGS preservation across memory dispatch ===\n");
-
-    MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<Executor>();
-    if (!setup_exec(*exec, mmio, 0x2000, test2_code, sizeof(test2_code)))
-        return false;
-
-    exec->run(0x2000, 100'000);
-
-    printf("  EBX  = %u  \t(expected 1 = JE taken)\n", exec->ctx.gp[GP_EBX]);
-    printf("  EDX  = %u  \t(expected 42 = loaded from RAM)\n", exec->ctx.gp[GP_EDX]);
-
-    bool ok = exec->ctx.gp[GP_EBX] == 1u
-           && exec->ctx.gp[GP_EDX] == 42u;
-
-    printf("  %s\n", ok ? "PASS" : "FAIL");
-    exec->destroy();
-    return ok;
+    for (auto& f : vk.in_flight)       if (f) vkDestroyFence(vk.device, f, nullptr);
+    for (auto& s : vk.render_finished) if (s) vkDestroySemaphore(vk.device, s, nullptr);
+    for (auto& s : vk.image_available) if (s) vkDestroySemaphore(vk.device, s, nullptr);
+    if (vk.cmd_pool)        vkDestroyCommandPool(vk.device, vk.cmd_pool, nullptr);
+    for (auto& fb : vk.framebuffers)   if (fb) vkDestroyFramebuffer(vk.device, fb, nullptr);
+    if (vk.render_pass)     vkDestroyRenderPass(vk.device, vk.render_pass, nullptr);
+    for (auto& iv : vk.swapchain_views) if (iv) vkDestroyImageView(vk.device, iv, nullptr);
+    if (vk.swapchain)       vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
+    if (vk.descriptor_pool) vkDestroyDescriptorPool(vk.device, vk.descriptor_pool, nullptr);
+    if (vk.device)          vkDestroyDevice(vk.device, nullptr);
+    if (vk.surface)         vkDestroySurfaceKHR(vk.instance, vk.surface, nullptr);
+    if (vk.instance)        vkDestroyInstance(vk.instance, nullptr);
 }
 
-// ===========================================================================
-// Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm
-// ===========================================================================
-// Guest program (load PA = 0x3000):
-//
-//   mov  eax, 10
-//   mov  ecx, 20
-//   lea  edx, [eax + ecx*2 + 5]  ; EDX = 10 + 40 + 5 = 55 (no mem access!)
-//   push 0x12345678               ; PUSH imm32
-//   push edx                      ; PUSH r32 (55)
-//   pop  ebx                      ; POP → EBX = 55
-//   pop  esi                      ; POP → ESI = 0x12345678
-//   mov  dword ptr [0x4000], 0x42 ; MOV [mem], imm32
-//   mov  edi, [0x4000]            ; EDI = 0x42
-//   ret
-//
-// Expected: EDX=55, EBX=55, ESI=0x12345678, EDI=0x42, ESP=STACK_TOP
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
 
-static const uint8_t test3_code[] = {
-    // mov eax, 10
-    0xB8, 0x0A, 0x00, 0x00, 0x00,             //  0
-    // mov ecx, 20
-    0xB9, 0x14, 0x00, 0x00, 0x00,             //  5
-    // lea edx, [eax + ecx*2 + 5]
-    0x8D, 0x54, 0x48, 0x05,                    // 10
-    // push 0x12345678
-    0x68, 0x78, 0x56, 0x34, 0x12,             // 14
-    // push edx
-    0x52,                                       // 19
-    // pop ebx
-    0x5B,                                       // 20
-    // pop esi
-    0x5E,                                       // 21
-    // mov dword ptr [0x4000], 0x42
-    0xC7, 0x05, 0x00, 0x40, 0x00, 0x00,
-          0x42, 0x00, 0x00, 0x00,              // 22
-    // mov edi, [0x4000]
-    0x8B, 0x3D, 0x00, 0x40, 0x00, 0x00,       // 32
-    // ret
-    0xC3,                                       // 38
+enum class AppState {
+    Menu,       // showing file picker / boot options
+    Running,    // emulation active
+    Halted,     // guest halted or crashed
 };
-static_assert(sizeof(test3_code) == 39);
 
-static bool test_lea_push_pop() {
-    printf("=== Test 3: LEA, PUSH imm, PUSH/POP regs, MOV [mem] imm ===\n");
+struct AppContext {
+    AppState               state       = AppState::Menu;
+    xbox::XboxSystem       sys;
+    xbox::BootConfig       cfg;
+    std::string            status_msg  = "Ready";
+    std::vector<std::string> log_lines;
 
-    MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<Executor>();
-    if (!setup_exec(*exec, mmio, 0x3000, test3_code, sizeof(test3_code)))
-        return false;
+    // Paths found on disk
+    std::string            dashboard_xbe;  // auto-detected dashboard
+    std::string            bios_path;
+    std::string            mcpx_path;
 
-    exec->run(0x3000, 100'000);
+    void log(const char* msg) {
+        log_lines.emplace_back(msg);
+        if (log_lines.size() > 500) log_lines.erase(log_lines.begin());
+        status_msg = msg;
+    }
+};
 
-    printf("  EDX  = %u  \t(expected 55  = LEA result)\n",     exec->ctx.gp[GP_EDX]);
-    printf("  EBX  = %u  \t(expected 55  = POP after PUSH EDX)\n", exec->ctx.gp[GP_EBX]);
-    printf("  ESI  = 0x%08X\t(expected 0x12345678 = POP after PUSH imm)\n", exec->ctx.gp[GP_ESI]);
-    printf("  EDI  = 0x%08X\t(expected 0x00000042 = MOV EDI,[0x4000])\n",   exec->ctx.gp[GP_EDI]);
-    printf("  ESP  = 0x%08X\t(expected 0x%08X = STACK_TOP+4 after RET)\n",
-           exec->ctx.gp[GP_ESP], STACK_TOP + 4);
+// Scan data/ for known files
+static void scan_data_dir(AppContext& app) {
+    // Check common locations for dashboard and BIOS
+    const char* dash_paths[] = {
+        "data/xbox dash orig_5960/xboxdash.xbe",
+        "data/xboxdash.xbe",
+        "xboxdash.xbe",
+    };
+    for (auto& p : dash_paths) {
+        FILE* f = fopen(p, "rb");
+        if (f) { fclose(f); app.dashboard_xbe = p; break; }
+    }
 
-    bool ok = exec->ctx.gp[GP_EDX] == 55u
-           && exec->ctx.gp[GP_EBX] == 55u
-           && exec->ctx.gp[GP_ESI] == 0x12345678u
-           && exec->ctx.gp[GP_EDI] == 0x42u
-           && exec->ctx.gp[GP_ESP] == STACK_TOP + 4;
+    const char* bios_paths[] = {
+        "data/bios.bin",
+        "bios.bin",
+        "data/complex_4627.bin",
+    };
+    for (auto& p : bios_paths) {
+        FILE* f = fopen(p, "rb");
+        if (f) { fclose(f); app.bios_path = p; break; }
+    }
 
-    printf("  %s\n", ok ? "PASS" : "FAIL");
-    exec->destroy();
-    return ok;
+    const char* mcpx_paths[] = {
+        "data/mcpx_1.0.bin",
+        "mcpx.bin",
+    };
+    for (auto& p : mcpx_paths) {
+        FILE* f = fopen(p, "rb");
+        if (f) { fclose(f); app.mcpx_path = p; break; }
+    }
 }
 
-// ===========================================================================
-// Test 4: x87 register-only operations (FXSAVE/FXRSTOR validation)
-// ===========================================================================
-// Guest program (load PA = 0x4100):
-//   Compute 1.0 + 1.0 = 2.0 twice using x87, verify equality via FCOMPP.
-//   All instructions are register-only — no memory operands.
-//
-//   FLD1                   ; ST(0) = 1.0
-//   FLD1                   ; ST(0) = 1.0, ST(1) = 1.0
-//   FADDP ST(1), ST        ; ST(0) = 2.0
-//   FLD1                   ; ST(0) = 1.0, ST(1) = 2.0
-//   FLD1                   ; ST(0) = 1.0, ST(1) = 1.0, ST(2) = 2.0
-//   FADDP ST(1), ST        ; ST(0) = 2.0, ST(1) = 2.0
-//   FCOMPP                 ; compare & pop both — if equal, C3=1
-//   FNSTSW AX              ; FPU status word → AX
-//   TEST AH, 0x40          ; check C3 (bit 14 of status → bit 6 of AH)
-//   JNZ .equal
-//   MOV EBX, 0             ; not equal (FAIL)
-//   RET
-// .equal:
-//   MOV EBX, 1             ; equal (PASS)
-//   RET
-//
-// Expected: EBX = 1
+// File dialog helper — uses SDL3 file dialog (async callback)
+static std::string g_picked_file;
+static bool g_file_picked = false;
 
-static const uint8_t test4_code[] = {
-    0xD9, 0xE8,                         //  0: FLD1
-    0xD9, 0xE8,                         //  2: FLD1
-    0xDE, 0xC1,                         //  4: FADDP ST(1),ST
-    0xD9, 0xE8,                         //  6: FLD1
-    0xD9, 0xE8,                         //  8: FLD1
-    0xDE, 0xC1,                         // 10: FADDP ST(1),ST
-    0xDE, 0xD9,                         // 12: FCOMPP
-    0xDF, 0xE0,                         // 14: FNSTSW AX
-    0xF6, 0xC4, 0x40,                  // 16: TEST AH, 0x40
-    0x75, 0x06,                         // 19: JNZ +6 → offset 27
-    0xBB, 0x00, 0x00, 0x00, 0x00,      // 21: MOV EBX, 0
-    0xC3,                               // 26: RET
-    0xBB, 0x01, 0x00, 0x00, 0x00,      // 27: MOV EBX, 1
-    0xC3,                               // 32: RET
-};
-static_assert(sizeof(test4_code) == 33);
-
-static bool test_fpu_register_ops() {
-    printf("=== Test 4: x87 register-only operations ===\n");
-
-    MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<Executor>();
-    if (!setup_exec(*exec, mmio, 0x4100, test4_code, sizeof(test4_code)))
-        return false;
-
-    exec->run(0x4100, 100'000);
-
-    printf("  EBX  = %u  \t(expected 1 = FCOMPP equal)\n", exec->ctx.gp[GP_EBX]);
-
-    bool ok = exec->ctx.gp[GP_EBX] == 1u;
-
-    printf("  %s\n", ok ? "PASS" : "FAIL");
-    exec->destroy();
-    return ok;
+static void SDLCALL file_dialog_callback(void* /*userdata*/, const char* const* filelist, int /*filter*/) {
+    if (filelist && filelist[0]) {
+        g_picked_file = filelist[0];
+        g_file_picked = true;
+    }
 }
 
-// ===========================================================================
-// Test 5: x87 memory store (FISTP to RAM via generic rewriter)
-// ===========================================================================
-// Guest program (load PA = 0x5000):
-//   Build the value 5.0 in x87, store to RAM via FISTP, read back via MOV.
-//
-//   FLD1                         ; ST(0) = 1.0
-//   FADD ST(0), ST(0)            ; ST(0) = 2.0
-//   FADD ST(0), ST(0)            ; ST(0) = 4.0
-//   FLD1                         ; ST(0) = 1.0, ST(1) = 4.0
-//   FADDP ST(1), ST              ; ST(0) = 5.0
-//   FISTP DWORD PTR [0x4000]     ; store 5 to RAM, pop
-//   MOV EAX, [0x4000]            ; EAX = 5
-//   RET
-//
-// Expected: EAX = 5, [0x4000] = 5
+// ---------------------------------------------------------------------------
+// ImGui frame — menu / boot UI
+// ---------------------------------------------------------------------------
 
-static const uint8_t test5_code[] = {
-    0xD9, 0xE8,                                 //  0: FLD1
-    0xD8, 0xC0,                                 //  2: FADD ST(0),ST(0) → 2.0
-    0xD8, 0xC0,                                 //  4: FADD ST(0),ST(0) → 4.0
-    0xD9, 0xE8,                                 //  6: FLD1
-    0xDE, 0xC1,                                 //  8: FADDP → 5.0
-    0xDB, 0x1D, 0x00, 0x40, 0x00, 0x00,        // 10: FISTP DWORD PTR [0x4000]
-    0x8B, 0x05, 0x00, 0x40, 0x00, 0x00,        // 16: MOV EAX, [0x4000]
-    0xC3,                                        // 22: RET
-};
-static_assert(sizeof(test5_code) == 23);
+static void draw_menu(AppContext& app) {
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
 
-static bool test_fpu_memory_store() {
-    printf("=== Test 5: x87 memory store (FISTP to RAM) ===\n");
+    ImGui::Begin("Xermu — Xbox Emulator");
 
-    MmioMap mmio = make_mmio();
-    auto exec = std::make_unique<Executor>();
-    if (!setup_exec(*exec, mmio, 0x5000, test5_code, sizeof(test5_code)))
-        return false;
+    // Status
+    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", app.status_msg.c_str());
+    ImGui::Separator();
 
-    exec->run(0x5000, 100'000);
+    // Auto-detected files
+    if (!app.dashboard_xbe.empty())
+        ImGui::Text("Dashboard: %s", app.dashboard_xbe.c_str());
+    else
+        ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "No dashboard found");
 
-    uint32_t ram4000 = 0;
-    memcpy(&ram4000, exec->ram + 0x4000, 4);
+    if (!app.bios_path.empty())
+        ImGui::Text("BIOS: %s", app.bios_path.c_str());
 
-    printf("  EAX  = %u  \t(expected 5)\n",       exec->ctx.gp[GP_EAX]);
-    printf("  [0x4000] = %u  \t(expected 5)\n",   ram4000);
+    ImGui::Separator();
 
-    bool ok = exec->ctx.gp[GP_EAX] == 5u
-           && ram4000              == 5u;
+    // Boot options
+    ImGui::Text("Boot Options:");
+    ImGui::Spacing();
 
-    printf("  %s\n", ok ? "PASS" : "FAIL");
-    exec->destroy();
-    return ok;
+    // Boot dashboard (HLE)
+    if (!app.dashboard_xbe.empty()) {
+        if (ImGui::Button("Boot Dashboard (HLE)", ImVec2(300, 30))) {
+            app.cfg = {};
+            app.cfg.xbe_path = app.dashboard_xbe;
+            app.log("[ui] Booting dashboard (HLE)...");
+
+            auto log_fn = [&](const char* msg) { app.log(msg); };
+            if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
+                app.state = AppState::Running;
+            } else {
+                app.log("[ui] Boot failed!");
+                app.state = AppState::Halted;
+            }
+        }
+    }
+
+    // Boot custom XBE
+    if (ImGui::Button("Select XBE...", ImVec2(300, 30))) {
+        SDL_DialogFileFilter filters[] = {{ "XBE files", "xbe" }, { "All files", "*" }};
+        SDL_ShowOpenFileDialog(file_dialog_callback, nullptr, nullptr, filters, 2, nullptr, false);
+    }
+
+    // Boot XISO
+    if (ImGui::Button("Select XISO...", ImVec2(300, 30))) {
+        SDL_DialogFileFilter filters[] = {{ "XISO images", "iso;xiso" }, { "All files", "*" }};
+        SDL_ShowOpenFileDialog(file_dialog_callback, nullptr, nullptr, filters, 2, nullptr, false);
+    }
+
+    // LLE boot (if BIOS available)
+    if (!app.bios_path.empty()) {
+        ImGui::Spacing();
+        if (ImGui::Button("Boot BIOS (LLE)", ImVec2(300, 30))) {
+            app.cfg = {};
+            app.cfg.bios_path = app.bios_path;
+            app.cfg.mcpx_path = app.mcpx_path;
+            app.log("[ui] Booting BIOS (LLE)...");
+
+            auto log_fn = [&](const char* msg) { app.log(msg); };
+            if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
+                app.state = AppState::Running;
+            } else {
+                app.log("[ui] LLE boot failed!");
+                app.state = AppState::Halted;
+            }
+        }
+    }
+
+    ImGui::Separator();
+
+    // Log window
+    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginChild("LogScroll", ImVec2(0, 150), ImGuiChildFlags_Borders);
+        for (auto& line : app.log_lines)
+            ImGui::TextUnformatted(line.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+    }
+
+    ImGui::End();
 }
 
-// ===========================================================================
+static void draw_running(AppContext& app) {
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
 
-int main() {
-    bool all_pass = true;
+    ImGui::Begin("Xermu — Running");
 
-    all_pass &= test_sum_loop();
-    printf("\n");
-    all_pass &= test_eflags_preservation();
-    printf("\n");
-    all_pass &= test_lea_push_pop();
-    printf("\n");
-    all_pass &= test_fpu_register_ops();
-    printf("\n");
-    all_pass &= test_fpu_memory_store();
+    auto& ctx = app.sys.exec->ctx;
+    ImGui::Text("EIP: 0x%08X  EAX: 0x%08X", ctx.eip, ctx.gp[GP_EAX]);
+    ImGui::Text("ESP: 0x%08X  EBP: 0x%08X", ctx.gp[GP_ESP], ctx.gp[GP_EBP]);
+    ImGui::Text("State: %s", app.sys.running ? "Running" : "Halted");
 
-    printf("\n%s\n", all_pass ? "ALL PASS" : "SOME FAILED");
-    return all_pass ? 0 : 1;
+    ImGui::Separator();
+
+    if (ImGui::Button("Stop", ImVec2(100, 25))) {
+        app.sys.running = false;
+        app.state = AppState::Halted;
+        app.log("[ui] Stopped by user");
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Back to Menu", ImVec2(150, 25))) {
+        app.sys.shutdown();
+        app.sys = xbox::XboxSystem();
+        app.state = AppState::Menu;
+        app.log("[ui] Returned to menu");
+    }
+
+    // Log
+    ImGui::Separator();
+    ImGui::BeginChild("LogScroll", ImVec2(0, 120), ImGuiChildFlags_Borders);
+    for (auto& line : app.log_lines)
+        ImGui::TextUnformatted(line.c_str());
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+        ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+
+    // Init SDL
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow("Xermu — Xbox Emulator",
+                                          1280, 720,
+                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    // Init Vulkan
+    VulkanContext vk;
+    if (!init_vulkan(vk, window)) {
+        fprintf(stderr, "Vulkan init failed\n");
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (!create_swapchain(vk, window)) {
+        fprintf(stderr, "Swapchain creation failed\n");
+        cleanup_vulkan(vk);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    // Init ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplSDL3_InitForVulkan(window);
+
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = vk.instance;
+    init_info.PhysicalDevice = vk.physical;
+    init_info.Device = vk.device;
+    init_info.QueueFamily = vk.queue_family;
+    init_info.Queue = vk.queue;
+    init_info.DescriptorPool = vk.descriptor_pool;
+    init_info.RenderPass = vk.render_pass;
+    init_info.MinImageCount = vk.frame_count;
+    init_info.ImageCount = vk.frame_count;
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    ImGui_ImplVulkan_Init(&init_info);
+
+    // App state
+    AppContext app;
+    scan_data_dir(app);
+
+    // Handle command-line XBE arg
+    if (argc >= 2) {
+        std::string arg = argv[1];
+        if (arg.size() > 4 && (arg.substr(arg.size()-4) == ".xbe" || arg.substr(arg.size()-4) == ".XBE")) {
+            app.cfg.xbe_path = arg;
+            auto log_fn = [&](const char* msg) { app.log(msg); };
+            if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
+                app.state = AppState::Running;
+            } else {
+                app.log("[ui] Boot failed for command-line XBE");
+            }
+        }
+    }
+
+    // Main loop
+    bool quit = false;
+    while (!quit) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL3_ProcessEvent(&event);
+            if (event.type == SDL_EVENT_QUIT)
+                quit = true;
+            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
+                quit = true;
+        }
+
+        // Handle file dialog result
+        if (g_file_picked) {
+            g_file_picked = false;
+            std::string path = g_picked_file;
+            g_picked_file.clear();
+
+            // Determine file type by extension
+            std::string ext;
+            auto dot = path.rfind('.');
+            if (dot != std::string::npos) ext = path.substr(dot);
+            for (auto& c : ext) c = (char)tolower(c);
+
+            if (ext == ".xbe") {
+                app.cfg = {};
+                app.cfg.xbe_path = path;
+                app.log(("[ui] Loading: " + path).c_str());
+                auto log_fn = [&](const char* msg) { app.log(msg); };
+                if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
+                    app.state = AppState::Running;
+                } else {
+                    app.log("[ui] Boot failed!");
+                }
+            } else if (ext == ".iso" || ext == ".xiso") {
+                // XISO: look for default.xbe inside or mount as D:
+                app.cfg = {};
+                if (!app.dashboard_xbe.empty()) {
+                    app.cfg.xbe_path = app.dashboard_xbe;
+                    app.cfg.xiso_path = path;
+                    app.log(("[ui] Mounting XISO: " + path).c_str());
+                    auto log_fn = [&](const char* msg) { app.log(msg); };
+                    if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
+                        app.state = AppState::Running;
+                    } else {
+                        app.log("[ui] Boot failed!");
+                    }
+                } else {
+                    app.log("[ui] No dashboard XBE available to host XISO");
+                }
+            }
+        }
+
+        // Run emulation steps if active
+        if (app.state == AppState::Running && app.sys.running) {
+            if (!xbox::run_step(app.sys, 500'000)) {
+                app.state = AppState::Halted;
+                char msg[128];
+                snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
+                         app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
+                app.log(msg);
+            }
+        }
+
+        // Render ImGui frame
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        switch (app.state) {
+        case AppState::Menu:   draw_menu(app);    break;
+        case AppState::Running:
+        case AppState::Halted: draw_running(app); break;
+        }
+
+        ImGui::Render();
+
+        // Vulkan rendering
+        uint32_t fi = vk.current_frame;
+        vkWaitForFences(vk.device, 1, &vk.in_flight[fi], VK_TRUE, UINT64_MAX);
+        vkResetFences(vk.device, 1, &vk.in_flight[fi]);
+
+        uint32_t img_idx;
+        VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX,
+                                              vk.image_available[fi], VK_NULL_HANDLE, &img_idx);
+        if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+            // Recreate swapchain on resize (simplified: skip this frame)
+            vk.current_frame = (fi + 1) % vk.frame_count;
+            continue;
+        }
+
+        vkResetCommandBuffer(vk.cmd_buffers[fi], 0);
+        VkCommandBufferBeginInfo begin = {};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(vk.cmd_buffers[fi], &begin);
+
+        VkClearValue clear = {{{0.1f, 0.1f, 0.12f, 1.0f}}};
+        VkRenderPassBeginInfo rp_begin = {};
+        rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp_begin.renderPass = vk.render_pass;
+        rp_begin.framebuffer = vk.framebuffers[img_idx];
+        rp_begin.renderArea.extent = vk.swapchain_extent;
+        rp_begin.clearValueCount = 1;
+        rp_begin.pClearValues = &clear;
+        vkCmdBeginRenderPass(vk.cmd_buffers[fi], &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), vk.cmd_buffers[fi]);
+
+        vkCmdEndRenderPass(vk.cmd_buffers[fi]);
+        vkEndCommandBuffer(vk.cmd_buffers[fi]);
+
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &vk.image_available[fi];
+        submit.pWaitDstStageMask = &wait_stage;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &vk.cmd_buffers[fi];
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &vk.render_finished[fi];
+        vkQueueSubmit(vk.queue, 1, &submit, vk.in_flight[fi]);
+
+        VkPresentInfoKHR present = {};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &vk.render_finished[fi];
+        present.swapchainCount = 1;
+        present.pSwapchains = &vk.swapchain;
+        present.pImageIndices = &img_idx;
+        vkQueuePresentKHR(vk.queue, &present);
+
+        vk.current_frame = (fi + 1) % vk.frame_count;
+    }
+
+    // Cleanup
+    vkDeviceWaitIdle(vk.device);
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    cleanup_vulkan(vk);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
 }

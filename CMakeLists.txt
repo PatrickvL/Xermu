@@ -4,6 +4,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
+
+# ---------------------------------------------------------------------------
+# Zydis — x86 instruction decoder
+# ---------------------------------------------------------------------------
 FetchContent_Declare(zydis
     GIT_REPOSITORY https://github.com/zyantific/zydis.git
     GIT_TAG        v4.1.0
@@ -18,6 +22,69 @@ set(ZYDIS_FEATURE_FORMATTER OFF CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_ENCODER   OFF CACHE BOOL "" FORCE)
 set(ZYDIS_MINIMAL_MODE      OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zydis)
+
+# ---------------------------------------------------------------------------
+# SDL3 — cross-platform windowing, input, and Vulkan surface
+# ---------------------------------------------------------------------------
+FetchContent_Declare(sdl3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG        release-3.2.14
+    GIT_SHALLOW    TRUE
+)
+set(SDL_SHARED  OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC  ON  CACHE BOOL "" FORCE)
+set(SDL_TEST    OFF CACHE BOOL "" FORCE)
+set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(sdl3)
+
+# ---------------------------------------------------------------------------
+# Dear ImGui — immediate-mode debug/UI overlay
+# ---------------------------------------------------------------------------
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.8
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
+# ---------------------------------------------------------------------------
+# Vulkan-Headers + volk — Vulkan without requiring the SDK installed.
+# volk dynamically loads vulkan-1.dll at runtime.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG        vulkan-sdk-1.4.313.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(vulkan_headers)
+
+FetchContent_Declare(volk
+    GIT_REPOSITORY https://github.com/zeux/volk.git
+    GIT_TAG        vulkan-sdk-1.4.313.0
+    GIT_SHALLOW    TRUE
+)
+set(VOLK_HEADERS_ONLY OFF CACHE BOOL "" FORCE)
+set(VOLK_INSTALL      OFF CACHE BOOL "" FORCE)
+# Point volk at our fetched Vulkan headers
+set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH "" FORCE)
+FetchContent_MakeAvailable(volk)
+
+# Build ImGui as a static library with SDL3 + Vulkan backends
+set(IMGUI_DIR ${imgui_SOURCE_DIR})
+add_library(imgui_lib STATIC
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui_lib PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+target_link_libraries(imgui_lib PUBLIC SDL3::SDL3-static Vulkan::Headers volk)
+# Tell ImGui's Vulkan backend to use volk for function loading
+target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
+
 
 # ---------------------------------------------------------------------------
 # Common source files (shared between executables)
@@ -36,18 +103,34 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# Main executable (self-tests with embedded byte arrays)
+# Test: basic inline tests (formerly main.cpp — byte-array self-tests)
 # ---------------------------------------------------------------------------
-add_executable(guided_executor ${COMMON_SOURCES} src/main.cpp)
-target_include_directories(guided_executor PRIVATE src src/cpu)
-target_link_libraries(guided_executor PRIVATE Zydis)
+add_executable(test_basic ${COMMON_SOURCES} src/tests/test_basic.cpp)
+target_include_directories(test_basic PRIVATE src src/cpu)
+target_link_libraries(test_basic PRIVATE Zydis)
 
 if(MSVC)
-    target_compile_options(guided_executor PRIVATE /W3)
+    target_compile_options(test_basic PRIVATE /W3)
 else()
-    target_compile_options(guided_executor PRIVATE -Wall -Wextra -O2)
+    target_compile_options(test_basic PRIVATE -Wall -Wextra -O2)
     if(UNIX)
-        target_link_libraries(guided_executor PRIVATE m)
+        target_link_libraries(test_basic PRIVATE m)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
+# ---------------------------------------------------------------------------
+add_executable(xermu ${COMMON_SOURCES} src/main.cpp)
+target_include_directories(xermu PRIVATE src src/cpu)
+target_link_libraries(xermu PRIVATE Zydis imgui_lib SDL3::SDL3-static volk)
+
+if(MSVC)
+    target_compile_options(xermu PRIVATE /W3)
+else()
+    target_compile_options(xermu PRIVATE -Wall -Wextra -O2)
+    if(UNIX)
+        target_link_libraries(xermu PRIVATE m dl pthread)
     endif()
 endif()
 

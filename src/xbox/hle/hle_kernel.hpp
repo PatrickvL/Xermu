@@ -10,7 +10,11 @@
 #include "xbe_loader.hpp"
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <vector>
+#include <string>
+#include <unordered_map>
+#include <algorithm>
 
 namespace xbe {
 
@@ -254,6 +258,13 @@ struct PendingThread {
     uint32_t start_context;
 };
 
+// Host-backed file handle for guest I/O
+struct HostFile {
+    FILE* fp;
+    uint64_t size;
+    std::string host_path;
+};
+
 struct XbeHeap {
     uint32_t next_alloc;  // next free PA
     uint32_t limit;       // end of allocatable region
@@ -261,6 +272,17 @@ struct XbeHeap {
 
     // Pending threads created by PsCreateSystemThread(Ex)
     std::vector<PendingThread> pending_threads;
+
+    // Host-backed file system
+    std::string xbe_directory;  // host directory containing the XBE
+    std::unordered_map<uint32_t, HostFile> open_files;
+
+    // Mount points: Xbox device path prefix → host directory
+    struct MountPoint {
+        std::string xbox_prefix;
+        std::string host_dir;
+    };
+    std::vector<MountPoint> mounts;
 
     XbeHeap() : next_alloc(0x01000000u), limit(GUEST_RAM_SIZE), next_handle(0x100) {}
 
@@ -270,7 +292,101 @@ struct XbeHeap {
         next_alloc = base + size;
         return base;
     }
+
+    // Set up default mount points based on the XBE file path
+    void set_xbe_path(const std::string& xbe_path) {
+        // Extract directory from XBE path
+        size_t last_sep = xbe_path.find_last_of("/\\");
+        xbe_directory = (last_sep != std::string::npos) ? xbe_path.substr(0, last_sep) : ".";
+
+        // Default mounts: Xbox partition 2 = dashboard directory
+        mounts.push_back({"\\Device\\Harddisk0\\Partition2", xbe_directory});
+        mounts.push_back({"\\??\\C:", xbe_directory});
+        mounts.push_back({"\\??\\D:", xbe_directory}); // D: also commonly used
+    }
+
+    // Translate Xbox path to host path
+    std::string translate_path(const std::string& xbox_path) const {
+        for (auto& m : mounts) {
+            if (xbox_path.size() > m.xbox_prefix.size() &&
+                _strnicmp(xbox_path.c_str(), m.xbox_prefix.c_str(), m.xbox_prefix.size()) == 0 &&
+                (xbox_path[m.xbox_prefix.size()] == '\\' || xbox_path[m.xbox_prefix.size()] == '/')) {
+                std::string rel = xbox_path.substr(m.xbox_prefix.size() + 1);
+                // Convert backslashes to forward slashes
+                for (auto& c : rel) if (c == '\\') c = '/';
+                return m.host_dir + "/" + rel;
+            }
+        }
+        return ""; // no mount matched
+    }
+
+    // Open a host file, return handle or 0 on failure
+    uint32_t open_host_file(const std::string& host_path) {
+        FILE* fp = fopen(host_path.c_str(), "rb");
+        if (!fp) return 0;
+        fseek(fp, 0, SEEK_END);
+        uint64_t sz = (uint64_t)ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        uint32_t h = next_handle++;
+        open_files[h] = {fp, sz, host_path};
+        return h;
+    }
+
+    // Close a host file by handle, returns true if it was a real file
+    bool close_host_file(uint32_t handle) {
+        auto it = open_files.find(handle);
+        if (it == open_files.end()) return false;
+        fclose(it->second.fp);
+        open_files.erase(it);
+        return true;
+    }
+
+    // Look up a host file by handle
+    HostFile* get_host_file(uint32_t handle) {
+        auto it = open_files.find(handle);
+        return (it != open_files.end()) ? &it->second : nullptr;
+    }
+
+    ~XbeHeap() {
+        for (auto& [h, f] : open_files)
+            if (f.fp) fclose(f.fp);
+    }
+
+    // Non-copyable (owns FILE* handles)
+    XbeHeap(const XbeHeap&) = delete;
+    XbeHeap& operator=(const XbeHeap&) = delete;
+    XbeHeap(XbeHeap&&) = default;
+    XbeHeap& operator=(XbeHeap&&) = default;
+
+    void reset() {
+        for (auto& [h, f] : open_files)
+            if (f.fp) fclose(f.fp);
+        open_files.clear();
+        pending_threads.clear();
+        mounts.clear();
+        xbe_directory.clear();
+        next_alloc = 0x01000000u;
+        limit = GUEST_RAM_SIZE;
+        next_handle = 0x100;
+    }
 };
+
+// Helper: read an ANSI string path from guest OBJECT_ATTRIBUTES structure.
+// Xbox OBJECT_ATTRIBUTES: { HANDLE RootDirectory (0), PANSI_STRING ObjectName (4),
+//                            ULONG Attributes (8) } — 12 bytes.
+// ANSI_STRING: { USHORT Length (0), USHORT MaxLength (2), PCHAR Buffer (4) }
+inline std::string read_object_name(Executor& exec, uint32_t obj_attrs_ptr) {
+    if (obj_attrs_ptr + 12 > GUEST_RAM_SIZE) return "";
+    uint32_t name_ptr = 0;
+    memcpy(&name_ptr, exec.ram + obj_attrs_ptr + 4, 4);
+    if (name_ptr == 0 || name_ptr + 8 > GUEST_RAM_SIZE) return "";
+    uint16_t len = 0;
+    memcpy(&len, exec.ram + name_ptr, 2);
+    uint32_t buf_ptr = 0;
+    memcpy(&buf_ptr, exec.ram + name_ptr + 4, 4);
+    if (buf_ptr == 0 || buf_ptr + len > GUEST_RAM_SIZE) return "";
+    return std::string(reinterpret_cast<char*>(exec.ram + buf_ptr), len);
+}
 
 inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     auto* heap = static_cast<XbeHeap*>(user);
@@ -371,6 +487,8 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
 
     case ORD_NtClose:
+        // Close handle — if it's a real file handle, close the FILE*
+        heap->close_host_file(stack_arg(exec, 0));
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 1);
         return true;
@@ -1107,10 +1225,40 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         // NTSTATUS NtOpenFile(OUT PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
         //     PIO_STATUS_BLOCK, ULONG ShareAccess, ULONG OpenOptions)
         uint32_t handle_ptr = stack_arg(exec, 0);
-        uint32_t h = heap->next_handle++;
+        uint32_t obj_attrs  = stack_arg(exec, 2);
+        uint32_t iosb_ptr   = stack_arg(exec, 3);
+
+        std::string xbox_path = read_object_name(exec, obj_attrs);
+        std::string host_path = heap->translate_path(xbox_path);
+
+        uint32_t h = 0;
+        uint32_t status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        if (!host_path.empty()) {
+            h = heap->open_host_file(host_path);
+            if (h) {
+                status = 0;
+                fprintf(stderr, "[hle] NtOpenFile: '%s' -> handle 0x%X\n",
+                        xbox_path.c_str(), h);
+            } else {
+                fprintf(stderr, "[hle] NtOpenFile: '%s' -> not found (%s)\n",
+                        xbox_path.c_str(), host_path.c_str());
+            }
+        } else {
+            // No mount matched — return a fake handle
+            h = heap->next_handle++;
+            status = 0;
+            fprintf(stderr, "[hle] NtOpenFile: '%s' -> fake handle 0x%X\n",
+                    xbox_path.c_str(), h);
+        }
+
         if (handle_ptr + 4 <= GUEST_RAM_SIZE)
             memcpy(exec.ram + handle_ptr, &h, 4);
-        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            uint32_t info = (status == 0) ? 1u : 0u;
+            memcpy(exec.ram + iosb_ptr + 4, &info, 4);
+        }
+        exec.ctx.gp[GP_EAX] = status;
         stdcall_cleanup(exec, 6);
         return true;
     }
@@ -1118,14 +1266,39 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     case ORD_NtReadFile: {
         // NTSTATUS NtReadFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID,
         //     PIO_STATUS_BLOCK, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset)
-        // Return 0 bytes read
+        uint32_t handle   = stack_arg(exec, 0);
         uint32_t iosb_ptr = stack_arg(exec, 4);
-        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
-            uint32_t zero = 0;
-            memcpy(exec.ram + iosb_ptr, &zero, 4); // Status = SUCCESS
-            memcpy(exec.ram + iosb_ptr + 4, &zero, 4); // Information = 0
+        uint32_t buf_ptr  = stack_arg(exec, 5);
+        uint32_t length   = stack_arg(exec, 6);
+        uint32_t off_ptr  = stack_arg(exec, 7);
+
+        HostFile* hf = heap->get_host_file(handle);
+        uint32_t bytes_read = 0;
+        uint32_t status = 0xC0000008u; // STATUS_INVALID_HANDLE
+
+        if (hf && hf->fp) {
+            // Seek to offset if provided
+            if (off_ptr && off_ptr + 8 <= GUEST_RAM_SIZE) {
+                int64_t offset = 0;
+                memcpy(&offset, exec.ram + off_ptr, 8);
+                if (offset >= 0) _fseeki64(hf->fp, offset, SEEK_SET);
+            }
+            // Clamp to guest RAM
+            if (buf_ptr + length > GUEST_RAM_SIZE)
+                length = (buf_ptr < GUEST_RAM_SIZE) ? GUEST_RAM_SIZE - buf_ptr : 0;
+            if (length > 0)
+                bytes_read = (uint32_t)fread(exec.ram + buf_ptr, 1, length, hf->fp);
+            status = (bytes_read > 0) ? 0 : 0xC0000011u; // STATUS_END_OF_FILE
+        } else if (!hf) {
+            // Fake handle (device, etc.) — return 0 bytes
+            status = 0;
         }
-        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            memcpy(exec.ram + iosb_ptr + 4, &bytes_read, 4);
+        }
+        exec.ctx.gp[GP_EAX] = status;
         stdcall_cleanup(exec, 8);
         return true;
     }
@@ -1135,6 +1308,89 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 5);
         return true;
+
+    case ORD_NtQueryInformationFile: {
+        // NTSTATUS NtQueryInformationFile(HANDLE FileHandle,
+        //     PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+        //     ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+        uint32_t handle   = stack_arg(exec, 0);
+        uint32_t iosb_ptr = stack_arg(exec, 1);
+        uint32_t info_ptr = stack_arg(exec, 2);
+        uint32_t info_len = stack_arg(exec, 3);
+        uint32_t info_class = stack_arg(exec, 4);
+
+        HostFile* hf = heap->get_host_file(handle);
+        uint32_t status = 0;
+
+        if (hf) {
+            switch (info_class) {
+            case 5: // FileStandardInformation (size, nlinks, delete pending, directory)
+                if (info_ptr + 24 <= GUEST_RAM_SIZE && info_len >= 24) {
+                    memset(exec.ram + info_ptr, 0, 24);
+                    uint64_t alloc_sz = (hf->size + 0xFFF) & ~0xFFFULL;
+                    memcpy(exec.ram + info_ptr + 0, &alloc_sz, 8); // AllocationSize
+                    memcpy(exec.ram + info_ptr + 8, &hf->size, 8); // EndOfFile
+                    uint32_t nlinks = 1;
+                    memcpy(exec.ram + info_ptr + 16, &nlinks, 4); // NumberOfLinks
+                    // DeletePending=0, Directory=0
+                }
+                break;
+            case 14: // FilePositionInformation
+                if (info_ptr + 8 <= GUEST_RAM_SIZE && info_len >= 8) {
+                    int64_t pos = hf->fp ? _ftelli64(hf->fp) : 0;
+                    memcpy(exec.ram + info_ptr, &pos, 8);
+                }
+                break;
+            default:
+                if (info_ptr + info_len <= GUEST_RAM_SIZE && info_len > 0)
+                    memset(exec.ram + info_ptr, 0, info_len);
+                break;
+            }
+        }
+
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            uint32_t info = 0;
+            memcpy(exec.ram + iosb_ptr + 4, &info, 4);
+        }
+        exec.ctx.gp[GP_EAX] = status;
+        stdcall_cleanup(exec, 5);
+        return true;
+    }
+
+    case ORD_NtQueryVolumeInformationFile: {
+        // NTSTATUS NtQueryVolumeInformationFile(HANDLE, PIO_STATUS_BLOCK,
+        //     PVOID FsInformation, ULONG Length, FS_INFORMATION_CLASS)
+        uint32_t iosb_ptr = stack_arg(exec, 1);
+        uint32_t info_ptr = stack_arg(exec, 2);
+        uint32_t info_len = stack_arg(exec, 3);
+        uint32_t info_class = stack_arg(exec, 4);
+
+        if (info_ptr + info_len <= GUEST_RAM_SIZE && info_len > 0)
+            memset(exec.ram + info_ptr, 0, info_len);
+
+        // FileFsSizeInformation (class 3): report 8 GB free
+        if (info_class == 3 && info_len >= 24 && info_ptr + 24 <= GUEST_RAM_SIZE) {
+            uint64_t total_units = 8ULL * 1024 * 1024 * 1024 / (512 * 8); // ~2M clusters
+            uint64_t avail_units = total_units / 2;
+            memcpy(exec.ram + info_ptr + 0, &total_units, 8);
+            memcpy(exec.ram + info_ptr + 8, &avail_units, 8);
+            uint32_t spc = 8;  // sectors per cluster
+            memcpy(exec.ram + info_ptr + 16, &spc, 4);
+            uint32_t bps = 512; // bytes per sector
+            memcpy(exec.ram + info_ptr + 20, &bps, 4);
+        }
+
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            uint32_t status = 0;
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            uint32_t info = 0;
+            memcpy(exec.ram + iosb_ptr + 4, &info, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 5);
+        return true;
+    }
 
     case ORD_KeRaiseIrqlToDpcLevel:
         // KIRQL KeRaiseIrqlToDpcLevel(void)
@@ -1190,11 +1446,42 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         //     POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
         //     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
         //     ULONG CreateDisposition, ULONG CreateOptions)
-        uint32_t handle_ptr = stack_arg(exec, 0);
-        uint32_t h = heap->next_handle++;
+        uint32_t handle_ptr  = stack_arg(exec, 0);
+        uint32_t obj_attrs   = stack_arg(exec, 2);
+        uint32_t iosb_ptr    = stack_arg(exec, 3);
+
+        std::string xbox_path = read_object_name(exec, obj_attrs);
+        std::string host_path = heap->translate_path(xbox_path);
+
+        uint32_t h = 0;
+        uint32_t status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        if (!host_path.empty()) {
+            h = heap->open_host_file(host_path);
+            if (h) {
+                status = 0; // STATUS_SUCCESS
+                fprintf(stderr, "[hle] NtCreateFile: '%s' -> handle 0x%X\n",
+                        xbox_path.c_str(), h);
+            } else {
+                fprintf(stderr, "[hle] NtCreateFile: '%s' -> not found (%s)\n",
+                        xbox_path.c_str(), host_path.c_str());
+            }
+        } else {
+            // No mount matched — return a fake handle for device paths etc.
+            h = heap->next_handle++;
+            status = 0;
+            fprintf(stderr, "[hle] NtCreateFile: '%s' -> fake handle 0x%X\n",
+                    xbox_path.c_str(), h);
+        }
+
         if (handle_ptr + 4 <= GUEST_RAM_SIZE)
             memcpy(exec.ram + handle_ptr, &h, 4);
-        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        // Write IO_STATUS_BLOCK: {Status, Information}
+        if (iosb_ptr + 8 <= GUEST_RAM_SIZE) {
+            memcpy(exec.ram + iosb_ptr, &status, 4);
+            uint32_t info = (status == 0) ? 1u : 0u; // FILE_OPENED
+            memcpy(exec.ram + iosb_ptr + 4, &info, 4);
+        }
+        exec.ctx.gp[GP_EAX] = status;
         stdcall_cleanup(exec, 9);
         return true;
     }
@@ -1222,8 +1509,41 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     case ORD_NtQueryFullAttributesFile: {
         // NTSTATUS NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         //     PFILE_NETWORK_OPEN_INFORMATION FileInformation)
-        // Return STATUS_OBJECT_NAME_NOT_FOUND for now â€” file doesn't exist
-        exec.ctx.gp[GP_EAX] = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        uint32_t obj_attrs = stack_arg(exec, 0);
+        uint32_t info_ptr  = stack_arg(exec, 1);
+
+        std::string xbox_path = read_object_name(exec, obj_attrs);
+        std::string host_path = heap->translate_path(xbox_path);
+
+        uint32_t status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        if (!host_path.empty()) {
+            FILE* fp = fopen(host_path.c_str(), "rb");
+            if (fp) {
+                fseek(fp, 0, SEEK_END);
+                uint64_t sz = (uint64_t)ftell(fp);
+                fclose(fp);
+
+                // FILE_NETWORK_OPEN_INFORMATION: 56 bytes
+                // {CreationTime(8), LastAccessTime(8), LastWriteTime(8),
+                //  ChangeTime(8), AllocationSize(8), EndOfFile(8),
+                //  FileAttributes(4), padding(4)}
+                if (info_ptr + 56 <= GUEST_RAM_SIZE) {
+                    memset(exec.ram + info_ptr, 0, 56);
+                    uint64_t alloc_sz = (sz + 0xFFF) & ~0xFFFULL;
+                    memcpy(exec.ram + info_ptr + 32, &alloc_sz, 8);
+                    memcpy(exec.ram + info_ptr + 40, &sz, 8);
+                    uint32_t attrs = 0x80; // FILE_ATTRIBUTE_NORMAL
+                    memcpy(exec.ram + info_ptr + 48, &attrs, 4);
+                }
+                status = 0;
+                fprintf(stderr, "[hle] NtQueryFullAttributesFile: '%s' -> size=%llu\n",
+                        xbox_path.c_str(), (unsigned long long)sz);
+            } else {
+                fprintf(stderr, "[hle] NtQueryFullAttributesFile: '%s' -> not found\n",
+                        xbox_path.c_str());
+            }
+        }
+        exec.ctx.gp[GP_EAX] = status;
         stdcall_cleanup(exec, 2);
         return true;
     }
