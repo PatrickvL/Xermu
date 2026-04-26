@@ -67,48 +67,65 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Step 4: Look up guest EIP from MemOpSite table.
-    uint32_t guest_eip = faulting_trace->lookup_guest_eip(rip);
-    if (!guest_eip) {
-        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP\n",
-                faulting_trace->guest_eip);
+    // Step 4: Look up the MemOpSite for this faulting instruction.
+    uint32_t rip_off = (uint32_t)(rip - faulting_trace->host_code);
+    Trace::MemOpSite* site = nullptr;
+    for (int i = 0; i < faulting_trace->num_mem_sites; ++i) {
+        if (faulting_trace->mem_sites[i].host_offset == rip_off) {
+            site = &faulting_trace->mem_sites[i];
+            break;
+        }
+    }
+
+    if (!site) {
+        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP %p\n",
+                faulting_trace->guest_eip, (void*)rip);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Step 5: Set fault bitmap bit.
-    exec->fb.set(guest_eip);
-
-    // Step 6: Rebuild the trace with bitmap-set slow paths.
-    Trace* new_trace = exec->builder.build(
-        faulting_trace->code_pa,
-        exec->ram,
-        exec->cc,
-        exec->arena,
-        &exec->ctx,
-        &exec->fb
-    );
-
-    if (!new_trace) {
-        fprintf(stderr, "[veh] rebuild failed for trace @%08X\n",
-                faulting_trace->guest_eip);
+    // SP_NONE: ALU/FPU/SSE MMIO — not patchable.
+    if (site->sp_kind == SP_NONE) {
+        fprintf(stderr, "[veh] MMIO fault at guest EIP %08X — unsupported op (SP_NONE)\n",
+                site->guest_eip);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Update trace cache and invalidate old trace.
-    new_trace->guest_eip = faulting_trace->guest_eip;
-    exec->tcache.insert(new_trace);  // overwrites old slot
-    faulting_trace->valid = false;
+    // Step 5: Lazy stub generation — generate once, patch NOP sled once.
+    if (!site->stub_ptr) {
+        static constexpr size_t MAX_STUB_BYTES = 256;
+        uint8_t* stub_buf = exec->cc.alloc_stub(MAX_STUB_BYTES);
+        if (!stub_buf) {
+            fprintf(stderr, "[veh] stub slab exhausted\n");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
 
-    // Step 7: Redirect to the faulting instruction's position in the new trace.
-    // The new trace has a slow-path CALL at the same guest EIP; skip there
-    // so that already-executed instructions are not re-executed.
-    uint32_t new_off = new_trace->lookup_host_offset(guest_eip);
-    if (new_off != ~0u) {
-        ctx_regs->Rip = (DWORD64)(uintptr_t)(new_trace->host_code + new_off);
-    } else {
-        // Fallback: start of trace (should not happen).
-        ctx_regs->Rip = (DWORD64)(uintptr_t)new_trace->host_code;
+        size_t n = generate_slow_path_stub(stub_buf, MAX_STUB_BYTES, *site);
+        if (!n) {
+            fprintf(stderr, "[veh] stub generation failed\n");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        site->stub_ptr = stub_buf;
     }
+
+    // Step 6: Patch the 5-byte NOP sled immediately before the faulting
+    // instruction with CALL rel32 → stub.  The NOP sled starts at rip - 5.
+    uint8_t* nop_sled = rip - 5;
+    intptr_t delta = (intptr_t)site->stub_ptr - (intptr_t)rip; // CALL rel32: target-(rip+5)+5 = target-rip ... wait
+    // CALL rel32 at nop_sled[0..4]: next IP = nop_sled+5 = rip, so
+    // rel32 = stub_ptr - (nop_sled + 5) = stub_ptr - rip
+    delta = (intptr_t)site->stub_ptr - (intptr_t)rip;
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        fprintf(stderr, "[veh] stub too far for rel32 CALL (delta=%td)\n", delta);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    int32_t rel32 = (int32_t)delta;
+    nop_sled[0] = 0xE8;
+    memcpy(nop_sled + 1, &rel32, 4);
+
+    // Step 7: Redirect RIP to the NOP sled (now CALL rel32) so it executes
+    // the stub on resume rather than faulting again.
+    ctx_regs->Rip = (DWORD64)(uintptr_t)nop_sled;
 
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -359,8 +376,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
         }
     }
 
-    // Clear the fault bitmap for this page (fresh start on rebuild).
-    fb.clear_page(page);
+    // No fault bitmap to clear — NOP sleds in invalidated traces are dead code.
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1207,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Build if missing.
         if (!t) {
             t = builder.build(code_pa, ram,
-                              cc, arena, &ctx, &fb);
+                              cc, arena, &ctx);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;
