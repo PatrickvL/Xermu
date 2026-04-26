@@ -27,7 +27,7 @@ struct MmioMap {
     uint32_t read(uint32_t pa, unsigned size) const {
         for (int i = 0; i < count; ++i) {
             const auto& r = regions[i];
-            if (pa >= r.base && pa < r.base + r.size)
+            if (pa >= r.base && (pa - r.base) < r.size)
                 return r.read(pa, size, r.user);
         }
         return BUS_FLOAT;
@@ -36,7 +36,7 @@ struct MmioMap {
     void write(uint32_t pa, uint32_t val, unsigned size) const {
         for (int i = 0; i < count; ++i) {
             const auto& r = regions[i];
-            if (pa >= r.base && pa < r.base + r.size) {
+            if (pa >= r.base && (pa - r.base) < r.size) {
                 r.write(pa, val, size, r.user);
                 return;
             }

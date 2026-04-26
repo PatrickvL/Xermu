@@ -90,6 +90,14 @@ struct alignas(16) GuestContext {
     // Task register and LDT selector (set by LTR / LLDT, read by STR / SLDT)
     uint16_t  tr_sel   = 0;  // Task Register selector
     uint16_t  ldtr_sel = 0;  // LDT Register selector
+
+    // Segment selectors (set by MOV sreg,r or far JMP/CALL/RET/IRET)
+    uint16_t  es_sel = 0;
+    uint16_t  cs_sel = 0;
+    uint16_t  ss_sel = 0;
+    uint16_t  ds_sel = 0;
+    uint16_t  fs_sel = 0;
+    uint16_t  gs_sel = 0;
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);

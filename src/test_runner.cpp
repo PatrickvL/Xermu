@@ -141,19 +141,23 @@ int main(int argc, char** argv) {
             printf("[test_runner] MCPX ROM loaded\n");
         }
 
-        // x86 reset state: start at the reset vector.
-        // Real hardware starts in 16-bit real mode at CS:IP = F000:FFF0
-        // (physical 0xFFFFFFF0).  Our JIT runs in 32-bit protected mode,
-        // so we set EIP to the physical address directly — the flash MMIO
-        // handler serves the correct bytes.
-        static constexpr uint32_t RESET_VECTOR = 0xFFFFFFF0u;
-        exec->ctx.eflags = 0x0000'0002;  // minimal: reserved bit 1 set
-        exec->ctx.gp[GP_ESP] = 0;        // no stack initially
+        // Boot: interpret the 16-bit real-mode prologue (LGDT/LIDT/PE/far JMP)
+        // to reach the 32-bit protected mode entry point.
+        if (!exec->interpret_real_mode_boot()) {
+            fprintf(stderr, "Real-mode boot stub interpretation failed\n");
+            exec->destroy();
+            delete hw;
+            return 2;
+        }
 
-        printf("[test_runner] Starting execution at reset vector 0x%08X\n",
-               RESET_VECTOR);
+        printf("[test_runner] Entering protected mode at EIP=0x%08X\n",
+               exec->ctx.eip);
+        printf("[test_runner] GDT: base=0x%08X limit=%u  IDT: base=0x%08X limit=%u\n",
+               exec->ctx.gdtr_base, exec->ctx.gdtr_limit,
+               exec->ctx.idtr_base, exec->ctx.idtr_limit);
+        printf("[test_runner] CR0=0x%08X\n", exec->ctx.cr0);
 
-        exec->run(RESET_VECTOR, /*max_steps=*/100'000'000);
+        exec->run(exec->ctx.eip, /*max_steps=*/100'000'000);
 
         printf("[test_runner] Halted: EIP=0x%08X EAX=0x%08X\n",
                exec->ctx.eip, exec->ctx.gp[GP_EAX]);

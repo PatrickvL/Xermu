@@ -613,9 +613,22 @@ static bool is_debug_register(ZydisRegister r) {
     return r >= ZYDIS_REGISTER_DR0 && r <= ZYDIS_REGISTER_DR15;
 }
 
+static bool is_segment_register(ZydisRegister r) {
+    return r == ZYDIS_REGISTER_ES || r == ZYDIS_REGISTER_CS ||
+           r == ZYDIS_REGISTER_SS || r == ZYDIS_REGISTER_DS ||
+           r == ZYDIS_REGISTER_FS || r == ZYDIS_REGISTER_GS;
+}
+
 bool emit_handler_mov_mem(Emitter& e, const ZydisDecodedInstruction& insn,
                           const ZydisDecodedOperand* ops, const uint8_t* raw,
                           GuestContext* /*ctx*/, bool save_flags) {
+    // MOV to/from segment registers: treat as privileged (run loop handles them).
+    for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            is_segment_register(ops[i].reg.value))
+            return false;  // reject → caller emits STOP_PRIVILEGED or #UD
+    }
+
     int mem_idx = -1;
     if (!TraceBuilder::has_mem_operand(ops, insn.operand_count, mem_idx)) {
         // reg-reg MOV: check for ESP involvement.
@@ -1604,13 +1617,14 @@ static constexpr uint32_t ARITH_FLAGS =
     ZYDIS_CPUFLAG_ZF | ZYDIS_CPUFLAG_SF | ZYDIS_CPUFLAG_OF;
 
 Trace* TraceBuilder::build(uint32_t            guest_eip,
+                            const uint8_t*      code,
+                            uint32_t            code_len,
                             const uint8_t*      ram,
                             CodeCache&          cc,
                             TraceArena&         arena,
                             GuestContext*       ctx) {
-    constexpr uint32_t ram_size = GUEST_RAM_SIZE;
-    if (guest_eip >= ram_size) {
-        fprintf(stderr, "[trace] EIP %08X outside RAM\n", guest_eip);
+    if (code_len == 0) {
+        fprintf(stderr, "[trace] EIP %08X — no code bytes available\n", guest_eip);
         return nullptr;
     }
 
@@ -1629,16 +1643,17 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     size_t   n_insns = 0;
 
     {
-        const uint8_t* scan_pc       = ram + guest_eip;
+        const uint8_t* scan_pc       = code;
+        uint32_t       scan_off      = 0;  // offset into code buffer
         uint32_t       scan_guest_pc = guest_eip;
         const uint32_t scan_page     = guest_eip & ~0xFFFu;
 
         for (size_t i = 0; i < MAX_INSN_COUNT; ++i) {
-            if (scan_guest_pc >= ram_size) break;
+            if (scan_off >= code_len) break;
 
             ZydisDecodedInstruction insn;
             ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
-            ZyanUSize avail = ram_size - scan_guest_pc;
+            ZyanUSize avail = code_len - scan_off;
             if (avail > 15) avail = 15;
 
             ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, scan_pc, avail,
@@ -1664,6 +1679,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 break;
 
             scan_pc       += insn.length;
+            scan_off      += insn.length;
             scan_guest_pc += insn.length;
             if ((scan_guest_pc & ~0xFFFu) != scan_page) break;
         }
@@ -1696,21 +1712,22 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
     Emitter  e(emit_buf, MAX_TRACE_BYTES);
     e.paging = (ctx->cr0 & 0x80000000u) != 0;  // CR0.PG at build time
-    const uint8_t* pc        = ram + guest_eip;
+    const uint8_t* pc        = code;
+    uint32_t       emit_off  = 0;  // offset into code buffer
     uint32_t       guest_pc  = guest_eip;
     const uint32_t page_base = guest_eip & ~0xFFFu;
     bool           done_flag = false;
     size_t         insn_idx  = 0;
 
     for (size_t n = 0; n < MAX_INSN_COUNT && !done_flag; ++n) {
-        if (guest_pc >= ram_size) {
+        if (emit_off >= code_len) {
             emit_epilog_static(e, guest_pc);
             break;
         }
 
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
-        ZyanUSize avail = ram_size - guest_pc;
+        ZyanUSize avail = code_len - emit_off;
         if (avail > 15) avail = 15;
 
         ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, pc, avail, &insn, ops);
@@ -1870,6 +1887,25 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                 done_flag = true;
                 goto advance;
             }
+
+            // MOV to/from segment registers (DS, ES, SS, FS, GS, CS).
+            bool has_seg = false;
+            for (int i = 0; i < (int)insn.operand_count_visible; ++i) {
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    is_segment_register(ops[i].reg.value)) {
+                    has_seg = true;
+                    break;
+                }
+            }
+            if (has_seg) {
+                emit_save_all_gp(e);
+                emit_save_eflags(e);
+                emit_write_next_eip_imm(e, guest_pc);
+                emit_set_stop_reason(e, STOP_PRIVILEGED);
+                e.emit8(0xC3);
+                done_flag = true;
+                goto advance;
+            }
         }
 
         // ---- Dispatch table handler ----
@@ -1895,6 +1931,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
     advance:
         pc       += insn.length;
+        emit_off += insn.length;
         guest_pc  = pc_after;
         ++insn_idx;
 

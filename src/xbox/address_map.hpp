@@ -28,6 +28,6 @@ static constexpr uint32_t USB1_BASE         = 0xFED08000u;
 static constexpr uint32_t USB1_SIZE         = 0x00001000u;  // 4 KB
 
 static constexpr uint32_t BIOS_BASE         = 0xFF000000u;
-static constexpr uint32_t BIOS_SIZE         = 0x00100000u;  // 1 MB
+static constexpr uint32_t BIOS_SIZE         = 0x01000000u;  // 16 MB (1 MB flash mirrored)
 
 } // namespace xbox

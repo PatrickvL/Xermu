@@ -121,4 +121,23 @@ ORG 0x1000
     mov eax, [fs:0x90]
     ASSERT_EQ eax, 125                              ; 22
 
+; ---- MOV to/from segment registers ----
+; These are handled as privileged instructions in the run loop.
+
+    ; MOV DS, immediate value via register
+    mov  eax, 0x10
+    mov  ds, ax
+
+    ; Read back: MOV AX, DS
+    mov  eax, 0xDEAD0000
+    mov  ax, ds
+    ASSERT_EQ eax, 0xDEAD0010                       ; 23
+
+    ; MOV ES from different register
+    mov  ecx, 0x18
+    mov  es, cx
+    mov  eax, 0
+    mov  ax, es
+    ASSERT_EQ eax, 0x0018                           ; 24
+
     PASS

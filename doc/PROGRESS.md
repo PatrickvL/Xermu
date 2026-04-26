@@ -270,6 +270,28 @@
 - **Result**: 48/48 pass
 - **Status**: DONE
 
+### Step 24: BIOS boot infrastructure — flash ROM execution + real-mode boot (HEAD)
+- **Code from flash ROM**: TraceBuilder::build() now accepts (code_ptr, code_len)
+  buffer; run loop fetches code via MMIO for addresses ≥ GUEST_RAM_SIZE.
+  handle_privileged() also fetches instruction bytes from flash.
+- **16 MB BIOS mirror**: BIOS_SIZE changed from 1 MB to 16 MB to cover the
+  entire 0xFF000000–0xFFFFFFFF range including reset vector at 0xFFFFFFF0.
+  MMIO range check fixed to avoid uint32_t overflow.
+- **Real-mode boot interpreter**: `interpret_real_mode_boot()` handles the
+  16-bit prologue (JMP rel8, LGDT, LIDT, MOV CR0, far JMP) to reach 32-bit PM.
+- **Segment register MOV**: `MOV DS/ES/SS/FS/GS, r/m16` and `MOV r16, sreg`
+  handled as privileged instructions; selectors stored in GuestContext.
+  FS/GS base loaded from GDT via `load_segment_base()`.
+- **String I/O**: REP INSB/INSW/INSD and REP OUTSB/OUTSW/OUTSD implemented
+  in handle_privileged() with direction flag and paging support.
+- **BIOS boot result**: Successfully enters 32-bit PM at 0xFFFFFE00, processes
+  init table commands (I/O, PCI config, MMIO read/write) until max_steps.
+- **Files**: executor.cpp, executor.hpp, context.hpp, trace_builder.cpp,
+  trace_builder.hpp, mmio.hpp, xbox/address_map.hpp, test_runner.cpp,
+  tests/segment.asm, doc/DESIGN.md (§5.27–5.31)
+- **Result**: 51/51 pass
+- **Status**: DONE
+
 ---
 
 ## Test Results
@@ -300,3 +322,4 @@
 | 678128d | 48   | 0    | pfifo race fix (50/50)   |
 | eedec47 | 48   | 0    | PTE/PDE bit constants    |
 | (HEAD)  | 48   | 0    | FPU/SSE + BUS_FLOAT      |
+| (HEAD)  | 51   | 0    | BIOS boot infrastructure |

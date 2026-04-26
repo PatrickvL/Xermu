@@ -49,7 +49,12 @@ struct TraceBuilder {
     TraceBuilder();
 
     // Build and emit a trace starting at guest_eip.
+    // `code` points to the instruction bytes at guest_eip.
+    // `code_len` is the number of bytes available starting at `code`.
+    // `ram` is the guest RAM base (needed for guest memory reads by C helpers).
     Trace* build(uint32_t           guest_eip,
+                 const uint8_t*     code,
+                 uint32_t           code_len,
                  const uint8_t*     ram,
                  CodeCache&         cc,
                  TraceArena&        arena,

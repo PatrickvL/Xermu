@@ -1908,6 +1908,94 @@ resumes past the faulting instruction via IRETD.
 
 ---
 
+#### 5.27 Execute Code from Flash ROM ✅ DONE
+
+The trace builder and run loop can now fetch guest code from any physical
+address, not just RAM:
+
+- **`TraceBuilder::build()`** accepts a `(code_ptr, code_len)` buffer instead
+  of computing `ram + guest_eip`.
+- **Run loop** detects `code_pa >= GUEST_RAM_SIZE` and fetches up to one page
+  of bytes via `ctx.mmio->read()` into a temp buffer before calling `build()`.
+- **`handle_privileged()`** likewise fetches instruction bytes via MMIO when
+  `code_pa >= GUEST_RAM_SIZE`.
+- **SMC page protection** is skipped for non-RAM pages (ROM is immutable).
+
+This enables executing BIOS/ROM code directly from flash MMIO space
+(e.g. the Xbox BIOS at 0xFF000000–0xFFFFFFFF).
+
+---
+
+#### 5.28 BIOS Address Map: 16 MB Flash Mirror ✅ DONE
+
+The Xbox BIOS flash is 256 KB (or 1 MB), mirrored across the full 16 MB region
+0xFF000000–0xFFFFFFFF.  The `BIOS_SIZE` constant was changed from 1 MB to 16 MB
+so that the MMIO registration covers the entire range including the reset vector
+at 0xFFFFFFF0.
+
+The MMIO range check `pa >= r.base && (pa - r.base) < r.size` was changed from
+`pa < r.base + r.size` to avoid uint32_t overflow when `r.base + r.size` wraps
+past 0xFFFFFFFF.
+
+---
+
+#### 5.29 Real-Mode Boot Interpreter ✅ DONE
+
+The x86 reset vector (0xFFFFFFF0) executes in 16-bit real mode.  The Xbox BIOS
+prologue is ~20 instructions: JMP, LGDT, LIDT, MOV CR0 (enable PE), far JMP to
+32-bit protected mode.  Rather than implementing a full 16-bit decoder in the
+JIT, `Executor::interpret_real_mode_boot()` is a mini interpreter that handles:
+
+| Instruction | Effect |
+|---|---|
+| `JMP rel8` | Short jump within 16-bit code |
+| `LGDT [CS:disp16]` | Load GDT pseudo-descriptor from flash |
+| `LIDT [CS:disp16]` | Load IDT pseudo-descriptor from flash |
+| `MOV EAX, CR0` | Read CR0 |
+| `OR AL, imm8` | Set PE bit |
+| `MOV CR0, EAX` | Write CR0 (enable protected mode) |
+| `JMP ptr16:32` | Far jump — enters 32-bit PM; returns true |
+| `NOP`, `CLI`, `CLD` | Side-effect-free or state-trivial |
+
+Called before the JIT run loop when booting a BIOS.  Execution begins at
+CS:IP = F000:FFF0 (PA 0xFFFFFFF0) with `cs_base = 0xFFFF0000`.
+
+---
+
+#### 5.30 Segment Register MOV ✅ DONE
+
+`MOV DS/ES/SS/FS/GS, r/m16` and `MOV r16, DS/ES/SS/FS/GS` cannot execute
+verbatim in JIT code (host segment registers are incompatible).  They are now
+handled as privileged instructions:
+
+- **Trace builder**: Detects segment register operands on MOV; emits
+  `STOP_PRIVILEGED` exit.
+- **Run loop**: `handle_privileged()` stores/loads the selector to/from
+  `ctx.{es,cs,ss,ds,fs,gs}_sel`.  For FS/GS, additionally loads the
+  segment base from the GDT via `load_segment_base()`.
+- **`GuestContext`**: New fields `es_sel`, `cs_sel`, `ss_sel`, `ds_sel`,
+  `fs_sel`, `gs_sel` (placed after `ldtr_sel` to avoid shifting FPU offsets).
+
+Test: `tests/segment.asm` assertions 23–24 exercise MOV sreg round-trip.
+
+---
+
+#### 5.31 String I/O: INS/OUTS ✅ DONE
+
+`REP INSB/INSW/INSD` and `REP OUTSB/OUTSW/OUTSD` are string I/O instructions
+used by the Xbox BIOS init table to bulk-transfer data from I/O ports.  These
+are already classified as `ICF_PRIVILEGED` in the instruction dispatch table.
+
+`handle_privileged()` now implements the full REP loop:
+
+- **INS**: reads from port DX into [ES:EDI], advances EDI by ±size, decrements
+  ECX for each iteration.  Handles direction flag.
+- **OUTS**: reads from [DS:ESI], writes to port DX, advances ESI.
+
+Paging translation is applied per-iteration when CR0.PG is set.
+
+---
+
 ## 6. Bugs Fixed During Development
 
 | # | Bug | Root Cause | Fix |

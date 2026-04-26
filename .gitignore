@@ -18,4 +18,6 @@ Desktop.ini
 .DS_Store
 
 # Logs / temp
-data/
+data/boot_output.txt
+stderr_bios.txt
+stdout_bios.txt

@@ -887,6 +887,60 @@ void Executor::unlink_trace(Trace* t) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: compute effective address from a Zydis memory operand.
+// ---------------------------------------------------------------------------
+static uint32_t compute_ea(const ZydisDecodedOperand& op, const GuestContext& ctx) {
+    uint32_t ea = 0;
+    if (op.mem.disp.has_displacement)
+        ea = (uint32_t)(int32_t)op.mem.disp.value;
+    if (op.mem.base != ZYDIS_REGISTER_NONE) {
+        uint8_t enc;
+        if (reg32_enc(op.mem.base, enc))
+            ea += ctx.gp[enc];
+    }
+    if (op.mem.index != ZYDIS_REGISTER_NONE) {
+        uint8_t enc;
+        if (reg32_enc(op.mem.index, enc))
+            ea += ctx.gp[enc] * op.mem.scale;
+    }
+    return ea;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: load segment base from GDT descriptor given a selector.
+// Returns 0 for null selector or if GDT is out of guest RAM.
+// ---------------------------------------------------------------------------
+uint32_t Executor::load_segment_base(uint16_t sel) {
+    if (sel == 0) return 0;  // null selector → base 0
+    uint16_t index = sel >> 3;
+    uint32_t desc_off = ctx.gdtr_base + (uint32_t)index * 8;
+
+    // Read 8-byte GDT descriptor
+    uint8_t desc[8];
+    uint32_t pa = desc_off;
+    if (paging_enabled()) {
+        pa = translate_va(desc_off, false);
+        if (pa == ~0u) return 0;
+    }
+    if (pa + 8 <= GUEST_RAM_SIZE) {
+        memcpy(desc, ram + pa, 8);
+    } else if (ctx.mmio) {
+        for (int i = 0; i < 8; ++i)
+            desc[i] = (uint8_t)ctx.mmio->read(pa + i, 1);
+    } else {
+        return 0;
+    }
+
+    // Extract base from descriptor bytes:
+    // base[15:0]  = desc[2..3]
+    // base[23:16] = desc[4]
+    // base[31:24] = desc[7]
+    uint32_t base = (uint32_t)desc[2] | ((uint32_t)desc[3] << 8) |
+                    ((uint32_t)desc[4] << 16) | ((uint32_t)desc[7] << 24);
+    return base;
+}
+
+// ---------------------------------------------------------------------------
 // Privileged instruction handler — decode and dispatch HLT, IN, OUT, etc.
 // Called from run loop when a trace exits with STOP_PRIVILEGED.
 // ctx.eip == address of the privileged instruction.
@@ -900,15 +954,37 @@ void Executor::handle_privileged() {
     ZydisDecodedInstruction insn;
     ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
 
-    if (ctx.eip >= GUEST_RAM_SIZE) {
-        fprintf(stderr, "[exec] privileged EIP=%08X out of range\n", ctx.eip);
+    // Fetch instruction bytes (from RAM or via MMIO for flash ROM).
+    uint8_t ibuf[15];
+    const uint8_t* pc;
+    ZyanUSize avail;
+
+    uint32_t code_pa = ctx.eip;
+    if (paging_enabled()) {
+        code_pa = translate_va(ctx.eip, false);
+        if (code_pa == ~0u) {
+            fprintf(stderr, "[exec] #PF translating privileged EIP=%08X\n", ctx.eip);
+            ctx.halted = true;
+            return;
+        }
+    }
+
+    if (code_pa < GUEST_RAM_SIZE) {
+        pc = ram + code_pa;
+        avail = GUEST_RAM_SIZE - code_pa;
+        if (avail > 15) avail = 15;
+    } else if (ctx.mmio) {
+        // Fetch up to 15 bytes via MMIO (e.g. flash ROM)
+        avail = 15;
+        for (ZyanUSize i = 0; i < avail; ++i)
+            ibuf[i] = (uint8_t)ctx.mmio->read(code_pa + (uint32_t)i, 1);
+        pc = ibuf;
+    } else {
+        fprintf(stderr, "[exec] privileged EIP=%08X (PA=%08X) out of range\n",
+                ctx.eip, code_pa);
         ctx.halted = true;
         return;
     }
-
-    const uint8_t* pc = ram + ctx.eip;
-    ZyanUSize avail = GUEST_RAM_SIZE - ctx.eip;
-    if (avail > 15) avail = 15;
 
     ZyanStatus st = ZydisDecoderDecodeFull(&decoder, pc, avail, &insn, ops);
     if (!ZYAN_SUCCESS(st)) {
@@ -1270,7 +1346,86 @@ void Executor::handle_privileged() {
                 return;
             }
         }
-        fprintf(stderr, "[exec] unhandled MOV CR/DR at EIP=%08X\n", ctx.eip);
+
+        // MOV sreg, r/m16 — load segment register.
+        // Xbox flat model: selector value stored, base stays 0 (except FS/GS).
+        auto seg_sel_ptr = [&](ZydisRegister r) -> uint16_t* {
+            switch (r) {
+            case ZYDIS_REGISTER_ES: return &ctx.es_sel;
+            case ZYDIS_REGISTER_CS: return &ctx.cs_sel;
+            case ZYDIS_REGISTER_SS: return &ctx.ss_sel;
+            case ZYDIS_REGISTER_DS: return &ctx.ds_sel;
+            case ZYDIS_REGISTER_FS: return &ctx.fs_sel;
+            case ZYDIS_REGISTER_GS: return &ctx.gs_sel;
+            default: return nullptr;
+            }
+        };
+
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            // MOV sreg, r16
+            uint16_t* sp = seg_sel_ptr(ops[0].reg.value);
+            if (sp) {
+                uint16_t val = 0;
+                if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    int gi = gp_index(ops[1].reg.value);
+                    // Accept both 16-bit and 32-bit forms (Zydis may decode as AX or EAX)
+                    if (gi < 0) {
+                        // Try 16-bit register → same encoding
+                        uint8_t enc;
+                        if (reg32_enc((ZydisRegister)(ops[1].reg.value +
+                            (ZYDIS_REGISTER_EAX - ZYDIS_REGISTER_AX)), enc))
+                            gi = (int)enc;
+                    }
+                    if (gi >= 0) val = (uint16_t)ctx.gp[gi];
+                } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    // MOV sreg, [mem] — read 16 bits from guest memory
+                    uint32_t ea = compute_ea(ops[1], ctx);
+                    uint32_t pa = ea;
+                    if (paging_enabled()) {
+                        pa = translate_va(ea, false);
+                        if (pa == ~0u) {
+                            deliver_interrupt(14, ctx.eip, true, 0);
+                            return;
+                        }
+                    }
+                    if (pa < GUEST_RAM_SIZE)
+                        memcpy(&val, ram + pa, 2);
+                    else if (ctx.mmio)
+                        val = (uint16_t)ctx.mmio->read(pa, 2);
+                }
+                *sp = val;
+                // Update segment base for FS/GS from GDT.
+                if (ops[0].reg.value == ZYDIS_REGISTER_FS ||
+                    ops[0].reg.value == ZYDIS_REGISTER_GS) {
+                    uint32_t base = load_segment_base(val);
+                    if (ops[0].reg.value == ZYDIS_REGISTER_FS)
+                        ctx.fs_base = base;
+                    else
+                        ctx.gs_base = base;
+                }
+                ctx.eip += insn.length;
+                return;
+            }
+
+            // MOV r16, sreg — read segment register
+            int gi = gp_index(ops[0].reg.value);
+            if (gi < 0) {
+                uint8_t enc;
+                if (reg32_enc((ZydisRegister)(ops[0].reg.value +
+                    (ZYDIS_REGISTER_EAX - ZYDIS_REGISTER_AX)), enc))
+                    gi = (int)enc;
+            }
+            if (gi >= 0) {
+                uint16_t* sp = seg_sel_ptr(ops[1].reg.value);
+                if (sp) {
+                    ctx.gp[gi] = (ctx.gp[gi] & 0xFFFF0000u) | *sp;
+                    ctx.eip += insn.length;
+                    return;
+                }
+            }
+        }
+
+        fprintf(stderr, "[exec] unhandled MOV CR/DR/SEG at EIP=%08X\n", ctx.eip);
         ctx.eip += insn.length;
         return;
     }
@@ -1402,6 +1557,65 @@ void Executor::handle_privileged() {
         else
             ctx.gp[GP_EAX] = value;
 
+        ctx.eip += insn.length;
+        return;
+    }
+
+    // String I/O: INSB/INSW/INSD (with optional REP prefix)
+    case ZYDIS_MNEMONIC_INSB:
+    case ZYDIS_MNEMONIC_INSW:
+    case ZYDIS_MNEMONIC_INSD: {
+        uint16_t port = (uint16_t)ctx.gp[GP_EDX];
+        unsigned sz = (insn.mnemonic == ZYDIS_MNEMONIC_INSB) ? 1 :
+                      (insn.mnemonic == ZYDIS_MNEMONIC_INSW) ? 2 : 4;
+        bool has_rep = (insn.attributes & ZYDIS_ATTRIB_HAS_REP) != 0;
+        uint32_t count = has_rep ? ctx.gp[GP_ECX] : 1;
+        bool df = (ctx.eflags & 0x400) != 0; // direction flag
+        int step = df ? -(int)sz : (int)sz;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t val = io_read(port, sz);
+            uint32_t ea = ctx.gp[GP_EDI];
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
+            }
+            if (pa < GUEST_RAM_SIZE) memcpy(ram + pa, &val, sz);
+            else if (ctx.mmio) ctx.mmio->write(pa, val, sz);
+            ctx.gp[GP_EDI] += step;
+        }
+        if (has_rep) ctx.gp[GP_ECX] = 0;
+        ctx.eip += insn.length;
+        return;
+    }
+
+    // String I/O: OUTSB/OUTSW/OUTSD (with optional REP prefix)
+    case ZYDIS_MNEMONIC_OUTSB:
+    case ZYDIS_MNEMONIC_OUTSW:
+    case ZYDIS_MNEMONIC_OUTSD: {
+        uint16_t port = (uint16_t)ctx.gp[GP_EDX];
+        unsigned sz = (insn.mnemonic == ZYDIS_MNEMONIC_OUTSB) ? 1 :
+                      (insn.mnemonic == ZYDIS_MNEMONIC_OUTSW) ? 2 : 4;
+        bool has_rep = (insn.attributes & ZYDIS_ATTRIB_HAS_REP) != 0;
+        uint32_t count = has_rep ? ctx.gp[GP_ECX] : 1;
+        bool df = (ctx.eflags & 0x400) != 0;
+        int step = df ? -(int)sz : (int)sz;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t ea = ctx.gp[GP_ESI];
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
+            }
+            uint32_t val = 0;
+            if (pa < GUEST_RAM_SIZE) memcpy(&val, ram + pa, sz);
+            else if (ctx.mmio) val = ctx.mmio->read(pa, sz);
+            io_write(port, val, sz);
+            ctx.gp[GP_ESI] += step;
+        }
+        if (has_rep) ctx.gp[GP_ECX] = 0;
         ctx.eip += insn.length;
         return;
     }
@@ -1614,6 +1828,166 @@ fault:
 }
 
 // ---------------------------------------------------------------------------
+// Real-mode boot stub interpreter.
+//
+// The x86 reset vector (0xFFFFFFF0) executes in 16-bit real mode.  The Xbox
+// BIOS prologue is a small sequence: JMP, LGDT, LIDT, MOV CR0 (PE=1), far JMP
+// to 32-bit protected mode.  Rather than implementing a full 16-bit decoder,
+// we interpret just enough instructions to reach the far JMP, then switch to
+// the JIT for 32-bit protected mode execution.
+//
+// Supports: JMP rel8, LGDT/LIDT, MOV EAX,CR0, OR AL,imm8, MOV CR0,EAX,
+//           JMP ptr16:32, NOP, CLI, CLD.
+// ---------------------------------------------------------------------------
+bool Executor::interpret_real_mode_boot() {
+    // Real mode after reset: CS base = 0xFFFF0000, flat physical addressing.
+    uint32_t cs_base = 0xFFFF0000u;
+    uint32_t eip = 0xFFF0u;  // CS:IP = F000:FFF0 → PA 0xFFFFFFF0
+
+    auto fetch_byte = [&](uint32_t pa) -> uint8_t {
+        if (pa < GUEST_RAM_SIZE) return ram[pa];
+        if (ctx.mmio) return (uint8_t)ctx.mmio->read(pa, 1);
+        return 0xCC;
+    };
+    auto fetch_word = [&](uint32_t pa) -> uint16_t {
+        uint8_t lo = fetch_byte(pa), hi = fetch_byte(pa + 1);
+        return (uint16_t)((hi << 8) | lo);
+    };
+    auto fetch_dword = [&](uint32_t pa) -> uint32_t {
+        uint16_t lo = fetch_word(pa), hi = fetch_word(pa + 2);
+        return ((uint32_t)hi << 16) | lo;
+    };
+
+    for (int step = 0; step < 100; ++step) {
+        uint32_t pa = cs_base + eip;
+        uint8_t b0 = fetch_byte(pa);
+
+        // Check for prefixes.
+        bool has_66 = false;
+        bool has_seg = false;
+        uint32_t seg_base = cs_base;
+        int prefix_len = 0;
+
+        while (b0 == 0x66 || b0 == 0x2E || b0 == 0x90 || b0 == 0xFC || b0 == 0xFA) {
+            if (b0 == 0x66) has_66 = true;
+            else if (b0 == 0x2E) { has_seg = true; seg_base = cs_base; }
+            else if (b0 == 0x90) { eip++; pa = cs_base + eip; b0 = fetch_byte(pa); continue; } // NOP
+            else if (b0 == 0xFC) { /* CLD — ignored, DF already 0 */ }
+            else if (b0 == 0xFA) { ctx.virtual_if = false; } // CLI
+            prefix_len++;
+            b0 = fetch_byte(pa + prefix_len);
+        }
+        pa += prefix_len;
+        eip += prefix_len;
+
+        // JMP rel8
+        if (b0 == 0xEB) {
+            int8_t rel = (int8_t)fetch_byte(pa + 1);
+            eip += 2 + rel;
+            continue;
+        }
+
+        // 0F group (LGDT, LIDT, MOV CR)
+        if (b0 == 0x0F) {
+            uint8_t b1 = fetch_byte(pa + 1);
+
+            // LGDT/LIDT: 0F 01 /2 or 0F 01 /3, mod=00, rm=6 → [disp16]
+            if (b1 == 0x01) {
+                uint8_t modrm = fetch_byte(pa + 2);
+                uint8_t reg = (modrm >> 3) & 7;
+                // mod=00, rm=6 → [disp16] in 16-bit addressing
+                uint16_t disp = fetch_word(pa + 3);
+                uint32_t desc_pa = (has_seg ? seg_base : cs_base) + disp;
+
+                // Load 6-byte pseudo-descriptor: 2-byte limit, 4-byte base
+                // (with 66 prefix, base is 32-bit; without, only 24-bit)
+                uint16_t limit = fetch_word(desc_pa);
+                uint32_t base;
+                if (has_66)
+                    base = fetch_dword(desc_pa + 2);
+                else
+                    base = fetch_word(desc_pa + 2) | ((uint32_t)fetch_byte(desc_pa + 4) << 16);
+
+                if (reg == 2) { // LGDT
+                    ctx.gdtr_base = base;
+                    ctx.gdtr_limit = limit;
+                } else if (reg == 3) { // LIDT
+                    ctx.idtr_base = base;
+                    ctx.idtr_limit = limit;
+                }
+                eip += 5; // 0F 01 modrm disp16
+                continue;
+            }
+
+            // MOV r32, CR0: 0F 20 C0 (ModRM = 11 000 000 → CR0 → EAX)
+            if (b1 == 0x20) {
+                uint8_t modrm = fetch_byte(pa + 2);
+                uint8_t rm = modrm & 7;
+                ctx.gp[rm] = ctx.cr0;
+                eip += 3;
+                continue;
+            }
+
+            // MOV CR0, r32: 0F 22 C0
+            if (b1 == 0x22) {
+                uint8_t modrm = fetch_byte(pa + 2);
+                uint8_t rm = modrm & 7;
+                ctx.cr0 = ctx.gp[rm];
+                eip += 3;
+                // If PE is now set, next instruction should be a far JMP.
+                continue;
+            }
+            // Unknown 0F instruction in boot stub.
+            fprintf(stderr, "[boot16] unhandled 0F %02X at PA %08X\n", b1, pa);
+            return false;
+        }
+
+        // OR AL, imm8
+        if (b0 == 0x0C) {
+            uint8_t imm = fetch_byte(pa + 1);
+            ctx.gp[GP_EAX] = (ctx.gp[GP_EAX] & ~0xFF) | ((ctx.gp[GP_EAX] & 0xFF) | imm);
+            eip += 2;
+            continue;
+        }
+
+        // Far JMP: EA offset selector (16-bit: offset16 sel16; with 66: offset32 sel16)
+        if (b0 == 0xEA) {
+            uint32_t target;
+            uint16_t sel;
+            if (has_66) {
+                target = fetch_dword(pa + 1);
+                sel = fetch_word(pa + 5);
+            } else {
+                target = fetch_word(pa + 1);
+                sel = fetch_word(pa + 3);
+            }
+            // Switch to protected mode: set EIP, we're done with real mode.
+            ctx.eip = target;
+            ctx.cr0 |= 1; // ensure PE=1
+            printf("[boot16] Far JMP to %04X:%08X — entering protected mode\n", sel, target);
+            return true;
+        }
+
+        // XOR EAX, EAX (33 C0) — might appear in some boot stubs
+        if (b0 == 0x33) {
+            uint8_t modrm = fetch_byte(pa + 1);
+            if (modrm == 0xC0) {
+                ctx.gp[GP_EAX] = 0;
+                eip += 2;
+                continue;
+            }
+        }
+
+        fprintf(stderr, "[boot16] unhandled opcode %02X at PA %08X (eip=%04X)\n",
+                b0, pa, eip);
+        return false;
+    }
+
+    fprintf(stderr, "[boot16] exceeded step limit\n");
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Run loop
 // ---------------------------------------------------------------------------
 
@@ -1625,7 +1999,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     Trace* prev_trace = nullptr;
 
     while (!ctx.halted) {
-        if (max_steps && steps >= max_steps) break;
+        if (max_steps && steps >= max_steps) {
+            fprintf(stderr, "[exec] max_steps (%llu) reached at EIP=%08X\n",
+                    (unsigned long long)max_steps, ctx.eip);
+            break;
+        }
 
         // Deliver pending hardware IRQs at trace boundaries.
         bool has_irq = irq_check ? irq_check(irq_user) : (pending_irq != 0);
@@ -1669,7 +2047,32 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
         // Build if missing.
         if (!t) {
-            t = builder.build(code_pa, ram,
+            // Prepare code bytes for the trace builder.
+            const uint8_t* code_ptr = nullptr;
+            uint32_t code_len = 0;
+            uint8_t rom_buf[4096];  // temp buffer for non-RAM code fetch
+
+            if (code_pa < GUEST_RAM_SIZE) {
+                // Code is in RAM — read directly.
+                code_ptr = ram + code_pa;
+                code_len = GUEST_RAM_SIZE - code_pa;
+            } else if (ctx.mmio) {
+                // Code is in MMIO space (e.g. flash ROM) — fetch via MMIO
+                // reads into a temp buffer (one page max).
+                uint32_t page_off = code_pa & 0xFFF;
+                uint32_t fetch_len = 4096 - page_off;
+                for (uint32_t i = 0; i < fetch_len; i += 4) {
+                    uint32_t pa = code_pa + i;
+                    uint32_t remain = fetch_len - i;
+                    unsigned sz = (remain >= 4) ? 4 : remain;
+                    uint32_t val = ctx.mmio->read(pa, sz);
+                    memcpy(rom_buf + i, &val, sz);
+                }
+                code_ptr = rom_buf;
+                code_len = fetch_len;
+            }
+
+            t = builder.build(code_pa, code_ptr, code_len, ram,
                               cc, arena, &ctx);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
@@ -1679,8 +2082,9 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             t->guest_eip = eip;
             tcache.insert(t);
 
-            // Protect code page for SMC detection — write faults invalidate traces.
-            protect_code_page(code_pa);
+            // Protect code page for SMC detection (RAM pages only).
+            if (code_pa < GUEST_RAM_SIZE)
+                protect_code_page(code_pa);
         }
 
         // Block linking: eagerly link this trace's exits to existing targets,
@@ -1737,9 +2141,9 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             continue;
         }
 
-        // Check for HALT condition (EIP == 0xFFFFFFFF or out of RAM).
-        if (ctx.eip == 0xFFFF'FFFFu || ctx.eip >= GUEST_RAM_SIZE) {
-            fprintf(stderr, "[exec] EIP=%08X out of range — halting\n", ctx.eip);
+        // Check for HALT condition (EIP == 0xFFFFFFFF).
+        if (ctx.eip == 0xFFFF'FFFFu) {
+            fprintf(stderr, "[exec] EIP=%08X — halting\n", ctx.eip);
             ctx.halted = true;
             break;
         }

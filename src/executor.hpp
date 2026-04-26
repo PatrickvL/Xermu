@@ -122,6 +122,11 @@ struct Executor {
     // traces have been dispatched (0 = unlimited).
     void run(uint32_t entry_eip, uint64_t max_steps = 0);
 
+    // Interpret the 16-bit real-mode boot stub (reset vector → far JMP to PM).
+    // Sets ctx.eip to the 32-bit protected mode entry point.
+    // Returns true if successful, false if interpretation failed.
+    bool interpret_real_mode_boot();
+
     // SMC: protect a code page as read-only, invalidate traces on write.
     void protect_code_page(uint32_t pa);
     void invalidate_code_page(uint32_t pa);
@@ -159,6 +164,9 @@ struct Executor {
     void try_link_trace(Trace* t);
     // Unlink all traces that jump to the given trace (before invalidation).
     void unlink_trace(Trace* t);
+
+    // Load segment base address from GDT descriptor given a selector.
+    uint32_t load_segment_base(uint16_t sel);
 };
 
 // ---------------------------------------------------------------------------
