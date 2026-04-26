@@ -225,7 +225,13 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
 
 // ---------------------------------------------------------------------------
 // run_step — run the executor for a batch of steps.  Returns true if still
-// running (not halted).  Dispatches pending HLE threads automatically.
+// running (not halted).  Dispatches pending HLE threads non-blockingly:
+// if a thread is pending after the main code halts, it gets set up for the
+// *next* frame's run_step call (never blocks the UI thread).
+//
+// Wait/delay HLE stubs set halted=true as a "yield" — the guest is still
+// alive but wants to give up its timeslice.  Only a halt at the sentinel
+// EIP (0xFFFFFFFF) or the HalReturnToFirmware stub is a real stop.
 // ---------------------------------------------------------------------------
 inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     if (!sys.running) return false;
@@ -234,34 +240,43 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     sys.exec->ctx.stop_reason = STOP_NONE;
     sys.exec->run(sys.entry_eip, max_steps);
 
-    // Dispatch pending HLE threads
-    while (!sys.hle_heap.pending_threads.empty()) {
+    // Check if this is a permanent halt (sentinel or HalReturnToFirmware)
+    uint32_t eip = sys.exec->ctx.eip;
+    bool real_halt = sys.exec->ctx.halted &&
+        (eip == 0xFFFFFFFF ||
+         eip == xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware));
+
+    // If permanently halted and there are pending threads, dispatch one
+    // for the *next* frame (never block the UI thread).
+    if (real_halt && !sys.hle_heap.pending_threads.empty()) {
         xbe::PendingThread t = sys.hle_heap.pending_threads.front();
         sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
 
-        sys.exec->ctx.halted = false;
-        sys.exec->ctx.stop_reason = STOP_NONE;
         uint32_t esp = sys.exec->ctx.gp[GP_ESP];
-        // Push context arg
+        // Push start_context as argument
         esp -= 4;
         if (esp + 4 <= GUEST_RAM_SIZE)
             memcpy(sys.exec->ram + esp, &t.start_context, 4);
-        // Push halt return address
+        // Push halt return address (will stop execution when thread returns)
         uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
         esp -= 4;
         if (esp + 4 <= GUEST_RAM_SIZE)
             memcpy(sys.exec->ram + esp, &halt_ret, 4);
         sys.exec->ctx.gp[GP_ESP] = esp;
 
-        sys.exec->run(t.start_routine, max_steps);
+        // Set entry EIP for next frame — don't run it now
+        sys.entry_eip = t.start_routine;
+        return true;  // still running — will dispatch thread next frame
     }
 
-    if (sys.exec->ctx.halted) {
+    // Permanent halt with no pending threads → done
+    if (real_halt) {
         sys.running = false;
         return false;
     }
 
-    // Update entry EIP for next call (continue from where we stopped)
+    // Either max_steps exhausted or a yield-halt (wait/delay stub).
+    // Continue from current EIP next frame.
     sys.entry_eip = sys.exec->ctx.eip;
     return true;
 }

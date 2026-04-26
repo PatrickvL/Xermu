@@ -396,8 +396,24 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     uint32_t hle_esp = exec.ctx.gp[GP_ESP];
     if (hle_esp + 4 <= GUEST_RAM_SIZE)
         memcpy(&ret_addr, exec.ram + hle_esp, 4);
-    fprintf(stderr, "[hle] ordinal %u  EIP=0x%08X  ESP=0x%08X  EBP=0x%08X  ret=0x%08X\n",
-            ordinal, exec.ctx.eip, hle_esp, exec.ctx.gp[GP_EBP], ret_addr);
+
+    // Suppress repeated log lines for high-frequency ordinals (wait/delay/critsec)
+    static uint32_t last_ordinal = 0;
+    static uint32_t repeat_count = 0;
+    if (ordinal == last_ordinal &&
+        (ordinal == ORD_RtlEnterCriticalSection || ordinal == ORD_RtlLeaveCriticalSection ||
+         ordinal == ORD_KeDelayExecutionThread   || ordinal == ORD_KeWaitForSingleObject ||
+         ordinal == ORD_KeWaitForMultipleObjects  || ordinal == ORD_NtWaitForSingleObject ||
+         ordinal == ORD_NtWaitForMultipleObjectsEx || ordinal == ORD_RtlInitializeCriticalSection)) {
+        repeat_count++;
+    } else {
+        if (repeat_count > 0)
+            fprintf(stderr, "[hle]   ... repeated %u times\n", repeat_count);
+        repeat_count = 0;
+        fprintf(stderr, "[hle] ordinal %u  EIP=0x%08X  ESP=0x%08X  EBP=0x%08X  ret=0x%08X\n",
+                ordinal, exec.ctx.eip, hle_esp, exec.ctx.gp[GP_EBP], ret_addr);
+    }
+    last_ordinal = ordinal;
 
     switch (ordinal) {
     case ORD_AvGetSavedDataAddress:
@@ -875,6 +891,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         //                                BOOLEAN Alertable, PLARGE_INTEGER Timeout)
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS (object signaled immediately)
         stdcall_cleanup(exec, 5);
+        exec.ctx.halted = true; // yield to frame loop
         return true;
 
     case ORD_KeWaitForMultipleObjects:
@@ -883,6 +900,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         //          PLARGE_INTEGER Timeout, PKWAIT_BLOCK WaitBlockArray)
         exec.ctx.gp[GP_EAX] = 0; // STATUS_WAIT_0
         stdcall_cleanup(exec, 8);
+        exec.ctx.halted = true; // yield to frame loop
         return true;
 
     case ORD_NtCreateEvent: {
@@ -936,6 +954,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         // NTSTATUS NtWaitForSingleObject(HANDLE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
         exec.ctx.gp[GP_EAX] = 0;
         stdcall_cleanup(exec, 3);
+        exec.ctx.halted = true; // yield to frame loop
         return true;
 
     case ORD_NtWaitForMultipleObjectsEx:
@@ -943,6 +962,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         //          WAIT_TYPE, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
         exec.ctx.gp[GP_EAX] = 0;
         stdcall_cleanup(exec, 5);
+        exec.ctx.halted = true; // yield to frame loop
         return true;
 
     // ---- Object manager stubs ----
@@ -1184,8 +1204,10 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     case ORD_KeDelayExecutionThread:
         // NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)
+        // Yield to host: halt the executor so the frame loop advances time.
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 3);
+        exec.ctx.halted = true;
         return true;
 
     case ORD_KeEnterCriticalRegion:
