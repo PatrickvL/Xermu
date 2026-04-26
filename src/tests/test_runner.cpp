@@ -130,19 +130,96 @@ int main(int argc, char** argv) {
         xbox::XboxSystem sys;
         if (!xbox::boot_lle(sys, cfg)) return 2;
 
-        // Run to completion
-        sys.exec->run(sys.entry_eip, 100'000'000);
+        // Run 2BL to completion — it processes the init table, sets up
+        // the memory controller, decrypts/decompresses the kernel into RAM,
+        // then jumps to KiSystemStartup.
+        // Run in a loop with run_step() to handle halts and retries.
+        for (int attempt = 0; attempt < 20 && sys.running; ++attempt) {
+            sys.exec->ctx.halted = false;
+            sys.exec->ctx.stop_reason = STOP_NONE;
+            sys.exec->run(sys.entry_eip, 500'000'000);
 
-        printf("[test_runner] Halted: EIP=0x%08X EAX=0x%08X\n",
+            uint32_t sr = sys.exec->ctx.stop_reason;
+            uint32_t eip = sys.exec->ctx.eip;
+            fprintf(stderr, "[bios] attempt %d: EIP=0x%08X stop=%u halted=%d\n",
+                    attempt, eip, sr, sys.exec->ctx.halted);
+
+            // Dump bytes at current EIP for diagnostics
+            if (eip < GUEST_RAM_SIZE - 16) {
+                fprintf(stderr, "  bytes @%08X:", eip);
+                for (int i = 0; i < 16; ++i)
+                    fprintf(stderr, " %02X", sys.exec->ram[eip + i]);
+                fprintf(stderr, "\n");
+            }
+            // On first attempt, also dump the 2BL header at 0x400000
+            if (attempt == 0 && 0x400040 < GUEST_RAM_SIZE) {
+                fprintf(stderr, "  2BL @400000:");
+                for (int i = 0; i < 64; ++i) {
+                    if (i % 16 == 0 && i > 0) fprintf(stderr, "\n              ");
+                    fprintf(stderr, " %02X", sys.exec->ram[0x400000 + i]);
+                }
+                fprintf(stderr, "\n");
+            }
+
+            if (sr == STOP_INVALID_OPCODE || sr == STOP_DIVIDE_ERROR) {
+                // Hit an unhandled instruction — continue from next EIP
+                sys.entry_eip = sys.exec->ctx.next_eip;
+                continue;
+            }
+            if (sys.exec->ctx.halted) {
+                // HLT — kernel might be waiting for interrupts
+                sys.entry_eip = eip + 1; // skip HLT
+                continue;
+            }
+            // Max steps exhausted — continue from current EIP
+            sys.entry_eip = eip;
+        }
+
+        printf("[test_runner] Final: EIP=0x%08X EAX=0x%08X\n",
                sys.exec->ctx.eip, sys.exec->ctx.gp[GP_EAX]);
 
-        // Dump 2BL area for verification
-        printf("[test_runner] RAM at 0x400000:");
-        for (int i = 0; i < 64; ++i) {
-            if (i % 16 == 0) printf("\n  %08X:", 0x400000 + i);
-            printf(" %02X", sys.exec->ram[0x400000 + i]);
+        // Scan RAM for a valid PE image (the decrypted/decompressed kernel).
+        // xboxkrnl.exe is typically loaded at 0x80010000 (VA) which maps to
+        // PA 0x00010000 with identity paging, or at the image's preferred base.
+        printf("[test_runner] Scanning RAM for PE images...\n");
+        for (uint32_t pa = 0; pa + 0x200 < GUEST_RAM_SIZE; pa += 0x1000) {
+            if (sys.exec->ram[pa] == 'M' && sys.exec->ram[pa+1] == 'Z') {
+                uint32_t e_lfanew;
+                memcpy(&e_lfanew, sys.exec->ram + pa + 0x3C, 4);
+                if (e_lfanew > 0 && e_lfanew < 0x1000 && pa + e_lfanew + 4 < GUEST_RAM_SIZE) {
+                    uint32_t pe_sig;
+                    memcpy(&pe_sig, sys.exec->ram + pa + e_lfanew, 4);
+                    if (pe_sig == 0x00004550) { // 'PE\0\0'
+                        uint16_t machine, num_sec;
+                        memcpy(&machine, sys.exec->ram + pa + e_lfanew + 4, 2);
+                        memcpy(&num_sec, sys.exec->ram + pa + e_lfanew + 6, 2);
+                        uint32_t img_base, img_size, entry_rva;
+                        uint32_t opt = pa + e_lfanew + 24;
+                        memcpy(&entry_rva, sys.exec->ram + opt + 16, 4);
+                        memcpy(&img_base, sys.exec->ram + opt + 28, 4);
+                        memcpy(&img_size, sys.exec->ram + opt + 56, 4);
+                        printf("  PE at PA=0x%08X: machine=0x%04X sections=%u "
+                               "base=0x%08X size=0x%X entry=0x%X\n",
+                               pa, machine, num_sec, img_base, img_size, entry_rva);
+                        // Dump to file if it looks like xboxkrnl.exe
+                        if (machine == 0x014C && img_size > 0x10000 && img_size < 0x400000) {
+                            char dump_path[256];
+                            snprintf(dump_path, sizeof(dump_path),
+                                     "data/xboxkrnl_dumped_0x%08X.exe", pa);
+                            FILE* df = fopen(dump_path, "wb");
+                            if (df) {
+                                uint32_t dump_sz = img_size;
+                                if (pa + dump_sz > GUEST_RAM_SIZE)
+                                    dump_sz = GUEST_RAM_SIZE - pa;
+                                fwrite(sys.exec->ram + pa, 1, dump_sz, df);
+                                fclose(df);
+                                printf("  -> Dumped %u bytes to %s\n", dump_sz, dump_path);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        printf("\n");
         return 0;
     }
 
