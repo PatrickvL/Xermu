@@ -1361,6 +1361,23 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             case ZYDIS_MNEMONIC_JMP:
                 emit_jmp_exit(e, insn, ops, pc_after, ctx);
                 break;
+            case ZYDIS_MNEMONIC_JCXZ:
+            case ZYDIS_MNEMONIC_JECXZ: {
+                // JECXZ/JCXZ: jump if ECX == 0 (no decrement).
+                uint32_t taken_eip = pc_after;
+                for (int i = 0; i < (int)insn.operand_count; ++i) {
+                    if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                        ops[i].imm.is_relative) {
+                        taken_eip = pc_after +
+                            (uint32_t)(int32_t)ops[i].imm.value.s;
+                        break;
+                    }
+                }
+                // TEST ECX, ECX — sets ZF if ECX==0
+                e.emit8(0x85); e.emit8(0xC9);
+                emit_epilog_conditional(e, 0x74 /*JZ*/, taken_eip, pc_after);
+                break;
+            }
             case ZYDIS_MNEMONIC_LOOP:
             case ZYDIS_MNEMONIC_LOOPE:
             case ZYDIS_MNEMONIC_LOOPNE: {

@@ -156,12 +156,22 @@ int main(int argc, char** argv) {
         for (int attempt = 0; attempt < 20 && sys.running; ++attempt) {
             sys.exec->ctx.halted = false;
             sys.exec->ctx.stop_reason = STOP_NONE;
+
+            // On first attempt, print CPU state
+            if (attempt == 0) {
+                fprintf(stderr, "[bios] CPU state: CR0=0x%08X EIP=0x%08X ESP=0x%08X\n",
+                        sys.exec->ctx.cr0, sys.entry_eip, sys.exec->ctx.gp[GP_ESP]);
+                fprintf(stderr, "[bios] GDT: base=0x%08X limit=0x%04X  IDT: base=0x%08X limit=0x%04X\n",
+                        sys.exec->ctx.gdtr_base, sys.exec->ctx.gdtr_limit,
+                        sys.exec->ctx.idtr_base, sys.exec->ctx.idtr_limit);
+            }
+
             sys.exec->run(sys.entry_eip, 500'000'000);
 
             uint32_t sr = sys.exec->ctx.stop_reason;
             uint32_t eip = sys.exec->ctx.eip;
-            fprintf(stderr, "[bios] attempt %d: EIP=0x%08X stop=%u halted=%d\n",
-                    attempt, eip, sr, sys.exec->ctx.halted);
+            fprintf(stderr, "[bios] attempt %d: EIP=0x%08X stop=%u halted=%d EAX=0x%08X\n",
+                    attempt, eip, sr, sys.exec->ctx.halted, sys.exec->ctx.gp[GP_EAX]);
 
             // Dump bytes at current EIP for diagnostics
             if (eip < GUEST_RAM_SIZE - 16) {

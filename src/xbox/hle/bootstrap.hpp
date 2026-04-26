@@ -206,10 +206,70 @@ inline void rc4_crypt(const uint8_t* key, size_t key_len,
 }
 
 // 2BL constants
-static constexpr uint32_t BL2_LOAD_ADDR = 0x00400000u;  // RAM address where 2BL is loaded
+static constexpr uint32_t BL2_LOAD_ADDR = 0x00090000u;  // RAM address where MCPX 1.0 loads 2BL
 static constexpr uint32_t BL2_SIZE      = 0x6000u;       // MCPX 1.0 decrypts 24 KB
 static constexpr uint32_t MCPX_KEY_OFF  = 0x1A5u;        // RC4 key offset in MCPX 1.0 ROM
 static constexpr uint32_t MCPX_KEY_LEN  = 16u;           // RC4 key length
+
+// ---------------------------------------------------------------------------
+// find_2bl_code_entry — scan flash for the 2BL executable code entry point.
+// In a pre-decrypted BIOS, the code section is in a lower-entropy region
+// of the flash (typically near offset 0x3D400 for 256KB images).
+// The entry is identified by a JMP near (E9) instruction at the start of the
+// code section, surrounded by 24KB of data with internal CALL references.
+// Returns the flash offset of the entry, or 0 on failure.
+// ---------------------------------------------------------------------------
+inline uint32_t find_2bl_code_entry(const uint8_t* flash, uint32_t flash_size)
+{
+    // Scan for E9 xx xx xx xx (JMP near rel32) followed by data/padding,
+    // in the region where entropy drops (typically 0x30000-0x3FE00 for 256KB).
+    // We look for the JMP and verify there are CALL near instructions nearby.
+    uint32_t scan_start = flash_size > 0x40000 ? flash_size - 0x10000 : flash_size / 2;
+    uint32_t scan_end   = flash_size - 0x200; // leave room for MCPX overlay
+
+    for (uint32_t off = scan_start; off < scan_end; off += 0x10) {
+        if (flash[off] != 0xE9) continue;
+
+        // Decode JMP target — must land within reasonable range
+        int32_t rel;
+        memcpy(&rel, flash + off + 1, 4);
+        uint32_t target = off + 5 + (uint32_t)rel;
+        if (target <= off || target >= scan_end) continue;
+
+        // Verify: count CALL near (E8) with in-range targets in the next 8KB
+        uint32_t check_end = off + 0x2000;
+        if (check_end > flash_size) check_end = flash_size;
+        int call_count = 0;
+        for (uint32_t ci = off; ci + 5 < check_end; ci++) {
+            if (flash[ci] != 0xE8) continue;
+            int32_t crel;
+            memcpy(&crel, flash + ci + 1, 4);
+            uint32_t ctarget = ci + 5 + (uint32_t)crel;
+            if (ctarget >= off && ctarget < check_end)
+                call_count++;
+        }
+        if (call_count >= 5) // real code has many internal calls
+            return off;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// is_bios_pre_decrypted — check if the BIOS 2BL region appears to already
+// be decrypted (e.g., copyright string visible in first 24KB).
+// ---------------------------------------------------------------------------
+inline bool is_bios_pre_decrypted(const uint8_t* flash, uint32_t flash_size)
+{
+    // Check first 24KB for "Microsoft" copyright string (visible in plaintext)
+    uint32_t check_len = BL2_SIZE < flash_size ? BL2_SIZE : flash_size;
+    const char* sig = "Microsoft";
+    size_t sig_len = 9;
+    for (uint32_t i = 0; i + sig_len <= check_len; i++) {
+        if (memcmp(flash + i, sig, sig_len) == 0)
+            return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // scan_and_dump_kernel — scan guest RAM for a valid PE image and write it to
@@ -331,34 +391,47 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
     }
 
     // --- Decrypt and load the 2BL ---
+    bool pre_decrypted = false;
     if (have_key) {
-        // Copy 2BL from flash offset 0 into RAM at BL2_LOAD_ADDR
-        if (BL2_LOAD_ADDR + BL2_SIZE <= GUEST_RAM_SIZE) {
-            memcpy(sys.exec->ram + BL2_LOAD_ADDR,
-                   sys.hw->flash.data, BL2_SIZE);
-            // RC4-decrypt the 2BL in-place
-            rc4_crypt(rc4_key, MCPX_KEY_LEN,
-                      sys.exec->ram + BL2_LOAD_ADDR, BL2_SIZE);
+        // Check if the BIOS is already decrypted (copyright string visible)
+        if (is_bios_pre_decrypted(sys.hw->flash.data, FLASH_SIZE)) {
+            say("[boot] BIOS appears pre-decrypted (copyright string found) — skipping RC4");
+            pre_decrypted = true;
+        } else {
+            // Copy 2BL from flash offset 0 into RAM at BL2_LOAD_ADDR
+            if (BL2_LOAD_ADDR + BL2_SIZE <= GUEST_RAM_SIZE) {
+                memcpy(sys.exec->ram + BL2_LOAD_ADDR,
+                       sys.hw->flash.data, BL2_SIZE);
+                // RC4-decrypt the 2BL in-place
+                rc4_crypt(rc4_key, MCPX_KEY_LEN,
+                          sys.exec->ram + BL2_LOAD_ADDR, BL2_SIZE);
 
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "[boot] 2BL decrypted: first bytes %02X %02X %02X %02X at 0x%08X",
-                     sys.exec->ram[BL2_LOAD_ADDR + 0],
-                     sys.exec->ram[BL2_LOAD_ADDR + 1],
-                     sys.exec->ram[BL2_LOAD_ADDR + 2],
-                     sys.exec->ram[BL2_LOAD_ADDR + 3],
-                     BL2_LOAD_ADDR);
-            say(msg);
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "[boot] 2BL decrypted: first bytes %02X %02X %02X %02X at 0x%08X",
+                         sys.exec->ram[BL2_LOAD_ADDR + 0],
+                         sys.exec->ram[BL2_LOAD_ADDR + 1],
+                         sys.exec->ram[BL2_LOAD_ADDR + 2],
+                         sys.exec->ram[BL2_LOAD_ADDR + 3],
+                         BL2_LOAD_ADDR);
+                say(msg);
 
-            // Check if decryption produced valid code (first byte should not be 0xCC/0xFF)
-            uint8_t first = sys.exec->ram[BL2_LOAD_ADDR];
-            if (first == 0xCC || first == 0xFF || first == 0x00) {
-                say("[boot] WARNING: decrypted 2BL starts with suspicious byte — wrong key?");
+                // Check if decryption produced valid code
+                uint8_t first = sys.exec->ram[BL2_LOAD_ADDR];
+                if (first == 0xCC || first == 0xFF || first == 0x00) {
+                    say("[boot] WARNING: decrypted 2BL starts with suspicious byte — wrong key?");
+                }
             }
         }
     } else {
-        say("[boot] No RC4 key — 2BL is still encrypted.");
-        say("[boot] Provide --rc4-key <key.bin> or --mcpx <mcpx.bin> for full LLE boot.");
+        // No key provided — check if BIOS is pre-decrypted
+        if (is_bios_pre_decrypted(sys.hw->flash.data, FLASH_SIZE)) {
+            say("[boot] No RC4 key, but BIOS appears pre-decrypted — will boot from flash");
+            pre_decrypted = true;
+        } else {
+            say("[boot] No RC4 key — 2BL is still encrypted.");
+            say("[boot] Provide --rc4-key <key.bin> or --mcpx <mcpx.bin> for full LLE boot.");
+        }
     }
 
     // Real-mode prologue → protected mode
@@ -368,7 +441,23 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
     }
 
     char msg[256];
-    if (have_key) {
+    if (pre_decrypted) {
+        // Pre-decrypted BIOS: find the 2BL code entry in flash and execute
+        // from the flash-mapped address (MMIO code fetch).
+        uint32_t entry_off = find_2bl_code_entry(sys.hw->flash.data, FLASH_SIZE);
+        if (entry_off == 0) {
+            say("[boot] Could not find 2BL code entry in pre-decrypted BIOS");
+            return false;
+        }
+        // Flash maps at both FLASH_BASE and BIOS_BASE; use FLASH_BASE for simplicity.
+        uint32_t entry_addr = FLASH_BASE + entry_off;
+        sys.entry_eip = entry_addr;
+        // Set up stack in low RAM (the 2BL will set up its own eventually)
+        sys.exec->ctx.gp[GP_ESP] = 0x00090000;
+        snprintf(msg, sizeof(msg),
+                 "[boot] Pre-decrypted BIOS: 2BL code at flash+0x%X -> EIP=0x%08X",
+                 entry_off, entry_addr);
+    } else if (have_key) {
         // Skip MCPX ROM — jump directly to decrypted 2BL
         sys.entry_eip = BL2_LOAD_ADDR;
         // Set up minimal CPU state that the 2BL expects:
@@ -383,7 +472,7 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
     }
     say(msg);
 
-    if (!have_key) sys.entry_eip = sys.exec->ctx.eip;
+    if (!have_key && !pre_decrypted) sys.entry_eip = sys.exec->ctx.eip;
     sys.running = true;
     return true;
 }
