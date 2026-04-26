@@ -87,6 +87,9 @@ struct alignas(16) GuestContext {
     uint64_t  mtrr_fix4k[8]    = {};  // MSR_MTRR_FIX4K_BASE–END
     uint64_t  mtrr_def_type    = 0x00000006; // MSR_MTRR_DEF_TYPE (default = WB)
 
+    // Debug registers (DR0–DR3 = breakpoint addresses, DR6 = status, DR7 = control)
+    uint32_t  dr[8] = {};  // DR0–DR7
+
     // Task register and LDT selector (set by LTR / LLDT, read by STR / SLDT)
     uint16_t  tr_sel   = 0;  // Task Register selector
     uint16_t  ldtr_sel = 0;  // LDT Register selector

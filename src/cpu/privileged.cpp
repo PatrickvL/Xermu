@@ -255,18 +255,18 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_LGDT: {
         // LGDT [mem] — load GDT base+limit from 6-byte memory operand
         if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            // Base register handling (simplified)
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
             }
-            if (ea + 6 <= GUEST_RAM_SIZE) {
-                memcpy(&ctx.gdtr_limit, ram + ea, 2);
-                memcpy(&ctx.gdtr_base,  ram + ea + 2, 4);
+            if (pa + 6 <= GUEST_RAM_SIZE) {
+                memcpy(&ctx.gdtr_limit, ram + pa, 2);
+                memcpy(&ctx.gdtr_base,  ram + pa + 2, 4);
+            } else if (ctx.mmio) {
+                ctx.gdtr_limit = (uint16_t)ctx.mmio->read(pa, 2);
+                ctx.gdtr_base  = ctx.mmio->read(pa + 2, 4);
             }
         }
         ctx.eip += insn.length;
@@ -275,17 +275,18 @@ void Executor::handle_privileged() {
 
     case ZYDIS_MNEMONIC_LIDT: {
         if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
             }
-            if (ea + 6 <= GUEST_RAM_SIZE) {
-                memcpy(&ctx.idtr_limit, ram + ea, 2);
-                memcpy(&ctx.idtr_base,  ram + ea + 2, 4);
+            if (pa + 6 <= GUEST_RAM_SIZE) {
+                memcpy(&ctx.idtr_limit, ram + pa, 2);
+                memcpy(&ctx.idtr_base,  ram + pa + 2, 4);
+            } else if (ctx.mmio) {
+                ctx.idtr_limit = (uint16_t)ctx.mmio->read(pa, 2);
+                ctx.idtr_base  = ctx.mmio->read(pa + 2, 4);
             }
         }
         ctx.eip += insn.length;
@@ -300,17 +301,16 @@ void Executor::handle_privileged() {
             if (guest_reg_enc(ops[0].reg.value, enc))
                 sel = (uint16_t)ctx.gp[enc];
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
             }
-            if (ea + 2 <= GUEST_RAM_SIZE) {
-                memcpy(&sel, ram + ea, 2);
-            }
+            if (pa + 2 <= GUEST_RAM_SIZE)
+                memcpy(&sel, ram + pa, 2);
+            else if (ctx.mmio)
+                sel = (uint16_t)ctx.mmio->read(pa, 2);
         }
         ctx.ldtr_sel = sel;
         ctx.eip += insn.length;
@@ -325,17 +325,16 @@ void Executor::handle_privileged() {
             if (guest_reg_enc(ops[0].reg.value, enc))
                 sel = (uint16_t)ctx.gp[enc];
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, false);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 0); return; }
             }
-            if (ea + 2 <= GUEST_RAM_SIZE) {
-                memcpy(&sel, ram + ea, 2);
-            }
+            if (pa + 2 <= GUEST_RAM_SIZE)
+                memcpy(&sel, ram + pa, 2);
+            else if (ctx.mmio)
+                sel = (uint16_t)ctx.mmio->read(pa, 2);
         }
         ctx.tr_sel = sel;
         ctx.eip += insn.length;
@@ -349,17 +348,17 @@ void Executor::handle_privileged() {
             if (guest_reg_enc(ops[0].reg.value, enc))
                 ctx.gp[enc] = ctx.ldtr_sel;
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
             }
-            if (ea + 2 <= GUEST_RAM_SIZE) {
+            if (pa + 2 <= GUEST_RAM_SIZE) {
                 uint16_t v = ctx.ldtr_sel;
-                memcpy(ram + ea, &v, 2);
+                memcpy(ram + pa, &v, 2);
+            } else if (ctx.mmio) {
+                ctx.mmio->write(pa, ctx.ldtr_sel, 2);
             }
         }
         ctx.eip += insn.length;
@@ -373,17 +372,17 @@ void Executor::handle_privileged() {
             if (guest_reg_enc(ops[0].reg.value, enc))
                 ctx.gp[enc] = ctx.tr_sel;
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
             }
-            if (ea + 2 <= GUEST_RAM_SIZE) {
+            if (pa + 2 <= GUEST_RAM_SIZE) {
                 uint16_t v = ctx.tr_sel;
-                memcpy(ram + ea, &v, 2);
+                memcpy(ram + pa, &v, 2);
+            } else if (ctx.mmio) {
+                ctx.mmio->write(pa, ctx.tr_sel, 2);
             }
         }
         ctx.eip += insn.length;
@@ -393,17 +392,18 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_SGDT: {
         // SGDT [mem] — store GDT base+limit to 6-byte memory operand
         if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
             }
-            if (ea + 6 <= GUEST_RAM_SIZE) {
-                memcpy(ram + ea, &ctx.gdtr_limit, 2);
-                memcpy(ram + ea + 2, &ctx.gdtr_base, 4);
+            if (pa + 6 <= GUEST_RAM_SIZE) {
+                memcpy(ram + pa, &ctx.gdtr_limit, 2);
+                memcpy(ram + pa + 2, &ctx.gdtr_base, 4);
+            } else if (ctx.mmio) {
+                ctx.mmio->write(pa, ctx.gdtr_limit, 2);
+                ctx.mmio->write(pa + 2, ctx.gdtr_base, 4);
             }
         }
         ctx.eip += insn.length;
@@ -413,17 +413,18 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_SIDT: {
         // SIDT [mem] — store IDT base+limit to 6-byte memory operand
         if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
+            uint32_t ea = compute_ea(ops[0], ctx);
+            uint32_t pa = ea;
+            if (paging_enabled()) {
+                pa = translate_va(ea, true);
+                if (pa == ~0u) { deliver_interrupt(14, ctx.eip, true, 2); return; }
             }
-            if (ea + 6 <= GUEST_RAM_SIZE) {
-                memcpy(ram + ea, &ctx.idtr_limit, 2);
-                memcpy(ram + ea + 2, &ctx.idtr_base, 4);
+            if (pa + 6 <= GUEST_RAM_SIZE) {
+                memcpy(ram + pa, &ctx.idtr_limit, 2);
+                memcpy(ram + pa + 2, &ctx.idtr_base, 4);
+            } else if (ctx.mmio) {
+                ctx.mmio->write(pa, ctx.idtr_limit, 2);
+                ctx.mmio->write(pa + 2, ctx.idtr_base, 4);
             }
         }
         ctx.eip += insn.length;
@@ -472,6 +473,46 @@ void Executor::handle_privileged() {
             gp = gp_index(ops[0].reg.value);
             if (cr && gp >= 0) {
                 ctx.gp[gp] = *cr;
+                ctx.eip += insn.length;
+                return;
+            }
+        }
+
+        // MOV DRn, r32 / MOV r32, DRn — debug registers.
+        auto dr_index = [](ZydisRegister r) -> int {
+            switch (r) {
+            case ZYDIS_REGISTER_DR0: return 0;
+            case ZYDIS_REGISTER_DR1: return 1;
+            case ZYDIS_REGISTER_DR2: return 2;
+            case ZYDIS_REGISTER_DR3: return 3;
+            case ZYDIS_REGISTER_DR4: return 4; // alias for DR6 when CR4.DE=0
+            case ZYDIS_REGISTER_DR5: return 5; // alias for DR7 when CR4.DE=0
+            case ZYDIS_REGISTER_DR6: return 6;
+            case ZYDIS_REGISTER_DR7: return 7;
+            default: return -1;
+            }
+        };
+
+        // MOV DRn, r32
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            int di = dr_index(ops[0].reg.value);
+            int gp = gp_index(ops[1].reg.value);
+            if (di >= 0 && gp >= 0) {
+                // DR4/DR5 alias to DR6/DR7 when CR4.DE (bit 3) is clear
+                if (di == 4 && !(ctx.cr4 & 8)) di = 6;
+                if (di == 5 && !(ctx.cr4 & 8)) di = 7;
+                ctx.dr[di] = ctx.gp[gp];
+                ctx.eip += insn.length;
+                return;
+            }
+            // MOV r32, DRn
+            di = dr_index(ops[1].reg.value);
+            gp = gp_index(ops[0].reg.value);
+            if (di >= 0 && gp >= 0) {
+                if (di == 4 && !(ctx.cr4 & 8)) di = 6;
+                if (di == 5 && !(ctx.cr4 & 8)) di = 7;
+                ctx.gp[gp] = ctx.dr[di];
                 ctx.eip += insn.length;
                 return;
             }
@@ -563,16 +604,18 @@ void Executor::handle_privileged() {
     case ZYDIS_MNEMONIC_INVLPG: {
         // INVLPG m — invalidate TLB entry for the page containing EA.
         if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            uint32_t ea = 0;
-            if (ops[0].mem.disp.has_displacement)
-                ea = (uint32_t)ops[0].mem.disp.value;
-            if (ops[0].mem.base != ZYDIS_REGISTER_NONE) {
-                uint8_t enc;
-                if (reg32_enc(ops[0].mem.base, enc))
-                    ea += ctx.gp[enc];
-            }
+            uint32_t ea = compute_ea(ops[0], ctx);
             tlb.flush_va(ea);
         }
+        ctx.eip += insn.length;
+        return;
+    }
+
+    case ZYDIS_MNEMONIC_RDPMC: {
+        // RDPMC: read performance counter ECX into EDX:EAX.
+        // Xbox kernel initialises PMCs but doesn't depend on values.
+        ctx.gp[GP_EAX] = 0;
+        ctx.gp[GP_EDX] = 0;
         ctx.eip += insn.length;
         return;
     }
