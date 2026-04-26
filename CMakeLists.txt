@@ -138,6 +138,7 @@ set(TEST_ASM_FILES
     tests/xbox_io.asm
     tests/fastmem.asm
     tests/smc_stress.asm
+    tests/div_error.asm
 )
 
 if(NASM_EXECUTABLE)

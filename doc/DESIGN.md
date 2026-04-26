@@ -1839,6 +1839,31 @@ reservation fails.  All paths use the same VEH-based MMIO dispatch.
   aliasing.
 - Trace linking between direct-branch targets — already done in §5.21.
 
+#### 5.24 #DE (Divide Error) Exception Delivery ✅ DONE
+
+Guest DIV/IDIV instructions that fault (division by zero or quotient overflow)
+raise `EXCEPTION_INT_DIVIDE_BY_ZERO` on the host.  The VEH handler intercepts
+this *before* access-violation handling:
+
+1. **Verify RIP is in code cache** — if not, propagate (`CONTINUE_SEARCH`).
+2. **Find owning trace** — scan `TraceCache` for the trace whose host code range
+   contains RIP.  Invalidated traces are *not* skipped because SMC can mark a
+   trace invalid while its DIV is still executing.
+3. **Map host RIP → guest EIP** — scan the trace's `mem_sites[]` for a site whose
+   `host_offset` is within 8 bytes of the faulting RIP offset (DIV/IDIV are
+   recorded via `add_mem_site` even for register-only operands).
+4. **Signal the run loop** — write `STOP_DIVIDE_ERROR` and `next_eip = guest_eip`
+   into `GuestContext` (via R13), redirect RIP to the `exception_exit` stub
+   (save-all-GP + RET) on the shared MMIO helper page.
+5. **Run loop delivers vector 0** — `deliver_interrupt(0, ctx.eip)` pushes
+   EFLAGS/CS/EIP onto the guest stack and transfers to the IDT handler.
+
+`StopReason` enum extended: `STOP_DIVIDE_ERROR = 3`.
+
+Test: `tests/div_error.asm` — 3 assertions: DIV ECX/0, IDIV ECX/0, DIV CX/0
+(16-bit).  Each #DE fires a guest ISR that increments a counter and uses a
+skip table to resume after the faulting instruction via IRETD.
+
 ---
 
 ## 6. Bugs Fixed During Development

@@ -103,6 +103,7 @@ struct MmioHelpers {
     uint8_t* read_helpers[8][3]  = {};  // [reg_enc][size_idx]  size_idx: 0=1B, 1=2B, 2=4B
     uint8_t* write_helpers[8][3] = {};  // [reg_enc][size_idx]
     uint8_t* write_imm_tails[3]  = {};  // [size_idx]  (thunks JMP here)
+    uint8_t* exception_exit      = nullptr;  // save_all_gp + RET — VEH redirects here
 
     uint8_t* lookup_read(uint8_t reg_enc, uint8_t size_bytes) const {
         int si = (size_bytes <= 1) ? 0 : (size_bytes == 2) ? 1 : 2;

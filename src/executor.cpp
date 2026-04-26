@@ -15,13 +15,71 @@
 LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     if (!g_active_executor) return EXCEPTION_CONTINUE_SEARCH;
 
-    // Only handle access violations.
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+    auto  code = ep->ExceptionRecord->ExceptionCode;
+    auto* ctx_regs = ep->ContextRecord;
+    auto* exec = g_active_executor;
+
+    // -----------------------------------------------------------------------
+    // #DE (divide-by-zero): DIV/IDIV executed natively on host faulted.
+    // Map back to guest EIP, set STOP_DIVIDE_ERROR, redirect to exit stub.
+    // -----------------------------------------------------------------------
+    if (code == EXCEPTION_INT_DIVIDE_BY_ZERO) {
+        auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
+        if (!exec->cc.contains(rip))
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        Trace* t = nullptr;
+        {
+            auto& tcache = exec->tcache;
+            for (size_t p = 0; p < TraceCache::L1_SIZE; ++p) {
+                auto* page = tcache.page_map[p];
+                if (!page) continue;
+                for (size_t s = 0; s < TraceCache::L2_SIZE; ++s) {
+                    Trace* tr = page->slots[s];
+                    // Include invalid traces: host code is still in-cache and
+                    // may have been executing when the #DE occurred.
+                    if (!tr || !tr->host_code) continue;
+                    if (rip >= tr->host_code && rip < tr->host_code + tr->host_size) {
+                        t = tr;
+                        break;
+                    }
+                }
+                if (t) break;
+            }
+        }
+        if (!t) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        uint32_t rip_off = (uint32_t)(rip - t->host_code);
+        uint32_t guest_eip = 0;
+        bool found = false;
+        for (int i = 0; i < t->num_mem_sites; ++i) {
+            if (rip_off >= t->mem_sites[i].host_offset &&
+                rip_off <  t->mem_sites[i].host_offset + 8) {
+                guest_eip = t->mem_sites[i].guest_eip;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return EXCEPTION_CONTINUE_SEARCH;
+
+        // Write stop_reason and next_eip into GuestContext via R13.
+        auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
+        gctx->next_eip    = guest_eip;
+        gctx->stop_reason  = STOP_DIVIDE_ERROR;
+
+        // Redirect to exception_exit stub (save_all_gp + RET).
+        ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
+        ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Only handle access violations below this point.
+    if (code != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    auto* ctx_regs = ep->ContextRecord;
-    auto  fault_addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
-    auto* exec = g_active_executor;
+    auto fault_addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
 
     // Step 1: Is the fault within the fastmem window?
     auto base = (uintptr_t)exec->ctx.fastmem_base;
@@ -1327,6 +1385,13 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             // Full error code computation would check P, W/R, U/S bits;
             // for now use 0 (not-present supervisor read).
             deliver_interrupt(14, ctx.eip, /*has_error=*/true, /*error_code=*/0);
+            continue;
+        }
+
+        // Divide-by-zero (#DE, vector 0): VEH caught host EXCEPTION_INT_DIVIDE_BY_ZERO.
+        if (ctx.stop_reason == STOP_DIVIDE_ERROR) {
+            prev_trace = nullptr;
+            deliver_interrupt(0, ctx.eip);
             continue;
         }
 

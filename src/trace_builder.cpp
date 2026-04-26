@@ -853,7 +853,14 @@ bool emit_handler_alu_mem(Emitter& e, const ZydisDecodedInstruction& insn,
             // substituted for ESP, then store R14 back if ESP was written.
             return emit_alu_esp_reg(e, insn, ops, raw);
         }
-        return emit_clean_insn(e, insn, ops, raw);
+        // DIV/IDIV can raise #DE at runtime.  Record a mem_site so the VEH
+        // can map the host fault address back to the guest EIP.
+        bool is_div = (insn.mnemonic == ZYDIS_MNEMONIC_DIV ||
+                       insn.mnemonic == ZYDIS_MNEMONIC_IDIV);
+        uint32_t insn_start = (uint32_t)e.pos;
+        emit_clean_insn(e, insn, ops, raw);
+        if (is_div) e.add_mem_site(insn_start, e.fault_eip);
+        return true;
     }
 
     // Memory form: compute EA, bounds check, rewrite for fastmem
@@ -2016,6 +2023,16 @@ void generate_mmio_helpers(uint8_t* page, size_t page_cap, MmioHelpers& out) {
     for (int si = 0; si < 3; ++si) {
         out.write_imm_tails[si] = emit_helper_entry(
             0, sizes[si], /*is_load=*/false, /*is_write_imm=*/true);
+    }
+
+    // --- exception exit stub ---
+    // VEH redirects RIP here when a synchronous fault (e.g. #DE) occurs
+    // mid-trace.  Saves all guest GP regs and returns to dispatch_trace
+    // which will read stop_reason + next_eip set by the VEH handler.
+    {
+        out.exception_exit = e.cur();
+        emit_save_all_gp(e);
+        e.emit8(0xC3); // RET
     }
 
     fprintf(stderr, "[mmio] generated %zu bytes of helpers in %zu-byte page\n",

@@ -5,9 +5,11 @@
 
 // Stop-reason codes: written by JIT into ctx->stop_reason, read by run loop.
 enum StopReason : uint32_t {
-    STOP_NONE       = 0,  // normal trace exit
-    STOP_PRIVILEGED = 1,  // trace hit a privileged instruction (HLT/IN/OUT/...)
-    STOP_PAGE_FAULT = 2,  // VA→PA translation failed; CR2 set, run loop delivers #PF
+    STOP_NONE           = 0,  // normal trace exit
+    STOP_PRIVILEGED     = 1,  // trace hit a privileged instruction (HLT/IN/OUT/...)
+    STOP_PAGE_FAULT     = 2,  // VA→PA translation failed; CR2 set, run loop delivers #PF
+    STOP_DIVIDE_ERROR   = 3,  // DIV/IDIV #DE — VEH caught host divide fault
+    STOP_INVALID_OPCODE = 4,  // #UD — trace builder couldn't translate the instruction
 };
 
 // Host reserved registers during trace execution:
