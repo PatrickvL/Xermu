@@ -102,25 +102,29 @@ static constexpr uint8_t  HLE_INT_VECTOR      = 0x20; // INT 20h = HLE trap
 
 // Each HLE stub is 8 bytes:   MOV EAX, ordinal (5 bytes) + INT 0x20 (2 bytes) + RET (1 byte)
 static constexpr uint32_t HLE_STUB_SIZE  = 8;
-static constexpr uint32_t HLE_STUB_BASE  = 0x00080000u; // guest PA for stub table
 
-// Kernel data exports area â€” data variables the XBE reads by pointer
-// Located after HLE stubs (which end at HLE_STUB_BASE + 379*8 = 0x80BD8)
-static constexpr uint32_t KDATA_BASE     = 0x00081000u;
+// Default base addresses for HLE stubs and kernel data exports.
+// These are recalculated by load_xbe() to sit above the XBE image so they
+// never overlap with any section.  The defaults are only used by tests that
+// don't load a full XBE.
+inline uint32_t HLE_STUB_BASE  = 0x00080000u;
+inline uint32_t KDATA_BASE     = 0x00081000u;
 
-// Layout of kernel data area at KDATA_BASE:
-//   +0x000: KeTickCount (ULONG = 4 bytes)
-//   +0x004: XboxHardwareInfo (Flags:ULONG + GpuRevision:UCHAR + McpRevision:UCHAR + pad:UCHAR[2] = 8 bytes)
-//   +0x00C: XboxKrnlVersion (Major:USHORT + Minor:USHORT + Build:USHORT + Qfe:USHORT = 8 bytes)
-//   +0x014: LaunchDataPage (ULONG = 4 bytes, a pointer â€” 0 = none)
-//   +0x018: XeImageFileName (ANSI_STRING: Length:USHORT + MaxLength:USHORT + Buffer:ULONG = 8 bytes)
-//   +0x020: XeImageFileName buffer (up to 256 bytes)
-static constexpr uint32_t KDATA_KeTickCount        = KDATA_BASE + 0x000;
-static constexpr uint32_t KDATA_XboxHardwareInfo   = KDATA_BASE + 0x004;
-static constexpr uint32_t KDATA_XboxKrnlVersion    = KDATA_BASE + 0x00C;
-static constexpr uint32_t KDATA_LaunchDataPage     = KDATA_BASE + 0x014;
-static constexpr uint32_t KDATA_XeImageFileName    = KDATA_BASE + 0x018;
-static constexpr uint32_t KDATA_XeImageFileNameBuf = KDATA_BASE + 0x020;
+// Kernel data area layout (offsets from KDATA_BASE)
+static constexpr uint32_t KDATA_OFF_KeTickCount        = 0x000;
+static constexpr uint32_t KDATA_OFF_XboxHardwareInfo   = 0x004;
+static constexpr uint32_t KDATA_OFF_XboxKrnlVersion    = 0x00C;
+static constexpr uint32_t KDATA_OFF_LaunchDataPage     = 0x014;
+static constexpr uint32_t KDATA_OFF_XeImageFileName    = 0x018;
+static constexpr uint32_t KDATA_OFF_XeImageFileNameBuf = 0x020;
+
+// Convenience accessors (use current KDATA_BASE)
+inline uint32_t KDATA_KeTickCount()        { return KDATA_BASE + KDATA_OFF_KeTickCount; }
+inline uint32_t KDATA_XboxHardwareInfo()   { return KDATA_BASE + KDATA_OFF_XboxHardwareInfo; }
+inline uint32_t KDATA_XboxKrnlVersion()    { return KDATA_BASE + KDATA_OFF_XboxKrnlVersion; }
+inline uint32_t KDATA_LaunchDataPage()     { return KDATA_BASE + KDATA_OFF_LaunchDataPage; }
+inline uint32_t KDATA_XeImageFileName()    { return KDATA_BASE + KDATA_OFF_XeImageFileName; }
+inline uint32_t KDATA_XeImageFileNameBuf() { return KDATA_BASE + KDATA_OFF_XeImageFileNameBuf; }
 
 // Forward declarations (defined after KernelOrdinal enum below)
 inline uint32_t kernel_data_addr(uint32_t ordinal);
@@ -148,10 +152,13 @@ inline uint32_t hle_stub_addr(uint32_t ordinal) {
 struct XbeInfo {
     uint32_t entry_point;       // decoded entry point VA
     uint32_t base_address;      // image base
+    uint32_t image_size;        // from header (size_of_image)
     uint32_t stack_size;        // from header
     uint32_t kernel_thunk_va;   // decoded kernel thunk VA
     uint32_t num_sections;
     uint32_t tls_addr;          // VA of TLS directory (0 if none)
+    uint32_t hle_stub_base;     // where HLE stubs were placed
+    uint32_t kdata_base;        // where kernel data exports were placed
     bool     valid;
 };
 
@@ -260,6 +267,18 @@ inline XbeInfo load_xbe(uint8_t* ram, const uint8_t* file_data, size_t file_size
         printf("[xbe] Section %u: VA=0x%08X  VSize=0x%08X  RawOff=0x%08X  RawSz=0x%08X  Flags=0x%X\n",
                i, va, vsz, roff, rsz, sec.flags);
     }
+
+    // Place HLE stubs and kernel data above the XBE image to avoid overlap.
+    uint32_t stubs_needed = MAX_KERNEL_ORDINALS * HLE_STUB_SIZE; // ~3 KB
+    uint32_t hle_base = (image_end + 0xFFFu) & ~0xFFFu;         // page-align
+    if (hle_base + stubs_needed + 0x1000 < GUEST_RAM_SIZE) {
+        HLE_STUB_BASE = hle_base;
+        KDATA_BASE    = (hle_base + stubs_needed + 0xFFFu) & ~0xFFFu;
+    }
+    info.hle_stub_base = HLE_STUB_BASE;
+    info.kdata_base    = KDATA_BASE;
+
+    printf("[xbe] HLE stubs at 0x%08X  KDATA at 0x%08X\n", HLE_STUB_BASE, KDATA_BASE);
 
     // Write HLE stub table
     write_hle_stubs(ram);

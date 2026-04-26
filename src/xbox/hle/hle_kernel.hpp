@@ -209,11 +209,11 @@ enum KernelOrdinal : uint32_t {
 // Returns the guest VA for a data export ordinal, or 0 if it's not a data export
 inline uint32_t kernel_data_addr(uint32_t ordinal) {
     switch (ordinal) {
-    case ORD_KeTickCount:       return KDATA_KeTickCount;
-    case ORD_XboxHardwareInfo:  return KDATA_XboxHardwareInfo;
-    case ORD_XboxKrnlVersion:   return KDATA_XboxKrnlVersion;
-    case ORD_LaunchDataPage:    return KDATA_LaunchDataPage;
-    case ORD_XeImageFileName:   return KDATA_XeImageFileName;
+    case ORD_KeTickCount:       return KDATA_KeTickCount();
+    case ORD_XboxHardwareInfo:  return KDATA_XboxHardwareInfo();
+    case ORD_XboxKrnlVersion:   return KDATA_XboxKrnlVersion();
+    case ORD_LaunchDataPage:    return KDATA_LaunchDataPage();
+    case ORD_XeImageFileName:   return KDATA_XeImageFileName();
     default:                    return 0;
     }
 }
@@ -225,31 +225,31 @@ inline void init_kernel_data(uint8_t* ram) {
 
     // KeTickCount: start at 1
     uint32_t tick = 1;
-    memcpy(ram + KDATA_KeTickCount, &tick, 4);
+    memcpy(ram + KDATA_KeTickCount(), &tick, 4);
 
     // XboxHardwareInfo: Flags=0x20 (INTERNAL_USB_HUB), GpuRevision=0xA1, McpRevision=0xD4
     uint32_t hw_flags = 0x00000020u;
-    memcpy(ram + KDATA_XboxHardwareInfo, &hw_flags, 4);
-    ram[KDATA_XboxHardwareInfo + 4] = 0xA1; // GPU revision (NV2A A1)
-    ram[KDATA_XboxHardwareInfo + 5] = 0xD4; // MCP revision (X3)
+    memcpy(ram + KDATA_XboxHardwareInfo(), &hw_flags, 4);
+    ram[KDATA_XboxHardwareInfo() + 4] = 0xA1; // GPU revision (NV2A A1)
+    ram[KDATA_XboxHardwareInfo() + 5] = 0xD4; // MCP revision (X3)
 
     // XboxKrnlVersion: 1.0.5838.1
     uint16_t ver[4] = { 1, 0, 5838, 1 };
-    memcpy(ram + KDATA_XboxKrnlVersion, ver, 8);
+    memcpy(ram + KDATA_XboxKrnlVersion(), ver, 8);
 
     // LaunchDataPage: NULL (no launch data)
     uint32_t null_ptr = 0;
-    memcpy(ram + KDATA_LaunchDataPage, &null_ptr, 4);
+    memcpy(ram + KDATA_LaunchDataPage(), &null_ptr, 4);
 
     // XeImageFileName: "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe"
     const char* img_name = "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe";
     uint16_t name_len = (uint16_t)strlen(img_name);
     uint16_t max_len = name_len + 1;
-    memcpy(ram + KDATA_XeImageFileName, &name_len, 2);
-    memcpy(ram + KDATA_XeImageFileName + 2, &max_len, 2);
-    uint32_t buf_addr = KDATA_XeImageFileNameBuf;
-    memcpy(ram + KDATA_XeImageFileName + 4, &buf_addr, 4);
-    memcpy(ram + KDATA_XeImageFileNameBuf, img_name, name_len + 1);
+    memcpy(ram + KDATA_XeImageFileName(), &name_len, 2);
+    memcpy(ram + KDATA_XeImageFileName() + 2, &max_len, 2);
+    uint32_t buf_addr = KDATA_XeImageFileNameBuf();
+    memcpy(ram + KDATA_XeImageFileName() + 4, &buf_addr, 4);
+    memcpy(ram + KDATA_XeImageFileNameBuf(), img_name, name_len + 1);
 }
 
 // Simple bump allocator for guest heap (contiguous memory requests)
