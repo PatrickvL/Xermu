@@ -33,7 +33,7 @@ struct Emitter {
         uint32_t guest_eip;
         uint8_t  patch_len;
     };
-    static constexpr int MAX_MEM_SITES = 64;
+    static constexpr int MAX_MEM_SITES = 256;
     MemSite mem_sites[MAX_MEM_SITES] = {};
     int num_mem_sites = 0;
 

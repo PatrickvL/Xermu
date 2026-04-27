@@ -37,7 +37,7 @@ struct Trace {
     // instruction bytes to derive (direction, reg, size), selects a pre-generated
     // helper, and overwrites the region with CALL rel32 + NOP fill.
     // Non-patchable sites (ALU/FPU/SSE) have patch_len == 0.
-    static constexpr int MAX_MEM_SITES = 64;
+    static constexpr int MAX_MEM_SITES = 256;
     struct MemOpSite {
         uint32_t host_offset;   // offset of patchable region from host_code
         uint32_t guest_eip;     // guest instruction EIP

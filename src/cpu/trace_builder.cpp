@@ -1541,6 +1541,12 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             emit_epilog_static(e, guest_pc);
             done_flag = true;
         }
+        // Stop the trace if mem_sites table is getting full (leave headroom
+        // for the next instruction which may record multiple sites).
+        if (!done_flag && e.num_mem_sites >= Emitter::MAX_MEM_SITES - 8) {
+            emit_epilog_static(e, guest_pc);
+            done_flag = true;
+        }
     }
 
     if (!done_flag)

@@ -190,6 +190,8 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     }
 
     // Step 4: Look up the MemOpSite for this faulting instruction.
+    // First try exact match, then try range match (the fault may occur a few
+    // bytes into the recorded patchable region due to prefix bytes).
     uint32_t rip_off = (uint32_t)(rip - faulting_trace->host_code);
     Trace::MemOpSite* site = nullptr;
     for (int i = 0; i < faulting_trace->num_mem_sites; ++i) {
@@ -198,10 +200,31 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
             break;
         }
     }
+    if (!site) {
+        // Range match: the faulting RIP is within the patchable region.
+        // This handles cases where prefix bytes (0x66, REX) precede the
+        // actual memory access, or non-patchable rewrites where the offset
+        // is approximate.
+        for (int i = 0; i < faulting_trace->num_mem_sites; ++i) {
+            auto& ms = faulting_trace->mem_sites[i];
+            uint32_t end = ms.host_offset + (ms.patch_len ? ms.patch_len : 16);
+            if (rip_off >= ms.host_offset && rip_off < end) {
+                site = &ms;
+                break;
+            }
+        }
+    }
 
     if (!site) {
-        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP %p\n",
-                faulting_trace->guest_eip, (void*)rip);
+        fprintf(stderr, "[veh] FAULT in trace @%08X — no mem site for RIP %p (off=%u, %d sites)\n",
+                faulting_trace->guest_eip, (void*)rip, rip_off,
+                faulting_trace->num_mem_sites);
+        // Dump all mem sites for debugging
+        for (int i = 0; i < faulting_trace->num_mem_sites; ++i) {
+            auto& ms = faulting_trace->mem_sites[i];
+            fprintf(stderr, "  site[%d]: host_off=%u guest_eip=%08X patch_len=%d\n",
+                    i, ms.host_offset, ms.guest_eip, ms.patch_len);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
