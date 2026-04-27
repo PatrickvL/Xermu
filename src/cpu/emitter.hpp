@@ -683,24 +683,34 @@ inline void emit_call_abs(Emitter& e, const void* target) {
 }
 
 // ---------------------------------------------------------------------------
-// Sub/Add DWORD PTR [R13 + offset], imm8
+// Sub/Add DWORD PTR [R13 + offset], imm8 — flag-preserving.
+//
+// Real x86 PUSH/POP/CALL/RET do NOT modify flags, but the host ADD/SUB we
+// use to adjust ctx->gp[ESP] would clobber host RFLAGS (which carry the
+// guest flags during trace execution).  Bracket the arithmetic with
+// PUSHFQ/POPFQ so guest EFLAGS is preserved exactly.
+//
 //   REX.B=1: 0x41, 0x83, ModRM, disp8, imm8
 //   ModRM for SUB: mod=01 reg=5(SUB) rm=5(R13&7) = 01_101_101 = 0x6D
 //   ModRM for ADD: mod=01 reg=0(ADD) rm=5(R13&7) = 01_000_101 = 0x45
 // ---------------------------------------------------------------------------
 
 inline void emit_sub_ctx_esp(Emitter& e, uint8_t amount) {
+    e.emit8(0x9C); // PUSHFQ — save guest EFLAGS
     e.emit8(REX_B); e.emit8(0x83);
     e.emit8(0x6D); // SUB [R13+?]
     e.emit8(gp_offset(GP_ESP));
     e.emit8(amount);
+    e.emit8(0x9D); // POPFQ — restore guest EFLAGS
 }
 
 inline void emit_add_ctx_esp(Emitter& e, uint8_t amount) {
+    e.emit8(0x9C); // PUSHFQ — save guest EFLAGS
     e.emit8(REX_B); e.emit8(0x83);
     e.emit8(0x45); // ADD [R13+?]
     e.emit8(gp_offset(GP_ESP));
     e.emit8(amount);
+    e.emit8(0x9D); // POPFQ — restore guest EFLAGS
 }
 
 // Load ctx->esp into R14D:

@@ -31,8 +31,8 @@ static constexpr uint32_t STACK_VA = 0x80400000u;
 // Set up nboxkrnl-compatible page tables in guest RAM.
 //
 // Page directory at PA 0xF000:
-//   PDE[0x000-0x00F]: Identity-map first 64 MB as 4 MB large pages (0xE3)
-//   PDE[0x200-0x20F]: Mirror at VA 0x80000000 → PA 0-64 MB
+//   PDE[0x000-0x01F]: Identity-map first 128 MB as 4 MB large pages (0xE3)
+//   PDE[0x200-0x21F]: Mirror at VA 0x80000000 → PA 0-128 MB
 //   PDE[0x300]:       Self-map → PA 0xF000 (0xF063)
 //   All other PDEs:   0 (not present)
 // ---------------------------------------------------------------------------
@@ -41,14 +41,15 @@ inline void setup_page_tables(uint8_t* ram) {
     memset(ram + PAGE_DIR_PA, 0, 0x1000);
     auto* pd = reinterpret_cast<uint32_t*>(ram + PAGE_DIR_PA);
 
-    // Identity-map: PDE[0..15] → PA 0, 4MB, ..., 60MB
-    for (int i = 0; i < 16; ++i) {
+    // Identity-map: PDE[0..31] → PA 0, 4MB, ..., 124MB
+    for (int i = 0; i < 32; ++i) {
         pd[i] = (i * 0x00400000u) | 0xE3u;
     }
 
-    // Kernel mirror: PDE[0x200..0x20F] → same physical addresses
-    for (int i = 0; i < 16; ++i) {
-        pd[0x200 + i] = (i * 0x00400000u) | 0xE3u;
+    // Kernel mirror: PDE[0x200..0x21F] → contiguous memory alias
+    // (PA 0x80000000+, same physical RAM via Xbox contiguous memory aliasing)
+    for (int i = 0; i < 32; ++i) {
+        pd[0x200 + i] = (0x80000000u + i * 0x00400000u) | 0xE3u;
     }
 
     // Self-map: PDE[0x300] → page directory

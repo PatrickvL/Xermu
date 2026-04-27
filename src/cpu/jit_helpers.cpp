@@ -71,8 +71,18 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     auto* ram = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
     uint32_t ram_size = GUEST_RAM_SIZE;
     uint32_t cr3 = ctx->cr3;
+    SoftTlb* tlb = ctx->soft_tlb;
 
-    uint32_t pdir_pa = cr3 & GUEST_PAGE_MASK;
+
+
+    // Software TLB lookup.
+    uint32_t vpn = va >> 12;
+    uint32_t tlb_idx = vpn & SoftTlb::MASK;
+    auto& te = is_write ? tlb->write_tlb[tlb_idx] : tlb->read_tlb[tlb_idx];
+    if (te.tag == vpn)
+        return te.pa_page | (va & 0xFFF);
+
+    uint32_t pdir_pa = alias_pa(cr3 & GUEST_PAGE_MASK);
     uint32_t pdi     = (va >> 22) & 0x3FF;
     uint32_t pti     = (va >> 12) & 0x3FF;
 
@@ -85,25 +95,28 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
 
     // 4 MB page (PS=1)?
     if (pde & PDE_PS) {
-        uint32_t pa = (pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF);
+        uint32_t pa = alias_pa((pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF));
         if (is_write && !(pde & PTE_RW)) goto fault;
         if (!(pde & PTE_ACCESSED) || (is_write && !(pde & PTE_DIRTY))) {
             pde |= PTE_ACCESSED;
             if (is_write) pde |= PTE_DIRTY;
             memcpy(ram + pde_pa, &pde, 4);
         }
+        // TLB fill.
+        te.tag = vpn;  te.pa_page = pa & GUEST_PAGE_MASK;
+        if (is_write) { tlb->read_tlb[tlb_idx].tag = vpn; tlb->read_tlb[tlb_idx].pa_page = pa & GUEST_PAGE_MASK; }
         return pa;
     }
 
     // 4 KB page table
     {
-        uint32_t pt_pa = (pde & GUEST_PAGE_MASK) + pti * 4;
+        uint32_t pt_pa = alias_pa(pde & GUEST_PAGE_MASK) + pti * 4;
         if (pt_pa + 4 > ram_size) goto fault;
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
         if (!(pte & PTE_PRESENT)) goto fault;
         if (is_write && !(pte & PTE_RW)) goto fault;
-        uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
+        uint32_t pa = alias_pa((pte & GUEST_PAGE_MASK) | (va & 0xFFF));
         bool need_pde_update = !(pde & PTE_ACCESSED);
         bool need_pte_update = !(pte & PTE_ACCESSED) || (is_write && !(pte & PTE_DIRTY));
         if (need_pde_update) { pde |= PTE_ACCESSED; memcpy(ram + pde_pa, &pde, 4); }
@@ -112,6 +125,9 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
             if (is_write) pte |= PTE_DIRTY;
             memcpy(ram + pt_pa, &pte, 4);
         }
+        // TLB fill.
+        te.tag = vpn;  te.pa_page = pa & GUEST_PAGE_MASK;
+        if (is_write) { tlb->read_tlb[tlb_idx].tag = vpn; tlb->read_tlb[tlb_idx].pa_page = pa & GUEST_PAGE_MASK; }
         return pa;
     }
 
@@ -205,7 +221,13 @@ void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
 // ---------------------------------------------------------------------------
 
 uint32_t call_mem_helper(GuestContext* ctx, uint32_t pa, uint32_t retaddr) {
-    uint32_t target = read_guest_mem32(ctx, pa);
+    // pa is pre-translated; read target directly from fastmem.
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint32_t target = 0;
+    if (pa < GUEST_RAM_SIZE)
+        memcpy(&target, base + pa, 4);
+    else if (ctx->mmio)
+        target = ctx->mmio->read(pa, 4);
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     write_guest_mem32(ctx, esp, retaddr);
@@ -230,11 +252,28 @@ void pop_esp_helper(GuestContext* ctx) {
 // ---------------------------------------------------------------------------
 
 void mov_esp_from_mem(GuestContext* ctx, uint32_t pa) {
-    ctx->gp[GP_ESP] = read_guest_mem32(ctx, pa);
+    // pa is already translated by emit_paging_translate in the JIT.
+    // Read directly from fastmem — do NOT call read_guest_mem32 which
+    // would double-translate the address.
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint32_t val = 0;
+    if (pa < GUEST_RAM_SIZE)
+        memcpy(&val, base + pa, 4);
+    else if (ctx->mmio)
+        val = ctx->mmio->read(pa, 4);
+    ctx->gp[GP_ESP] = val;
 }
 
 void mov_esp_to_mem(GuestContext* ctx, uint32_t pa) {
-    write_guest_mem32(ctx, pa, ctx->gp[GP_ESP]);
+    // pa is already translated by emit_paging_translate in the JIT.
+    // Write directly to fastmem — do NOT call write_guest_mem32 which
+    // would double-translate the address.
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint32_t val = ctx->gp[GP_ESP];
+    if (pa < GUEST_RAM_SIZE)
+        memcpy(base + pa, &val, 4);
+    else if (ctx->mmio)
+        ctx->mmio->write(pa, val, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +299,13 @@ void mov_highbyte_to_mem(GuestContext* ctx, uint32_t pa, uint32_t gp_idx) {
 // ---------------------------------------------------------------------------
 
 void push_mem_helper(GuestContext* ctx, uint32_t pa) {
-    uint32_t val = read_guest_mem32(ctx, pa);
+    // pa is pre-translated; read directly from fastmem.
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    uint32_t val = 0;
+    if (pa < GUEST_RAM_SIZE)
+        memcpy(&val, base + pa, 4);
+    else if (ctx->mmio)
+        val = ctx->mmio->read(pa, 4);
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     write_guest_mem32(ctx, esp, val);
@@ -270,7 +315,12 @@ void pop_mem_helper(GuestContext* ctx, uint32_t pa) {
     uint32_t esp = ctx->gp[GP_ESP];
     uint32_t val = read_guest_mem32(ctx, esp);
     ctx->gp[GP_ESP] = esp + 4;
-    write_guest_mem32(ctx, pa, val);
+    // pa is pre-translated; write directly to fastmem.
+    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
+    if (pa < GUEST_RAM_SIZE)
+        memcpy(base + pa, &val, 4);
+    else if (ctx->mmio)
+        ctx->mmio->write(pa, val, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +415,20 @@ void iret_helper(GuestContext* ctx) {
     ctx->eflags = (new_eflags & 0x003F7FD5u) | 0x02u; // bit 1 always set
     // Restore interrupt enable from the IF bit.
     ctx->virtual_if = (new_eflags & 0x200u) != 0;
+}
+
+// ---------------------------------------------------------------------------
+// RETF helper: pop EIP and CS from guest stack (far return).
+// ---------------------------------------------------------------------------
+
+void retf_helper(GuestContext* ctx, uint32_t extra_pop) {
+    uint32_t esp = ctx->gp[GP_ESP];
+    uint32_t new_eip = read_guest_mem32(ctx, esp); esp += 4;
+    uint32_t new_cs  = read_guest_mem32(ctx, esp); esp += 4;
+    esp += extra_pop;  // RETF imm16
+    ctx->gp[GP_ESP] = esp;
+    ctx->next_eip   = new_eip;
+    ctx->cs_sel     = (uint16_t)new_cs;
 }
 
 // ---------------------------------------------------------------------------

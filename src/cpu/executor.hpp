@@ -10,6 +10,18 @@
 // Maximum guest RAM: 128 MB (e.g. Xbox devkit had 128 MB, retail 64 MB).
 static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 
+// Xbox contiguous memory alias: PA 0x80000000 maps to the same physical
+// RAM as PA 0x00000000.  nboxkrnl's page tables reference this range.
+static constexpr uint32_t CONTIGUOUS_MEMORY_BASE = 0x80000000u;
+
+// Translate a physical address through the contiguous memory alias.
+// PA 0x80000000-0x87FFFFFF → 0x00000000-0x07FFFFFF; all other PAs unchanged.
+inline uint32_t alias_pa(uint32_t pa) {
+    if (pa >= CONTIGUOUS_MEMORY_BASE && pa < CONTIGUOUS_MEMORY_BASE + GUEST_RAM_SIZE)
+        return pa - CONTIGUOUS_MEMORY_BASE;
+    return pa;
+}
+
 // Guest page geometry (4 KB pages, standard x86).
 static constexpr uint32_t GUEST_PAGE_SIZE = 0x1000u;
 static constexpr uint32_t GUEST_PAGE_MASK = ~(GUEST_PAGE_SIZE - 1u); // 0xFFFFF000

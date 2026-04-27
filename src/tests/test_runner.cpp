@@ -256,7 +256,29 @@ int main(int argc, char** argv) {
         // Run — nboxkrnl manages its own threads and scheduling.
         // We use a single large run since the kernel handles everything.
         fprintf(stderr, "[nboxkrnl] starting execution at EIP=0x%08X\n", sys.entry_eip);
-        sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
+        {
+            auto* ram_base = reinterpret_cast<uint8_t*>(sys.exec->ctx.fastmem_base);
+            uint32_t cr3 = sys.exec->ctx.cr3;
+            fprintf(stderr, "[nboxkrnl] PDE dump (CR3=0x%08X):", cr3);
+            for (int i = 0; i < 16; ++i) {
+                uint32_t pde;
+                memcpy(&pde, ram_base + cr3 + i * 4, 4);
+                fprintf(stderr, " [%d]=%08X", i, pde);
+            }
+            // Also dump PDE[0x200]-PDE[0x203]
+            fprintf(stderr, "\n[nboxkrnl] PDE[200-203]:");
+            for (int i = 0x200; i <= 0x203; ++i) {
+                uint32_t pde;
+                memcpy(&pde, ram_base + cr3 + i * 4, 4);
+                fprintf(stderr, " [%X]=%08X", i, pde);
+            }
+            fprintf(stderr, "\n");
+            // Check PA 0x2E278 before execution
+            uint32_t ct_before = 0;
+            memcpy(&ct_before, ram_base + 0x2E278, 4);
+            fprintf(stderr, "[nboxkrnl] PA[0x2E278] before exec = %08X\n", ct_before);
+        }
+        sys.exec->run(sys.entry_eip, 20'000'000ULL);
 
         uint32_t eip = sys.exec->ctx.eip;
         uint32_t sr  = sys.exec->ctx.stop_reason;

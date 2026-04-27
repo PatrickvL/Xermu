@@ -54,9 +54,9 @@ static bool test_page_tables() {
         }
     }
 
-    // Check kernel-mirror PDEs [0x200..0x20F].
+    // Check kernel-mirror PDEs [0x200..0x20F] (contiguous memory alias).
     for (int i = 0; i < 16; ++i) {
-        uint32_t expected = (i * 0x00400000u) | 0xE3u;
+        uint32_t expected = (0x80000000u + i * 0x00400000u) | 0xE3u;
         if (pd[0x200 + i] != expected) {
             printf("  PDE[0x%03X] = 0x%08X (expected 0x%08X)\n",
                    0x200 + i, pd[0x200 + i], expected);

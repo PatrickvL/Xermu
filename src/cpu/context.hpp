@@ -3,6 +3,8 @@
 #include <cstddef>
 #include "mmio.hpp"
 
+struct SoftTlb;  // forward declaration (defined in trace_builder.hpp)
+
 // Stop-reason codes: written by JIT into ctx->stop_reason, read by run loop.
 enum StopReason : uint32_t {
     STOP_NONE           = 0,  // normal trace exit
@@ -101,6 +103,9 @@ struct alignas(16) GuestContext {
     uint16_t  ds_sel = 0;
     uint16_t  fs_sel = 0;
     uint16_t  gs_sel = 0;
+
+    // Software TLB pointer (owned by Executor, set during init).
+    SoftTlb*  soft_tlb = nullptr;
 };
 
 static_assert(offsetof(GuestContext, gp)           ==  0);

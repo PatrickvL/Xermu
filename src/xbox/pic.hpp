@@ -1,6 +1,7 @@
 #pragma once
 // Dual 8259A PIC — master (0x20-0x21), slave (0xA0-0xA1).
 #include <cstdint>
+#include <cstdio>
 
 namespace xbox {
 
@@ -105,7 +106,15 @@ struct PicPair {
         }
     }
 
-    bool has_pending() const { return master.has_pending(); }
+    bool has_pending() const {
+        // Master has pending, but if it's only the cascade line,
+        // verify the slave actually has something unmasked.
+        if (!master.has_pending()) return false;
+        uint8_t master_bits = master.irr & ~master.imr & ~master.isr;
+        if (master_bits == (1 << 2))  // only cascade pending
+            return slave.has_pending();
+        return true;
+    }
 
     uint8_t ack() {
         int line = master.highest_pending();
@@ -114,6 +123,13 @@ struct PicPair {
             master.isr |=  (1 << 2);
             if (master.auto_eoi) master.isr &= ~(1 << 2);
             return slave.ack();
+        }
+        if (line == 2 && !slave.has_pending()) {
+            // Spurious cascade: slave has nothing pending (masked or empty).
+            // Lower the cascade line and re-check the master.
+            master.irr &= ~(1 << 2);
+            if (!master.has_pending()) return master.vector_base; // spurious
+            return master.ack();
         }
         return master.ack();
     }

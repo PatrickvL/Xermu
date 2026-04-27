@@ -1,5 +1,6 @@
 ﻿#include "executor.hpp"
 #include "fault_handler.hpp"
+#include "../xbox/pic.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cassert>
@@ -150,6 +151,7 @@ bool Executor::init(MmioMap* mmio) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.fastmem_base = (uint64_t)(uintptr_t)ram;
     ctx.mmio         = mmio;
+    ctx.soft_tlb     = &tlb;
     ctx.cr0          = 0x00000011;  // PE=1, ET=1 (protected mode, no paging)
     ctx.eflags       = 0x00000002;  // reserved bit always set
     ctx.virtual_if   = true;
@@ -364,7 +366,14 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
     if (paging_enabled()) {
         desc_pa = translate_va(desc_addr, false);
         if (desc_pa == ~0u) {
-            fprintf(stderr, "[exec] IDT descriptor VA %08X page fault\n", desc_addr);
+            // Diagnostic: dump PDE for the failing VA.
+            uint32_t pdi = (desc_addr >> 22) & 0x3FF;
+            uint32_t pde_pa = (ctx.cr3 & 0xFFFFF000u) + pdi * 4;
+            uint32_t pde = 0;
+            if (pde_pa + 4 <= GUEST_RAM_SIZE)
+                memcpy(&pde, ram + pde_pa, 4);
+            fprintf(stderr, "[exec] IDT descriptor VA %08X page fault (vector=%u CR2=%08X CR3=%08X PDE[%03X]=%08X)\n",
+                    desc_addr, vector, ctx.cr2, ctx.cr3, pdi, pde);
             ctx.halted = true;
             return;
         }
@@ -384,7 +393,14 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
     memcpy(&offset_hi, ram + desc_pa + 6, 2);
 
     if (!(type_attr & 0x80)) {
-        fprintf(stderr, "[exec] IDT vector %u not present\n", vector);
+        fprintf(stderr, "[exec] IDT vector %u not present (type_attr=0x%02X desc_pa=0x%08X return_eip=0x%08X current_eip=0x%08X)\n",
+                vector, type_attr, desc_pa, return_eip, ctx.eip);
+        // Dump 8 bytes of the IDT entry
+        uint8_t idt_bytes[8];
+        memcpy(idt_bytes, ram + desc_pa, 8);
+        fprintf(stderr, "[exec] IDT[%u] bytes: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                vector, idt_bytes[0], idt_bytes[1], idt_bytes[2], idt_bytes[3],
+                idt_bytes[4], idt_bytes[5], idt_bytes[6], idt_bytes[7]);
         ctx.halted = true;
         return;
     }
@@ -400,8 +416,9 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
 
     // Stack bounds check: if ESP is too low to push the interrupt frame
     // (12-16 bytes), halt to prevent infinite fault loops.
+    // When paging is enabled, ESP is a VA — only check for near-zero wrap.
     uint32_t frame_size = has_error ? 16 : 12;
-    if (esp < frame_size || esp > GUEST_RAM_SIZE) {
+    if (esp < frame_size || (!paging_enabled() && esp > GUEST_RAM_SIZE)) {
         fprintf(stderr, "[exec] stack overflow delivering vector %u (ESP=0x%08X)\n",
                 vector, esp);
         ctx.halted = true;
@@ -455,7 +472,14 @@ void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
 // ---------------------------------------------------------------------------
 
 uint32_t Executor::translate_va(uint32_t va, bool is_write) {
-    uint32_t pdir_pa = ctx.cr3 & GUEST_PAGE_MASK;
+    // Software TLB lookup.
+    uint32_t vpn = va >> 12;
+    uint32_t tlb_idx = vpn & SoftTlb::MASK;
+    auto& te = is_write ? tlb.write_tlb[tlb_idx] : tlb.read_tlb[tlb_idx];
+    if (te.tag == vpn)
+        return te.pa_page | (va & 0xFFF);
+
+    uint32_t pdir_pa = alias_pa(ctx.cr3 & GUEST_PAGE_MASK);
     uint32_t pdi     = (va >> 22) & 0x3FF;
     uint32_t pti     = (va >> 12) & 0x3FF;
 
@@ -469,19 +493,22 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
 
     // 4 MB page (PS=1)?
     if (pde & PDE_PS) {
-        uint32_t pa = (pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF);
+        uint32_t pa = alias_pa((pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF));
         if (is_write && !(pde & PTE_RW)) goto fault;
         if (!(pde & PTE_ACCESSED) || (is_write && !(pde & PTE_DIRTY))) {
             pde |= PTE_ACCESSED;
             if (is_write) pde |= PTE_DIRTY;
             memcpy(ram + pde_pa, &pde, 4);
         }
+        // TLB fill (also populate read TLB on write hits for future reads).
+        te.tag = vpn;  te.pa_page = pa & GUEST_PAGE_MASK;
+        if (is_write) { tlb.read_tlb[tlb_idx].tag = vpn; tlb.read_tlb[tlb_idx].pa_page = pa & GUEST_PAGE_MASK; }
         return pa;
     }
 
     // 4 KB page table
     {
-        uint32_t pt_pa = (pde & GUEST_PAGE_MASK) + pti * 4;
+        uint32_t pt_pa = alias_pa((pde & GUEST_PAGE_MASK)) + pti * 4;
         if (pt_pa + 4 > GUEST_RAM_SIZE) goto fault;
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
@@ -489,7 +516,7 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
         if (!(pte & PTE_PRESENT)) goto fault;
         if (is_write && !(pte & PTE_RW)) goto fault;
 
-        uint32_t pa = (pte & GUEST_PAGE_MASK) | (va & 0xFFF);
+        uint32_t pa = alias_pa((pte & GUEST_PAGE_MASK) | (va & 0xFFF));
 
         bool need_pde_update = !(pde & PTE_ACCESSED);
         bool need_pte_update = !(pte & PTE_ACCESSED) || (is_write && !(pte & PTE_DIRTY));
@@ -503,6 +530,9 @@ uint32_t Executor::translate_va(uint32_t va, bool is_write) {
             memcpy(ram + pt_pa, &pte, 4);
         }
 
+        // TLB fill.
+        te.tag = vpn;  te.pa_page = pa & GUEST_PAGE_MASK;
+        if (is_write) { tlb.read_tlb[tlb_idx].tag = vpn; tlb.read_tlb[tlb_idx].pa_page = pa & GUEST_PAGE_MASK; }
         return pa;
     }
 
@@ -758,7 +788,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                     (unsigned long long)max_steps, ctx.eip);
             break;
         }
-
+        // Periodic progress report (every 1M steps).
+        if ((steps & 0xFFFFF) == 0 && steps > 0) {
+            fprintf(stderr, "[exec] step %llu EIP=%08X ESP=%08X\n",
+                    (unsigned long long)steps, ctx.eip, ctx.gp[GP_ESP]);
+        }
         // Deliver pending hardware IRQs at trace boundaries.
         bool has_irq = irq_check ? irq_check(irq_user) : (pending_irq != 0);
         if (has_irq && ctx.virtual_if) {
@@ -772,6 +806,17 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 while (!(bits & 1)) { bits >>= 1; ++irq; }
                 pending_irq &= ~(1u << irq);
                 vector = uint8_t(0x20 + irq);
+            }
+            if (steps < 5000) { // Diagnostic: log first few IRQ deliveries
+                fprintf(stderr, "[exec] IRQ deliver: vector=%u EIP=%08X steps=%llu\n",
+                        vector, ctx.eip, (unsigned long long)steps);
+                // Also dump PIC state for cascade debugging
+                if (irq_user) {
+                    auto* pic = static_cast<xbox::PicPair*>(irq_user);
+                    fprintf(stderr, "[exec] PIC master: irr=%02X imr=%02X isr=%02X vec=%02X  slave: irr=%02X imr=%02X isr=%02X vec=%02X\n",
+                            pic->master.irr, pic->master.imr, pic->master.isr, pic->master.vector_base,
+                            pic->slave.irr, pic->slave.imr, pic->slave.isr, pic->slave.vector_base);
+                }
             }
             deliver_interrupt(vector, ctx.eip);
             prev_trace = nullptr; // chain broken by interrupt
@@ -856,14 +901,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 code_len = fetch_len;
             }
 
-            t = builder.build(code_pa, code_ptr, code_len, ram,
+            t = builder.build(eip, code_ptr, code_len, ram,
                               cc, arena, &ctx);
             if (!t) {
                 fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) â€” halting\n", eip, code_pa);
                 break;
             }
-            // Override guest_eip to store the VA (for cache lookup).
-            t->guest_eip = eip;
             tcache.insert(t);
 
             // Protect code page for SMC detection (RAM pages only).
@@ -899,23 +942,23 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                     // Two-pass scan: CMP patterns first (multi-byte, safe),
                     // then DEC/INC single-byte patterns only at offset 0.
                     bool handled = false;
-                    if (eip + 32 <= GUEST_RAM_SIZE) {
+                    if (code_pa + 32 <= GUEST_RAM_SIZE) {
                         // Pass 1: look for CMP r32, imm or DEC [mem] patterns
                         for (uint32_t off = 0; off < 24 && !handled; ++off) {
-                            uint8_t b = ram[eip + off];
+                            uint8_t b = ram[code_pa + off];
                             // CMP EAX, imm32 (opcode 3D)
                             if (b == 0x3D && off + 5 <= 28) {
                                 uint32_t imm;
-                                memcpy(&imm, ram + eip + off + 1, 4);
+                                memcpy(&imm, ram + code_pa + off + 1, 4);
                                 ctx.gp[GP_EAX] = imm;
                                 handled = true;
                             }
                             // 81 F8..FF = CMP r32, imm32 (/7 = CMP in ModR/M)
                             else if (b == 0x81 && off + 6 <= 28) {
-                                uint8_t modrm = ram[eip + off + 1];
+                                uint8_t modrm = ram[code_pa + off + 1];
                                 if ((modrm & 0xF8) == 0xF8) { // /7 reg-direct
                                     uint32_t imm;
-                                    memcpy(&imm, ram + eip + off + 2, 4);
+                                    memcpy(&imm, ram + code_pa + off + 2, 4);
                                     unsigned reg = modrm & 7;
                                     ctx.gp[reg] = imm;
                                     handled = true;
@@ -923,17 +966,23 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                             }
                             // 83 F8..FF = CMP r32, imm8
                             else if (b == 0x83 && off + 3 <= 28) {
-                                uint8_t modrm = ram[eip + off + 1];
+                                uint8_t modrm = ram[code_pa + off + 1];
                                 if ((modrm & 0xF8) == 0xF8) {
-                                    uint32_t imm = (uint32_t)(int32_t)(int8_t)ram[eip + off + 2];
+                                    uint32_t imm = (uint32_t)(int32_t)(int8_t)ram[code_pa + off + 2];
                                     unsigned reg = modrm & 7;
                                     ctx.gp[reg] = imm;
                                     handled = true;
                                 }
+                                // 83 E8..EF = SUB r32, imm8 (countdown loop)
+                                else if ((modrm & 0xF8) == 0xE8) {
+                                    unsigned reg = modrm & 7;
+                                    ctx.gp[reg] = 1; // after SUB 1: 0→ZF=1, JNZ falls through
+                                    handled = true;
+                                }
                             }
                             // FF /1 = DEC [EBP+disp8]  (FF 4D xx)
-                            else if (b == 0xFF && off + 3 <= 28 && ram[eip + off + 1] == 0x4D) {
-                                int8_t disp = (int8_t)ram[eip + off + 2];
+                            else if (b == 0xFF && off + 3 <= 28 && ram[code_pa + off + 1] == 0x4D) {
+                                int8_t disp = (int8_t)ram[code_pa + off + 2];
                                 uint32_t addr = ctx.gp[GP_EBP] + (int32_t)disp;
                                 if (addr + 4 <= GUEST_RAM_SIZE) {
                                     uint32_t one = 1;
@@ -944,7 +993,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         }
                         // Pass 2: only at offset 0, check for DEC r32 (48..4F)
                         if (!handled) {
-                            uint8_t b0 = ram[eip];
+                            uint8_t b0 = ram[code_pa];
                             if (b0 >= 0x48 && b0 <= 0x4F) {
                                 unsigned reg = b0 - 0x48;
                                 ctx.gp[reg] = 1;
@@ -955,18 +1004,18 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         // This is a countdown delay loop. Fast-forward by
                         // zeroing the counter register so DEC sets ZF=0 and
                         // JNZ falls through.
-                        if (!handled && eip + 12 <= GUEST_RAM_SIZE) {
-                            uint8_t b0 = ram[eip];
+                        if (!handled && code_pa + 12 <= GUEST_RAM_SIZE) {
+                            uint8_t b0 = ram[code_pa];
                             // 8B 44 24 dd = MOV EAX,[ESP+disp8]  (or other reg)
                             if (b0 == 0x8B) {
-                                uint8_t modrm = ram[eip + 1];
+                                uint8_t modrm = ram[code_pa + 1];
                                 if ((modrm & 0xC7) == 0x44) { // mod=01, r/m=4 (SIB)
-                                    uint8_t sib = ram[eip + 2];
+                                    uint8_t sib = ram[code_pa + 2];
                                     if (sib == 0x24) { // SIB = base=ESP, no index
-                                        uint8_t disp = ram[eip + 3];
+                                        uint8_t disp = ram[code_pa + 3];
                                         unsigned reg = (modrm >> 3) & 7;
                                         // Check DEC reg follows at offset 4
-                                        uint8_t b4 = ram[eip + 4];
+                                        uint8_t b4 = ram[code_pa + 4];
                                         if (b4 >= 0x48 && b4 <= 0x4F &&
                                             (unsigned)(b4 - 0x48) == reg) {
                                             // Set reg to 1 so after DEC: 1→0, ZF=1, JNZ falls through
@@ -1040,6 +1089,28 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
             prev_trace = nullptr; // chain broken
+            static int pf_log_count = 0;
+            if (pf_log_count < 10) {
+                ++pf_log_count;
+                uint32_t cr2 = ctx.cr2;
+                uint32_t pdi = (cr2 >> 22) & 0x3FF;
+                uint32_t pde_pa = alias_pa(ctx.cr3 & 0xFFFFF000u) + pdi * 4;
+                uint32_t pde = 0;
+                if (pde_pa + 4 <= GUEST_RAM_SIZE)
+                    memcpy(&pde, ram + pde_pa, 4);
+                fprintf(stderr, "[exec] #PF at EIP=%08X CR2=%08X PDE[%03X]=%08X fs_base=%08X\n",
+                        ctx.eip, cr2, pdi, pde, ctx.fs_base);
+                // Dump physical memory at PA 0x2E278 (KiPcr.PrcbData.CurrentThread)
+                uint32_t ct_val = 0;
+                memcpy(&ct_val, ram + 0x2E278, 4);
+                // Also try translating VA 0x8002E278
+                uint32_t ct_pa = translate_va(0x8002E278u, false);
+                uint32_t ct_via_va = 0;
+                if (ct_pa != ~0u && ct_pa + 4 <= GUEST_RAM_SIZE)
+                    memcpy(&ct_via_va, ram + ct_pa, 4);
+                fprintf(stderr, "[exec]   PA[0x2E278]=%08X  VA[0x8002E278]->PA=%08X->val=%08X\n",
+                        ct_val, ct_pa, ct_via_va);
+            }
             // Error code: bit 0 = 0 (not present), bit 2 = 0 (supervisor).
             // Full error code computation would check P, W/R, U/S bits;
             // for now use 0 (not-present supervisor read).

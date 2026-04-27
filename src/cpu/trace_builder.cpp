@@ -1335,6 +1335,8 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
             switch (insn.mnemonic) {
             case ZYDIS_MNEMONIC_RET: {
                 // RET or RET imm16: pop return address, optionally pop extra bytes.
+                // Far return (RETF/RETFQ) also uses ZYDIS_MNEMONIC_RET with
+                // branch_type == ZYDIS_BRANCH_TYPE_FAR.
                 uint16_t extra = 0;
                 for (int oi = 0; oi < (int)insn.operand_count; ++oi) {
                     if (ops[oi].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
@@ -1342,7 +1344,17 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                         break;
                     }
                 }
-                emit_ret_exit(e, ctx, extra);
+                if (insn.meta.branch_type == ZYDIS_BRANCH_TYPE_FAR) {
+                    // RETF: pop EIP and CS via helper.
+                    emit_save_all_gp(e);
+                    emit_ccall_arg0_ctx(e);
+                    emit_ccall_arg1_imm(e, (uint32_t)extra);
+                    emit_call_abs(e, reinterpret_cast<void*>(retf_helper));
+                    emit_load_all_gp(e);
+                    e.emit8(0xC3);
+                } else {
+                    emit_ret_exit(e, ctx, extra);
+                }
                 break;
             }
             case ZYDIS_MNEMONIC_IRETD:

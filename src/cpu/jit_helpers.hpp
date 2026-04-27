@@ -54,6 +54,7 @@ void     popad_helper(GuestContext* ctx);
 void     enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting);
 uint32_t xlatb_helper(GuestContext* ctx);
 void     iret_helper(GuestContext* ctx);
+void     retf_helper(GuestContext* ctx, uint32_t extra_pop);
 
 // String instruction helpers (return updated EFLAGS).
 uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,

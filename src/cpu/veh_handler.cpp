@@ -164,8 +164,18 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     // Step 2: Is the faulting RIP within our code cache?
     auto rip = (uint8_t*)(uintptr_t)ctx_regs->Rip;
     if (!exec->cc.contains(rip)) {
+        auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
         fprintf(stderr, "[veh] AV in fastmem but RIP=%p outside code cache, PA=0x%08X access=%lld\n",
                 (void*)rip, guest_pa, (long long)access_type);
+        if (gctx) {
+            fprintf(stderr, "[veh]   guest EIP=0x%08X next_eip=0x%08X ESP=0x%08X\n",
+                    gctx->eip, gctx->next_eip, gctx->gp[4]);
+            fprintf(stderr, "[veh]   EAX=0x%08X ECX=0x%08X EDX=0x%08X EBX=0x%08X\n",
+                    gctx->gp[0], gctx->gp[1], gctx->gp[2], gctx->gp[3]);
+            fprintf(stderr, "[veh]   ESI=0x%08X EDI=0x%08X CR3=0x%08X\n",
+                    gctx->gp[6], gctx->gp[7], gctx->cr3);
+            fprintf(stderr, "[veh]   R14D(EA)=0x%08X\n", (uint32_t)ctx_regs->R14);
+        }
         fflush(stderr);
         return EXCEPTION_CONTINUE_SEARCH;
     }

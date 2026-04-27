@@ -14,6 +14,7 @@
 #include "smbus.hpp"
 #include "pic.hpp"
 #include "pit.hpp"
+#include "cmos.hpp"
 #include "misc_io.hpp"
 #include "acpi.hpp"
 #include "cpu/executor.hpp"
@@ -36,6 +37,7 @@ struct XboxHardware {
     SmbusState  smbus;
     PicPair     pic;
     PitState    pit;
+    CmosState   cmos;
     MiscIoState misc;
     AcpiState   acpi;
     uint8_t*    ram = nullptr;
@@ -49,6 +51,11 @@ static void hw_tick_callback(void* user) {
     hw->nv2a.tick_timer();
     hw->usb0.tick_frame();
     hw->usb1.tick_frame();
+
+    // CMOS/RTC periodic interrupt → IRQ 8 via PIC.
+    if (hw->cmos.tick()) {
+        hw->pic.raise_irq(8);
+    }
 
     // Process NV2A PFIFO push buffer commands so DMA_GET advances.
     if (hw->ram)
@@ -136,6 +143,13 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.register_io(0x43, pit_io_read, pit_io_write, &hw->pit);
 
     hw->pit.pic  = &hw->pic;
+
+    hw->cmos.pic = &hw->pic;
+    hw->cmos.init();
+    exec.register_io(0x70, cmos_io_read, cmos_io_write, &hw->cmos);
+    exec.register_io(0x71, cmos_io_read, cmos_io_write, &hw->cmos);
+    exec.register_io(0x4D0, elcr_io_read, elcr_io_write, &hw->cmos);
+    exec.register_io(0x4D1, elcr_io_read, elcr_io_write, &hw->cmos);
 
     exec.tick_fn     = hw_tick_callback;
     exec.tick_user   = hw;

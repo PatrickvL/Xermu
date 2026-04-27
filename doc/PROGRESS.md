@@ -531,3 +531,31 @@
 - **Files**: src/xbox/hle/bootstrap.hpp, src/tests/test_runner.cpp,
   src/tests/test_nboxkrnl_e2e.cpp, CMakeLists.txt
 - **Status**: DONE
+
+### Step 39: Fix EFLAGS clobbering, double-translation, 128MB page tables (HEAD)
+- **EFLAGS preservation in ESP adjust**: `emit_sub_ctx_esp()` and
+  `emit_add_ctx_esp()` now bracket the host ADD/SUB with PUSHFQ/POPFQ.
+  Real x86 PUSH/POP/CALL/RET do not modify flags, but the host arithmetic
+  we emit to adjust `ctx->gp[ESP]` was clobbering host RFLAGS (which carry
+  guest EFLAGS during trace execution).  This caused ZF corruption after
+  `RET imm16` (stdcall return), making the nboxkrnl DPC dispatch misinterpret
+  `KiFindReadyThread` returning NULL → wrote NULL to CurrentThread → infinite
+  #PF loop.
+- **Double-translation fix**: Five JIT helpers (`mov_esp_from_mem`,
+  `mov_esp_to_mem`, `call_mem_helper`, `push_mem_helper`, `pop_mem_helper`)
+  received pre-translated PAs from `emit_paging_translate` but called
+  `read/write_guest_mem32()` which re-translated the PA as a VA.  With
+  identity mapping active, this accidentally worked; after MmInitSystem
+  cleared the identity map, the double-translation failed silently and wrote
+  to wrong addresses.  Fixed: these helpers now access `fastmem_base + pa`
+  directly, matching `mov_highbyte_from/to_mem` and `guest_read/write`.
+- **128MB page tables**: Expanded boot page table setup from 16 to 32 PDEs
+  for both identity-map (PDE[0..31]) and contiguous mirror (PDE[0x200..0x21F]),
+  covering the full 128MB Xbox RAM.
+- **Result**: nboxkrnl boots through KiInitSystem, MmInitSystem, context
+  switching, and DPC dispatch.  Reaches page pool initialisation before hitting
+  a null page pointer in the free-list insertion (next investigation).
+- **Files**: src/cpu/emitter.hpp, src/cpu/jit_helpers.cpp,
+  src/xbox/nboxkrnl_boot.hpp
+- **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
+- **Status**: DONE
