@@ -332,13 +332,17 @@ struct XbeHeap {
     // Translate Xbox path to host path
     std::string translate_path(const std::string& xbox_path) const {
         for (auto& m : mounts) {
-            if (xbox_path.size() > m.xbox_prefix.size() &&
-                _strnicmp(xbox_path.c_str(), m.xbox_prefix.c_str(), m.xbox_prefix.size()) == 0 &&
-                (xbox_path[m.xbox_prefix.size()] == '\\' || xbox_path[m.xbox_prefix.size()] == '/')) {
-                std::string rel = xbox_path.substr(m.xbox_prefix.size() + 1);
-                // Convert backslashes to forward slashes
-                for (auto& c : rel) if (c == '\\') c = '/';
-                return m.host_dir + "/" + rel;
+            if (_strnicmp(xbox_path.c_str(), m.xbox_prefix.c_str(), m.xbox_prefix.size()) == 0) {
+                if (xbox_path.size() == m.xbox_prefix.size()) {
+                    // Exact match (e.g. "CDROM0:" → host_dir)
+                    return m.host_dir;
+                }
+                char sep = xbox_path[m.xbox_prefix.size()];
+                if (sep == '\\' || sep == '/') {
+                    std::string rel = xbox_path.substr(m.xbox_prefix.size() + 1);
+                    for (auto& c : rel) if (c == '\\') c = '/';
+                    return m.host_dir + "/" + rel;
+                }
             }
         }
         return ""; // no mount matched
@@ -594,6 +598,10 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         case 0x08: result_val = 0; break;          // DvdRegion: region free
         case 0x09: result_val = 0; break;          // TimeZone bias: UTC
         case 0x0A: result_val = 0; break;          // TimeZone std name (empty)
+        case 0x10: result_val = 0; break;          // Audio flags: stereo
+        case 0x11: result_val = 0; break;          // Parental control: no restrictions
+        case 0x103: result_val = 0x00000100; break; // Factory AV region: NTSC_M
+        case 0x104: result_val = 0x00000001; break; // Factory game region: North America
         default: break;
         }
 
@@ -604,6 +612,8 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         if (result_ptr + 4 <= GUEST_RAM_SIZE)
             memcpy(exec.ram + result_ptr, &result_size, 4);
 
+        fprintf(stderr, "[hle] ExQueryNonVolatileSetting(0x%02X) -> 0x%08X\n",
+                value_index, result_val);
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 5);
         return true;
@@ -612,19 +622,54 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     case ORD_RtlNtStatusToDosError: {
         // ULONG RtlNtStatusToDosError(NTSTATUS Status)
         uint32_t status = stack_arg(exec, 0);
-        uint32_t dos_error = (status == 0) ? 0 : 317; // ERROR_MR_MID_NOT_FOUND
+        uint32_t dos_error;
+        switch (status) {
+        case 0x00000000u: dos_error = 0; break;                     // STATUS_SUCCESS
+        case 0xC0000034u: dos_error = 2; break;                     // STATUS_OBJECT_NAME_NOT_FOUND → ERROR_FILE_NOT_FOUND
+        case 0xC000003Au: dos_error = 3; break;                     // STATUS_OBJECT_PATH_NOT_FOUND → ERROR_PATH_NOT_FOUND
+        case 0xC0000035u: dos_error = 183; break;                   // STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS
+        case 0xC0000022u: dos_error = 5; break;                     // STATUS_ACCESS_DENIED → ERROR_ACCESS_DENIED
+        case 0xC0000008u: dos_error = 6; break;                     // STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE
+        case 0xC000000Du: dos_error = 87; break;                    // STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER
+        case 0xC0000017u: dos_error = 8; break;                     // STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY
+        case 0xC0000002u: dos_error = 1; break;                     // STATUS_NOT_IMPLEMENTED → ERROR_INVALID_FUNCTION
+        default:          dos_error = (status >> 30) ? 317u : 0; break; // fallback
+        }
         exec.ctx.gp[GP_EAX] = dos_error;
         stdcall_cleanup(exec, 1);
         return true;
     }
 
-    case ORD_HalReturnToFirmware:
-        // Thread/program exit. The scheduler in run_step promotes pending
-        // threads and switches between alive thread slots.
+    case ORD_HalReturnToFirmware: {
+        // HalReturnToFirmware(FIRMWARE_REENTRY: 0=Halt, 1=Reboot, 2=QuickReboot, 3=KdReboot, 4=Fatal)
+        uint32_t reason = stack_arg(exec, 0);
+        fprintf(stderr, "[hle] HalReturnToFirmware(%u) at EIP=0x%08X\n", reason, exec.ctx.eip);
+        // Dump stack frames for debugging
+        uint32_t esp_val = exec.ctx.gp[GP_ESP];
+        uint32_t ebp_val = exec.ctx.gp[GP_EBP];
+        fprintf(stderr, "[hle]   ESP=0x%08X EBP=0x%08X\n", esp_val, ebp_val);
+        // Walk EBP chain for up to 10 frames
+        for (int i = 0; i < 10 && ebp_val > 0 && ebp_val + 8 <= GUEST_RAM_SIZE; ++i) {
+            uint32_t saved_ebp = 0, ret_addr = 0;
+            memcpy(&saved_ebp, exec.ram + ebp_val, 4);
+            memcpy(&ret_addr, exec.ram + ebp_val + 4, 4);
+            fprintf(stderr, "[hle]   frame %d: [%08X] ret=%08X\n", i, ebp_val, ret_addr);
+            if (saved_ebp <= ebp_val) break; // ascending or stuck
+            ebp_val = saved_ebp;
+        }
+        // Also dump raw stack words
+        fprintf(stderr, "[hle]   stack:");
+        for (int i = 0; i < 16 && esp_val + i*4 + 4 <= GUEST_RAM_SIZE; ++i) {
+            uint32_t w = 0;
+            memcpy(&w, exec.ram + esp_val + i*4, 4);
+            fprintf(stderr, " %08X", w);
+        }
+        fprintf(stderr, "\n");
         stdcall_cleanup(exec, 1);
         exec.ctx.eip = 0xFFFFFFFF;
         exec.ctx.halted = true;
         return true;
+    }
 
     case ORD_KeGetCurrentThread:
         // Return a fake KTHREAD pointer (nonzero, page-aligned)
@@ -1312,11 +1357,9 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
                         xbox_path.c_str(), host_path.c_str());
             }
         } else {
-            // No mount matched — return a fake handle
-            h = heap->next_handle++;
-            status = 0;
-            fprintf(stderr, "[hle] NtOpenFile: '%s' -> fake handle 0x%X\n",
-                    xbox_path.c_str(), h);
+            // No mount matched — return not-found.
+            fprintf(stderr, "[hle] NtOpenFile: '%s' -> not found (no mount)\n",
+                    xbox_path.c_str());
         }
 
         if (handle_ptr + 4 <= GUEST_RAM_SIZE)
@@ -1530,15 +1573,19 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
                 fprintf(stderr, "[hle] NtCreateFile: '%s' -> handle 0x%X\n",
                         xbox_path.c_str(), h);
             } else {
-                fprintf(stderr, "[hle] NtCreateFile: '%s' -> not found (%s)\n",
-                        xbox_path.c_str(), host_path.c_str());
+                // Mount matched but file doesn't exist — return a fake handle.
+                // This covers directory creates and files the guest expects to
+                // create (CreateDisposition = FILE_OPEN_IF / FILE_CREATE).
+                h = heap->next_handle++;
+                status = 0;
+                fprintf(stderr, "[hle] NtCreateFile: '%s' -> fake handle 0x%X (created)\n",
+                        xbox_path.c_str(), h);
             }
         } else {
-            // No mount matched — return a fake handle for device paths etc.
-            h = heap->next_handle++;
-            status = 0;
-            fprintf(stderr, "[hle] NtCreateFile: '%s' -> fake handle 0x%X\n",
-                    xbox_path.c_str(), h);
+            // No mount matched — return not-found so the guest doesn't
+            // try to use a non-existent file (e.g. xonlinedash.xbe).
+            fprintf(stderr, "[hle] NtCreateFile: '%s' -> not found (no mount)\n",
+                    xbox_path.c_str());
         }
 
         if (handle_ptr + 4 <= GUEST_RAM_SIZE)

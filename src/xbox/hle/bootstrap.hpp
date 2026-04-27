@@ -222,6 +222,44 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
         sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xiso_dir});
     }
 
+    // Default Xbox drive mounts — map to data subdirectories beside the XBE.
+    // The dashboard expects T:, C:, Y:, Z: to exist (even if empty).
+    // Add both \??\X: and x: prefixes since paths may or may not include
+    // the NT object namespace prefix.
+    {
+        size_t sep = cfg.xbe_path.find_last_of("/\\");
+        std::string xbe_dir = (sep != std::string::npos)
+            ? cfg.xbe_path.substr(0, sep) : ".";
+        // D: = XBE directory (DVD-ROM for the title)
+        if (cfg.xiso_path.empty()) {
+            sys.hle_heap.mounts.push_back({"\\??\\D:", xbe_dir});
+            sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xbe_dir});
+            sys.hle_heap.mounts.push_back({"d:", xbe_dir});
+            sys.hle_heap.mounts.push_back({"D:", xbe_dir});
+        }
+        // T: = title persistent data
+        sys.hle_heap.mounts.push_back({"\\??\\T:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"t:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"T:", xbe_dir});
+        // C: = system data partition
+        sys.hle_heap.mounts.push_back({"\\??\\C:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"c:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"C:", xbe_dir});
+        // NT device paths (used by dashboard for NtQueryFullAttributesFile)
+        sys.hle_heap.mounts.push_back({"\\Device\\Harddisk0\\partition2", xbe_dir}); // C:
+        sys.hle_heap.mounts.push_back({"\\Device\\Harddisk0\\Partition2", xbe_dir});
+        // CDROM0: device (DVD-ROM, needed by dashboard tray-state check)
+        sys.hle_heap.mounts.push_back({"CDROM0:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xbe_dir});
+        // Y: = system cache partition — NOT mounted by default.
+        // On a clean Xbox Y:\xodash\xonlinedash.xbe doesn't exist; mounting
+        // the XBE directory here would false-positive the update check.
+        // Z: = title cache partition
+        sys.hle_heap.mounts.push_back({"\\??\\Z:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"z:", xbe_dir});
+        sys.hle_heap.mounts.push_back({"Z:", xbe_dir});
+    }
+
     sys.exec->hle_handler = xbe::default_hle_handler;
     sys.exec->hle_user    = &sys.hle_heap;
     sys.hle_heap.nv2a_ptr = &sys.hw->nv2a;  // for PRAMIN mapping in MmClaimGpuInstanceMemory
@@ -683,9 +721,10 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
             if (esp + 4 <= GUEST_RAM_SIZE)
                 memcpy(sys.exec->ram + esp, &halt_ret, 4);
 
-            uint32_t fs = 0x00D0'0000u + (uint32_t)(sys.threads.size() + 1) * 0x4000u;
-            if (fs + 0x2000 <= GUEST_RAM_SIZE)
-                setup_kpcr(*sys.exec, fs, esp + 8);
+            // Share the main thread's KPCR — cooperative single-core model.
+            // Spawned threads inherit thread 0's FS_BASE so FS-relative
+            // accesses (KPCR.CurrentThread, TlsData, etc.) see the same data.
+            uint32_t fs = sys.threads.empty() ? 0x00D0'0000u : sys.threads[0].fs_base;
 
             ThreadSlot slot;
             memset(slot.gp, 0, sizeof(slot.gp));
@@ -696,8 +735,8 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
             slot.alive   = true;
             sys.threads.push_back(slot);
 
-            fprintf(stderr, "[sched] Thread %d created: routine=%08X ctx=%08X esp=%08X\n",
-                    (int)sys.threads.size() - 1, t.start_routine, t.start_context, esp);
+            fprintf(stderr, "[sched] Thread %d created: routine=%08X ctx=%08X esp=%08X fs=%08X\n",
+                    (int)sys.threads.size() - 1, t.start_routine, t.start_context, esp, fs);
         }
     };
 
