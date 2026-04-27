@@ -516,3 +516,18 @@
 - **Files**: src/xbox/nboxkrnl_keys.hpp, src/tests/test_nboxkrnl_keys.cpp,
   CMakeLists.txt
 - **Status**: DONE
+
+### Step 38: nboxkrnl M7 — E2E integration test and --nboxkrnl boot mode
+- **bootstrap.hpp**: Added `boot_nboxkrnl_system()` that wires the full
+  pipeline: Xbox hardware setup → host I/O ports → async file I/O → disk
+  partitions → EEPROM keys → PE loading → page tables → CPU state. New
+  `NboxkrnlState` struct holds HostState + IoSystem + KeyConfig.
+- **test_runner.cpp**: Added `--nboxkrnl <kernel.exe> <game.xbe>` mode that
+  boots nboxkrnl and runs to completion with full hardware emulation.
+- **test_nboxkrnl_e2e**: 2 integration tests — full mock boot pipeline
+  (creates a valid PE on disk, boots through `boot_nboxkrnl_system()`, runs
+  mock kernel that exercises host ports) + partition directory creation
+  (2/2 pass).
+- **Files**: src/xbox/hle/bootstrap.hpp, src/tests/test_runner.cpp,
+  src/tests/test_nboxkrnl_e2e.cpp, CMakeLists.txt
+- **Status**: DONE

@@ -80,16 +80,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n"
                         "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>] [--rc4-key <key.bin>]\n"
                         "                   [--inner-key <key.bin>] [--dump-kernel <out.exe>]\n"
-                        "       test_runner --xbox --kernel <xboxkrnl.exe> <game.xbe>\n");
+                        "       test_runner --xbox --kernel <xboxkrnl.exe> <game.xbe>\n"
+                        "       test_runner --nboxkrnl <nboxkrnl.exe> <game.xbe>\n");
         return 2;
     }
 
     // Parse flags.
     bool xbox_mode = false;
     bool bios_mode = false;
+    bool nboxkrnl_mode = false;
     const char* bios_path = nullptr;
     const char* mcpx_path = nullptr;
     const char* kernel_path = nullptr;
+    const char* nboxkrnl_path = nullptr;
     const char* rc4_key_path = nullptr;
     const char* inner_key_path = nullptr;
     const char* dump_kernel_path = nullptr;
@@ -142,6 +145,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             kernel_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--nboxkrnl") == 0) {
+            nboxkrnl_mode = true;
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--nboxkrnl requires a nboxkrnl.exe path\n");
+                return 2;
+            }
+            nboxkrnl_path = argv[argi++];
         } else {
             break;
         }
@@ -229,6 +240,33 @@ int main(int argc, char** argv) {
         if (dump_path.empty()) dump_path = "data/xboxkrnl_dumped.exe";
         uint32_t kernel_pa = xbox::scan_and_dump_kernel(
             sys.exec->ram, GUEST_RAM_SIZE, dump_path);
+        return 0;
+    }
+
+    // ---- nboxkrnl boot mode ----
+    if (nboxkrnl_mode && argi < argc) {
+        xbox::BootConfig cfg;
+        cfg.kernel_path = nboxkrnl_path;
+        cfg.xbe_path = argv[argi];
+
+        xbox::XboxSystem sys;
+        xbox::NboxkrnlState nbox;
+        if (!xbox::boot_nboxkrnl_system(sys, cfg, nbox)) return 2;
+
+        // Run — nboxkrnl manages its own threads and scheduling.
+        // We use a single large run since the kernel handles everything.
+        fprintf(stderr, "[nboxkrnl] starting execution at EIP=0x%08X\n", sys.entry_eip);
+        sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
+
+        uint32_t eip = sys.exec->ctx.eip;
+        uint32_t sr  = sys.exec->ctx.stop_reason;
+        fprintf(stderr, "[nboxkrnl] Final: EIP=0x%08X stop=%u halted=%d EAX=0x%08X\n",
+                eip, sr, sys.exec->ctx.halted, sys.exec->ctx.gp[GP_EAX]);
+        fprintf(stderr, "[nboxkrnl] CR0=0x%08X CR3=0x%08X ESP=0x%08X\n",
+                sys.exec->ctx.cr0, sys.exec->ctx.cr3, sys.exec->ctx.gp[GP_ESP]);
+
+        printf("[test_runner] nboxkrnl finished: EIP=0x%08X EAX=0x%08X\n",
+               eip, sys.exec->ctx.gp[GP_EAX]);
         return 0;
     }
 

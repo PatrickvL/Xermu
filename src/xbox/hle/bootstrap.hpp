@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <functional>
+#include <direct.h>
 
 namespace xbox {
 
@@ -212,54 +213,44 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
     xbe::write_hle_stubs(sys.exec->ram);
     sys.hle_heap.reset();
     sys.hle_heap.set_xbe_path(cfg.xbe_path);
+    const std::string& xbe_dir = sys.hle_heap.xbe_directory;
 
-    // If an XISO is provided, mount it as D:
+    // ---- Xbox partition / device mounts ----
+    // These mirror the real kernel's IoCreateSymbolicLink calls that the
+    // kernel does during Phase1Initialization.
+
+    // D: = DVD-ROM (title media).  Override with XISO directory if given.
     if (!cfg.xiso_path.empty()) {
-        // Extract directory of the XISO for basic mount
         size_t sep = cfg.xiso_path.find_last_of("/\\");
         std::string xiso_dir = (sep != std::string::npos)
             ? cfg.xiso_path.substr(0, sep) : ".";
-        sys.hle_heap.mounts.push_back({"\\??\\D:", xiso_dir});
-        sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xiso_dir});
+        sys.hle_heap.mount_drive("\\??\\D:", "D", xiso_dir);
+        sys.hle_heap.mount_device("\\Device\\CdRom0", xiso_dir);
+    } else {
+        sys.hle_heap.mount_drive("\\??\\D:", "D", xbe_dir);
     }
 
-    // Default Xbox drive mounts — map to data subdirectories beside the XBE.
-    // The dashboard expects T:, C:, Y:, Z: to exist (even if empty).
-    // Add both \??\X: and x: prefixes since paths may or may not include
-    // the NT object namespace prefix.
-    {
-        size_t sep = cfg.xbe_path.find_last_of("/\\");
-        std::string xbe_dir = (sep != std::string::npos)
-            ? cfg.xbe_path.substr(0, sep) : ".";
-        // D: = XBE directory (DVD-ROM for the title)
-        if (cfg.xiso_path.empty()) {
-            sys.hle_heap.mounts.push_back({"\\??\\D:", xbe_dir});
-            sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xbe_dir});
-            sys.hle_heap.mounts.push_back({"d:", xbe_dir});
-            sys.hle_heap.mounts.push_back({"D:", xbe_dir});
-        }
-        // T: = title persistent data
-        sys.hle_heap.mounts.push_back({"\\??\\T:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"t:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"T:", xbe_dir});
-        // C: = system data partition
-        sys.hle_heap.mounts.push_back({"\\??\\C:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"c:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"C:", xbe_dir});
-        // NT device paths (used by dashboard for NtQueryFullAttributesFile)
-        sys.hle_heap.mounts.push_back({"\\Device\\Harddisk0\\partition2", xbe_dir}); // C:
-        sys.hle_heap.mounts.push_back({"\\Device\\Harddisk0\\Partition2", xbe_dir});
-        // CDROM0: device (DVD-ROM, needed by dashboard tray-state check)
-        sys.hle_heap.mounts.push_back({"CDROM0:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"\\Device\\CdRom0", xbe_dir});
-        // Y: = system cache partition — NOT mounted by default.
-        // On a clean Xbox Y:\xodash\xonlinedash.xbe doesn't exist; mounting
-        // the XBE directory here would false-positive the update check.
-        // Z: = title cache partition
-        sys.hle_heap.mounts.push_back({"\\??\\Z:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"z:", xbe_dir});
-        sys.hle_heap.mounts.push_back({"Z:", xbe_dir});
-    }
+    // C: = system data partition (Partition2)
+    sys.hle_heap.mount_drive("\\??\\C:", "C", xbe_dir);
+    sys.hle_heap.mount_device("\\Device\\Harddisk0\\partition2", xbe_dir);
+    sys.hle_heap.mount_device("\\Device\\Harddisk0\\Partition2", xbe_dir);
+
+    // T: = title persistent data (Partition1 in practice)
+    sys.hle_heap.mount_drive("\\??\\T:", "T", xbe_dir);
+
+    // Y: = system cache partition — must be a separate empty directory
+    // because the XBE directory may contain xodash/ (Xbox Live update).
+    // On a clean Xbox this partition is empty.
+    std::string cache_y = xbe_dir + "/cache_y";
+    _mkdir(cache_y.c_str());
+    sys.hle_heap.mount_drive("\\??\\Y:", "Y", cache_y);
+
+    // Z: = title utility cache partition
+    sys.hle_heap.mount_drive("\\??\\Z:", "Z", xbe_dir);
+
+    // CDROM0: device path (used by HalReadSMCTrayState / NtCreateFile)
+    sys.hle_heap.mount_device("CDROM0:", xbe_dir);
+    sys.hle_heap.mount_device("\\Device\\CdRom0", xbe_dir);
 
     sys.exec->hle_handler = xbe::default_hle_handler;
     sys.exec->hle_user    = &sys.hle_heap;
@@ -893,6 +884,78 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
         sys.running = false;
         return false;
     }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// boot_nboxkrnl — boot a nboxkrnl PE binary with full host-side support.
+//
+// Sets up Xbox hardware, host I/O ports (0x200-0x210), async file I/O,
+// disk partitions, EEPROM keys, loads the kernel PE, configures page tables
+// and CPU state, and returns with sys.entry_eip set to KernelEntry.
+// ---------------------------------------------------------------------------
+} // namespace xbox
+
+#include "xbox/nboxkrnl_boot.hpp"
+#include "xbox/nboxkrnl_host.hpp"
+#include "xbox/nboxkrnl_io.hpp"
+#include "xbox/nboxkrnl_paths.hpp"
+#include "xbox/nboxkrnl_keys.hpp"
+
+namespace xbox {
+
+struct NboxkrnlState {
+    nboxkrnl::HostState    host;
+    nboxkrnl::IoSystem     io;
+    nboxkrnl::KeyConfig    keys;
+};
+
+inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
+                                 NboxkrnlState& nbox,
+                                 std::function<void(const char*)> log = nullptr)
+{
+    auto say = [&](const char* msg) { if (log) log(msg); else fprintf(stderr, "%s\n", msg); };
+
+    // ---- Xbox hardware (MMIO, PIC, PIT, SMBus, NV2A, etc.) ----
+    sys.hw = xbox_setup(*sys.exec);
+
+    // ---- Keys ----
+    nbox.keys = nboxkrnl::default_keys();
+    char kmsg[256];
+    snprintf(kmsg, sizeof(kmsg), "[nboxkrnl] keys: %s",
+             nbox.keys.is_zero() ? "zero (unencrypted EEPROM)" : "loaded from file");
+    say(kmsg);
+
+    // ---- Paths (set up partitions, XBE path) + I/O system ----
+    if (!nboxkrnl::setup_paths(nbox.host, nbox.io, cfg.xbe_path.c_str())) {
+        say("[nboxkrnl] path setup failed");
+        return false;
+    }
+
+    // ---- Host I/O ports ----
+    nbox.host.exec = sys.exec.get();
+    nbox.host.io   = &nbox.io;
+    nboxkrnl::register_host_ports(*sys.exec, nbox.host);
+
+    // ---- Load kernel PE ----
+    nboxkrnl::BootConfig bcfg;
+    bcfg.kernel_pe_path = cfg.kernel_path.c_str();
+    bcfg.input_path     = cfg.xbe_path.c_str();
+    bcfg.keys           = nbox.keys.data;
+
+    uint32_t entry = nboxkrnl::boot_nboxkrnl(*sys.exec, bcfg);
+    if (!entry) {
+        say("[nboxkrnl] boot failed — could not load kernel PE");
+        return false;
+    }
+
+    sys.entry_eip = entry;
+    sys.running   = true;
+
+    snprintf(kmsg, sizeof(kmsg), "[nboxkrnl] boot ready — EIP=0x%08X ESP=0x%08X CR3=0x%08X",
+             entry, sys.exec->ctx.gp[GP_ESP], sys.exec->ctx.cr3);
+    say(kmsg);
 
     return true;
 }
