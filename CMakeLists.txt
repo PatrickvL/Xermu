@@ -179,6 +179,18 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Test: nboxkrnl boot (PE loader + page tables + mock kernel)
+# ---------------------------------------------------------------------------
+add_executable(test_nboxkrnl_boot ${COMMON_SOURCES} src/tests/test_nboxkrnl_boot.cpp)
+target_include_directories(test_nboxkrnl_boot PRIVATE src src/cpu)
+target_link_libraries(test_nboxkrnl_boot PRIVATE Zydis)
+if(MSVC)
+    target_compile_options(test_nboxkrnl_boot PRIVATE /W3)
+else()
+    target_compile_options(test_nboxkrnl_boot PRIVATE -Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
 add_executable(xermu ${COMMON_SOURCES} src/main.cpp)

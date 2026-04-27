@@ -488,3 +488,17 @@
 - **Files**: src/xbox/nboxkrnl_paths.hpp, src/tests/test_nboxkrnl_paths.cpp,
   CMakeLists.txt
 - **Status**: DONE
+
+### Step 36: nboxkrnl M5 — PE loader, page tables, and boot mode
+- **nboxkrnl_boot.hpp**: New file with `boot_nboxkrnl()` that loads a 32-bit
+  Native PE (ImageBase=0x80010000) into guest RAM at PA 0x10000, sets up
+  32-bit non-PAE page tables (identity-map + contiguous mirror + self-map),
+  configures CPU state (CR0/CR3/CR4, segments, stack), and passes 32 bytes
+  of EEPROM/certificate keys on the stack.
+- **Page tables**: PDE[0..15] identity-map 64MB, PDE[0x200..0x20F] mirror
+  at VA 0x80000000, PDE[0x300] self-map at VA 0xC0000000.
+- **test_nboxkrnl_boot**: 3 tests — page table layout, CPU state registers,
+  mock kernel boot (runs guest code with paging + host ports) (3/3 pass).
+- **Files**: src/xbox/nboxkrnl_boot.hpp, src/tests/test_nboxkrnl_boot.cpp,
+  CMakeLists.txt
+- **Status**: DONE
