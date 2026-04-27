@@ -688,6 +688,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     TraceEntry trace_ring[TRACE_RING_SIZE] = {};
     int trace_ring_idx = 0;
 
+    // Spin-loop detection: if the same trace is executed many times in a row,
+    // skip the rest of the countdown by zeroing the loop counter on the stack.
+    uint32_t spin_eip    = 0;
+    uint32_t spin_count  = 0;
+    static constexpr uint32_t SPIN_THRESHOLD = 512;
+
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) {
             fprintf(stderr, "[exec] max_steps (%llu) reached at EIP=%08X\n",
@@ -822,6 +828,36 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         ctx.eip = ctx.next_eip;
         ++steps;
         prev_trace = t;
+
+        // Spin-loop detection: if the trace loops back to itself many times,
+        // it's a busy-wait countdown. Skip by setting likely stack counters to 1.
+        if (ctx.eip == eip) {
+            if (spin_eip == eip) {
+                ++spin_count;
+                if (spin_count >= SPIN_THRESHOLD) {
+                    // Scan the near stack frame for values that look like
+                    // countdown counters and set them to 1 so the loop exits.
+                    uint32_t esp = ctx.gp[GP_ESP];
+                    for (uint32_t off = 0; off <= 0x20; off += 4) {
+                        uint32_t addr = esp + off;
+                        if (addr + 4 <= GUEST_RAM_SIZE) {
+                            uint32_t v;
+                            memcpy(&v, ram + addr, 4);
+                            if (v > 1 && v < 0x80000000u) {
+                                v = 1;
+                                memcpy(ram + addr, &v, 4);
+                            }
+                        }
+                    }
+                    spin_count = 0;
+                }
+            } else {
+                spin_eip = eip;
+                spin_count = 1;
+            }
+        } else {
+            spin_count = 0;
+        }
 
         // Periodic device tick (e.g. PIT timer).
         if (tick_period && ++tick_counter >= tick_period) {

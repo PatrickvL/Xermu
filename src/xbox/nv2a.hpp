@@ -9,6 +9,7 @@
 #include "address_map.hpp"
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 
 namespace xbox {
 
