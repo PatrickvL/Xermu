@@ -578,3 +578,29 @@
 - **Files**: src/cpu/emitter.hpp, src/cpu/jit_helpers.cpp
 - **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
 - **Status**: DONE
+
+### Step 41: Fix stale stop_reason from C helpers + add MmPersistContiguousMemory (HEAD)
+- **Problem 1**: `translate_va_jit()` sets `ctx->stop_reason = STOP_PAGE_FAULT`
+  on every page-walk failure.  When called from C helpers via `guest_translate()`,
+  the helper handles the `~0u` return (e.g. returns bus-float for MMIO read) but
+  does **not** clear `stop_reason`.  The trace continues executing, and when the
+  next `emit_translate_r14` succeeds, the stale `stop_reason` is still set.  The
+  JIT exit checks `stop_reason != 0` → delivers a **spurious #PF** with wrong
+  CR2/EIP.  This corrupted kernel state during page pool initialisation, causing
+  AVL tree root pointer at 0x8002AC58 to contain 0xFFFFFFFF.
+- **Fix 1**: `guest_translate()` in jit_helpers.cpp now unconditionally clears
+  `ctx->stop_reason = 0` after calling `translate_va_jit()`.  C helpers rely on
+  the `~0u` return value for fault detection; the JIT path (emit_translate_r14)
+  still uses `stop_reason` via the separate direct call.
+- **Problem 2**: Kernel ordinal 178 (MmPersistContiguousMemory) was unhandled,
+  causing a FATAL halt during boot after the partition open failure.
+- **Fix 2**: Added `MmPersistContiguousMemory` as a no-op HLE stub (stdcall,
+  3 args).  Persistence across quick-reboots is not emulated.
+- **Result**: nboxkrnl now boots through MmInitSystem, creates a system thread,
+  queries EEPROM settings, sets up timers, allocates virtual memory, tries to
+  open `\Device\Harddisk0\partition1\` (fails — no mount), allocates contiguous
+  memory for display, then calls `HalReturnToFirmware(2)` (quick-reboot).
+  The next blocker is implementing partition/filesystem mounting.
+- **Files**: src/cpu/jit_helpers.cpp, src/xbox/hle/hle_kernel.hpp
+- **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
+- **Status**: DONE

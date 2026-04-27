@@ -143,8 +143,14 @@ fault:
 
 // Translate a guest address to PA if paging is enabled, otherwise pass through.
 static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is_write) {
-    if (ctx->cr0 & 0x80000000u)
-        return translate_va_jit(ctx, addr, is_write ? 1 : 0);
+    if (ctx->cr0 & 0x80000000u) {
+        uint32_t pa = translate_va_jit(ctx, addr, is_write ? 1 : 0);
+        // C helpers handle faults via the ~0u return value.
+        // Clear stop_reason so it doesn't leak into the next
+        // emit_translate_r14 check and cause a spurious #PF.
+        ctx->stop_reason = 0;
+        return pa;
+    }
     return addr;
 }
 

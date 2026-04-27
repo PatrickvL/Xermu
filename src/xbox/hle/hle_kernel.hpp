@@ -153,6 +153,7 @@ enum KernelOrdinal : uint32_t {
     ORD_MmIsAddressValid               = 174,
     ORD_MmLockUnlockBufferPages        = 175,
     ORD_MmMapIoSpace                   = 177,
+    ORD_MmPersistContiguousMemory      = 178,
     ORD_MmQueryStatistics              = 181,
     ORD_MmSetAddressProtect            = 182,
     ORD_MmUnmapIoSpace                 = 183,
@@ -589,6 +590,12 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     case ORD_MmFreeContiguousMemory:
         // Leak: don't track frees in the bump allocator
         stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_MmPersistContiguousMemory:
+        // VOID MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
+        // No-op: persistence across quick-reboots is not emulated.
+        stdcall_cleanup(exec, 3);
         return true;
 
     case ORD_MmGetPhysicalAddress: {
