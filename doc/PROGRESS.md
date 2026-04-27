@@ -604,3 +604,24 @@
 - **Files**: src/cpu/jit_helpers.cpp, src/xbox/hle/hle_kernel.hpp
 - **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
 - **Status**: DONE
+
+### Step 42: Add partition1 device mount + directory-open support (HEAD)
+- **Problem**: `NtOpenFile('\Device\Harddisk0\partition1\')` returned "no mount"
+  because only `partition2` had a device mount.  Additionally, `open_host_file()`
+  used `fopen("rb")` which fails on directories — the partition root open always
+  failed even if the mount existed.
+- **Fix 1**: Added `\Device\Harddisk0\partition1` device mount in `bootstrap.hpp`
+  (points to `<xbe_dir>/TDATA/` for game save data).  Created the directory
+  automatically with `_mkdir`.
+- **Fix 2**: `open_host_file()` in `hle_kernel.hpp` now falls back to `_stat()`
+  when `fopen()` fails — if the path is a directory, it returns a valid handle
+  with `fp=nullptr` and `size=0`.  `close_host_file()` and the destructor
+  already handle null `fp`.
+- **Result**: Dashboard XBE now boots further — passes partition check, creates
+  threads, sets up interrupts/timers, allocates memory, opens temp files, queries
+  EEPROM.  Stops at `HalReturnToFirmware(4)` (Fatal) when
+  `NtCreateFile('y:\xodash\xonlinedash.xbe')` fails (Xbox Live dashboard update
+  not present).  Next blocker: xodash fallback handling.
+- **Files**: src/xbox/hle/bootstrap.hpp, src/xbox/hle/hle_kernel.hpp
+- **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
+- **Status**: DONE

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+#include <sys/stat.h>
 
 // Forward declaration for NV2A PRAMIN mapping
 namespace xbox { struct Nv2aState; }
@@ -432,9 +433,20 @@ struct XbeHeap {
     }
 
     // Open a host file, return handle or 0 on failure
+    // Open a host file, return handle or 0 on failure.
+    // Also succeeds for directories (returns handle with fp=nullptr, size=0).
     uint32_t open_host_file(const std::string& host_path) {
         FILE* fp = fopen(host_path.c_str(), "rb");
-        if (!fp) return 0;
+        if (!fp) {
+            // Check if it's a directory — common for partition root opens.
+            struct _stat st;
+            if (_stat(host_path.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR)) {
+                uint32_t h = next_handle++;
+                open_files[h] = {nullptr, 0, host_path};
+                return h;
+            }
+            return 0;
+        }
         fseek(fp, 0, SEEK_END);
         uint64_t sz = (uint64_t)ftell(fp);
         fseek(fp, 0, SEEK_SET);
@@ -447,7 +459,7 @@ struct XbeHeap {
     bool close_host_file(uint32_t handle) {
         auto it = open_files.find(handle);
         if (it == open_files.end()) return false;
-        fclose(it->second.fp);
+        if (it->second.fp) fclose(it->second.fp);
         open_files.erase(it);
         return true;
     }

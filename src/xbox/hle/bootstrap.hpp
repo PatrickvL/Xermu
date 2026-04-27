@@ -235,6 +235,14 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
     sys.hle_heap.mount_device("\\Device\\Harddisk0\\partition2", xbe_dir);
     sys.hle_heap.mount_device("\\Device\\Harddisk0\\Partition2", xbe_dir);
 
+    // E: = title persistent data (Partition1)
+    // The dashboard opens \Device\Harddisk0\partition1\ during boot.
+    std::string part1_dir = xbe_dir + "/TDATA";
+    _mkdir(part1_dir.c_str());
+    sys.hle_heap.mount_drive("\\??\\E:", "E", part1_dir);
+    sys.hle_heap.mount_device("\\Device\\Harddisk0\\partition1", part1_dir);
+    sys.hle_heap.mount_device("\\Device\\Harddisk0\\Partition1", part1_dir);
+
     // T: = title persistent data (Partition1 in practice)
     sys.hle_heap.mount_drive("\\??\\T:", "T", xbe_dir);
 
