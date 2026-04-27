@@ -449,3 +449,16 @@
 - **Files**: src/cpu/executor.hpp, src/cpu/executor.cpp, src/tests/test_block_rw.cpp,
   CMakeLists.txt
 - **Status**: DONE
+
+### Step 33: nboxkrnl M2 — Host-kernel communication I/O ports
+- **nboxkrnl_host.hpp**: New file implementing I/O port handlers for ports
+  0x200–0x210 — the nboxkrnl ↔ host protocol.  Handles debug string output
+  (DBG_STR), machine type query (MACHINE_TYPE), clock increment, boot time,
+  ACPI timer, XBE path transfer, abort, and file I/O stubs.
+- **HostState**: Timing (boot_time, clock_increment), XBE path, pending I/O
+  flag, and back-pointer to executor for read/write_guest_block.
+- **test_nboxkrnl_ports**: 7 unit tests exercising each port category via
+  hand-assembled guest IN/OUT instructions.
+- **Files**: src/xbox/nboxkrnl_host.hpp, src/tests/test_nboxkrnl_ports.cpp,
+  CMakeLists.txt
+- **Status**: DONE

@@ -135,6 +135,22 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Test: nboxkrnl host I/O port handlers
+# ---------------------------------------------------------------------------
+add_executable(test_nboxkrnl_ports ${COMMON_SOURCES} src/tests/test_nboxkrnl_ports.cpp)
+target_include_directories(test_nboxkrnl_ports PRIVATE src src/cpu)
+target_link_libraries(test_nboxkrnl_ports PRIVATE Zydis)
+
+if(MSVC)
+    target_compile_options(test_nboxkrnl_ports PRIVATE /W3)
+else()
+    target_compile_options(test_nboxkrnl_ports PRIVATE -Wall -Wextra -O2)
+    if(UNIX)
+        target_link_libraries(test_nboxkrnl_ports PRIVATE m)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
 add_executable(xermu ${COMMON_SOURCES} src/main.cpp)
