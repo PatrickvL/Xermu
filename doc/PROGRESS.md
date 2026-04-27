@@ -462,3 +462,19 @@
 - **Files**: src/xbox/nboxkrnl_host.hpp, src/tests/test_nboxkrnl_ports.cpp,
   CMakeLists.txt
 - **Status**: DONE
+
+### Step 34: nboxkrnl M3 — Host-side asynchronous file I/O system
+- **nboxkrnl_io.hpp**: New file implementing the nboxkrnl file I/O packet
+  protocol.  Worker thread processes submit (port 0x206), retry (0x207),
+  query (0x208) and check-enqueue (0x20A) operations.
+- **Supports**: open (all 6 dispositions), close, read, write, remove.
+  Xbox device paths (\Device\CdRom0\..., \Device\Harddisk0\PartitionN\...)
+  mapped to host directories under data/hdd/.  Case-insensitive path lookup.
+- **Pass-through I/O**: Uses host filesystem directly (no FATX metadata).
+  Timestamps fabricated, free clusters = large fixed value.
+- **nboxkrnl_host.hpp**: I/O port stubs replaced with IoSystem calls.
+- **test_nboxkrnl_io**: 4 tests — open, read, create+write+read round-trip,
+  open-nonexistent (4/4 pass).
+- **Files**: src/xbox/nboxkrnl_io.hpp, src/xbox/nboxkrnl_host.hpp,
+  src/tests/test_nboxkrnl_io.cpp, CMakeLists.txt
+- **Status**: DONE

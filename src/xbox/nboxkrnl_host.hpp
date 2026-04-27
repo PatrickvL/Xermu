@@ -9,6 +9,7 @@
 // ---------------------------------------------------------------------------
 
 #include "cpu/executor.hpp"
+#include "nboxkrnl_io.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -61,8 +62,8 @@ struct HostState {
     // XBE launch path in Xbox format, e.g. "\Device\CdRom0\default.xbe".
     std::string xbe_path;
 
-    // File I/O state (set to true when pending packets exist).
-    bool pending_io_packets = false;
+    // File I/O system (optional — set up separately via IoSystem::init).
+    IoSystem* io = nullptr;
 
     // Back-pointer to the executor (for read/write_guest_block).
     Executor* exec = nullptr;
@@ -120,7 +121,7 @@ static uint32_t nboxkrnl_host_read(uint16_t port, unsigned /*size*/, void* user)
     }
 
     case PORT_IO_CHECK_ENQUEUE:
-        return s.pending_io_packets ? 1u : 0u;
+        return (s.io && s.io->has_pending_packets) ? 1u : 0u;
 
     case PORT_XBE_PATH_LENGTH:
         return static_cast<uint32_t>(s.xbe_path.size());
@@ -167,16 +168,21 @@ static void nboxkrnl_host_write(uint16_t port, uint32_t val, unsigned /*size*/, 
         break;
 
     case PORT_IO_START:
-        // TODO (M3): submit_io_packet(s, val);
-        fprintf(stderr, "[nboxkrnl] IO_START: packet at VA 0x%08X (stub)\n", val);
+        if (s.io) {
+            s.io->submit_io_packet(val);
+        } else {
+            fprintf(stderr, "[nboxkrnl] IO_START: packet at VA 0x%08X (no I/O system)\n", val);
+        }
         break;
 
     case PORT_IO_RETRY:
-        // TODO (M3): flush_pending_packets(s);
+        if (s.io) s.io->flush_pending_packets();
         break;
 
     case PORT_IO_QUERY:
-        // TODO (M3): query_io_packet(s, val);
+        if (s.io) {
+            s.io->query_io_packet(val);
+        }
         break;
 
     case PORT_XBE_PATH_ADDR:
