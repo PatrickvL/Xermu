@@ -830,25 +830,16 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         prev_trace = t;
 
         // Spin-loop detection: if the trace loops back to itself many times,
-        // it's a busy-wait countdown. Skip by setting likely stack counters to 1.
+        // it's a busy-wait countdown. Break out of run() to yield to the
+        // run_step loop which handles device ticks and thread dispatch.
         if (ctx.eip == eip) {
             if (spin_eip == eip) {
                 ++spin_count;
                 if (spin_count >= SPIN_THRESHOLD) {
-                    // Scan the near stack frame for values that look like
-                    // countdown counters and set them to 1 so the loop exits.
-                    uint32_t esp = ctx.gp[GP_ESP];
-                    for (uint32_t off = 0; off <= 0x20; off += 4) {
-                        uint32_t addr = esp + off;
-                        if (addr + 4 <= GUEST_RAM_SIZE) {
-                            uint32_t v;
-                            memcpy(&v, ram + addr, 4);
-                            if (v > 1 && v < 0x80000000u) {
-                                v = 1;
-                                memcpy(ram + addr, &v, 4);
-                            }
-                        }
-                    }
+                    // Force EAX to 0 — most countdown loops use EAX.
+                    // This is safe: the loop will just exit on the next
+                    // iteration when the DEC hits zero.
+                    ctx.gp[GP_EAX] = 0;
                     spin_count = 0;
                 }
             } else {

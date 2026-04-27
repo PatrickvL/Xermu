@@ -695,6 +695,11 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
 
     // Either max_steps exhausted or a yield-halt (wait/delay stub).
     // Continue from current EIP next frame.
+    // If EIP is outside guest RAM, this is a bad jump — treat as permanent halt.
+    if (eip >= GUEST_RAM_SIZE && eip < 0xF0000000u) {
+        sys.running = false;
+        return false;
+    }
     sys.entry_eip = sys.exec->ctx.eip;
     return true;
 }
