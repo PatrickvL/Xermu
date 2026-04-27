@@ -191,6 +191,18 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Test: nboxkrnl EEPROM/certificate keys
+# ---------------------------------------------------------------------------
+add_executable(test_nboxkrnl_keys ${COMMON_SOURCES} src/tests/test_nboxkrnl_keys.cpp)
+target_include_directories(test_nboxkrnl_keys PRIVATE src src/cpu)
+target_link_libraries(test_nboxkrnl_keys PRIVATE Zydis)
+if(MSVC)
+    target_compile_options(test_nboxkrnl_keys PRIVATE /W3)
+else()
+    target_compile_options(test_nboxkrnl_keys PRIVATE -Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
 add_executable(xermu ${COMMON_SOURCES} src/main.cpp)

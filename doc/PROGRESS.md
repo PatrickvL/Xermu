@@ -502,3 +502,17 @@
 - **Files**: src/xbox/nboxkrnl_boot.hpp, src/tests/test_nboxkrnl_boot.cpp,
   CMakeLists.txt
 - **Status**: DONE
+
+### Step 37: nboxkrnl M6 — EEPROM and certificate key setup
+- **nboxkrnl_keys.hpp**: New file with `KeyConfig` struct (32 bytes: 16B
+  EEPROM + 16B certificate), `default_keys()` for zero-key mode, and
+  `load_keys()` to read a 32-byte key file from disk.
+- Default zero keys work with the existing unencrypted EEPROM defaults in
+  `SmbusState::init_eeprom()` (NTSC, English, region 1).
+- Optional `--keys` flag support for loading real Xbox keys.
+- **test_nboxkrnl_keys**: 4 tests — default zero keys, load from file
+  (including wrong-size rejection), keys on guest stack, EEPROM defaults
+  consistency (4/4 pass).
+- **Files**: src/xbox/nboxkrnl_keys.hpp, src/tests/test_nboxkrnl_keys.cpp,
+  CMakeLists.txt
+- **Status**: DONE
