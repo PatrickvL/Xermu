@@ -28,11 +28,9 @@ data/
 *.py
 
 # Output captures
-boot_output.txt
-full_output.txt
-run_output.txt
+*_output.txt
+*_stderr.txt
 output.txt
-test_output.txt
 xermu_run.txt
 stderr*.txt
 stdout*.txt
