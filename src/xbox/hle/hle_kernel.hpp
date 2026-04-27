@@ -20,6 +20,100 @@ namespace xbox { struct Nv2aState; }
 #include <unordered_map>
 #include <algorithm>
 
+
+// ---------- Minimal SHA-1 for Xbox crypto HLE (XcSHA / XcHMAC) ----------
+namespace sha1_detail {
+struct SHA1_CTX {
+    uint32_t state[5];
+    uint64_t count;
+    uint8_t  buffer[64];
+};
+
+static inline uint32_t rol32(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+
+static void sha1_transform(uint32_t state[5], const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i)
+        w[i] = (uint32_t(block[i*4])<<24)|(uint32_t(block[i*4+1])<<16)|
+               (uint32_t(block[i*4+2])<<8)|block[i*4+3];
+    for (int i = 16; i < 80; ++i)
+        w[i] = rol32(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+    uint32_t a=state[0],b=state[1],c=state[2],d=state[3],e=state[4];
+    for (int i = 0; i < 80; ++i) {
+        uint32_t f, k;
+        if (i<20)      { f=(b&c)|((~b)&d); k=0x5A827999; }
+        else if (i<40) { f=b^c^d;           k=0x6ED9EBA1; }
+        else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
+        else           { f=b^c^d;           k=0xCA62C1D6; }
+        uint32_t t = rol32(a,5)+f+e+k+w[i];
+        e=d; d=c; c=rol32(b,30); b=a; a=t;
+    }
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d; state[4]+=e;
+}
+
+static void sha1_init(SHA1_CTX* ctx) {
+    ctx->state[0]=0x67452301; ctx->state[1]=0xEFCDAB89;
+    ctx->state[2]=0x98BADCFE; ctx->state[3]=0x10325476;
+    ctx->state[4]=0xC3D2E1F0; ctx->count=0;
+}
+
+static void sha1_update(SHA1_CTX* ctx, const uint8_t* data, size_t len) {
+    size_t idx = (size_t)(ctx->count & 63);
+    ctx->count += len;
+    for (size_t i = 0; i < len; ++i) {
+        ctx->buffer[idx++] = data[i];
+        if (idx == 64) { sha1_transform(ctx->state, ctx->buffer); idx = 0; }
+    }
+}
+
+static void sha1_final(SHA1_CTX* ctx, uint8_t digest[20]) {
+    uint64_t bits = ctx->count * 8;
+    uint8_t pad = 0x80;
+    sha1_update(ctx, &pad, 1);
+    pad = 0;
+    while ((ctx->count & 63) != 56)
+        sha1_update(ctx, &pad, 1);
+    uint8_t len_be[8];
+    for (int i = 7; i >= 0; --i) { len_be[i] = (uint8_t)(bits & 0xFF); bits >>= 8; }
+    sha1_update(ctx, len_be, 8);
+    for (int i = 0; i < 5; ++i) {
+        digest[i*4+0] = (uint8_t)(ctx->state[i]>>24);
+        digest[i*4+1] = (uint8_t)(ctx->state[i]>>16);
+        digest[i*4+2] = (uint8_t)(ctx->state[i]>>8);
+        digest[i*4+3] = (uint8_t)(ctx->state[i]);
+    }
+}
+
+static void hmac_sha1(const uint8_t* key, size_t key_len,
+                      const uint8_t* data1, size_t data1_len,
+                      const uint8_t* data2, size_t data2_len,
+                      uint8_t digest[20]) {
+    uint8_t k_pad[64];
+    memset(k_pad, 0, 64);
+    if (key_len > 64) {
+        SHA1_CTX tmp; sha1_init(&tmp);
+        sha1_update(&tmp, key, key_len);
+        sha1_final(&tmp, k_pad);
+    } else {
+        memcpy(k_pad, key, key_len);
+    }
+    // ipad
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; ++i) { ipad[i] = k_pad[i] ^ 0x36; opad[i] = k_pad[i] ^ 0x5C; }
+    SHA1_CTX ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, ipad, 64);
+    if (data1 && data1_len) sha1_update(&ctx, data1, data1_len);
+    if (data2 && data2_len) sha1_update(&ctx, data2, data2_len);
+    uint8_t inner[20];
+    sha1_final(&ctx, inner);
+    sha1_init(&ctx);
+    sha1_update(&ctx, opad, 64);
+    sha1_update(&ctx, inner, 20);
+    sha1_final(&ctx, digest);
+}
+} // namespace sha1_detail
+
 namespace xbe {
 
 // ============================= Default HLE Handler =========================
@@ -81,7 +175,6 @@ enum KernelOrdinal : uint32_t {
     ORD_ExAllocatePoolWithTag          = 15,
     ORD_ExFreePool                     = 17,
     ORD_ExInitializeReadWriteLock      = 18,
-    ORD_ExReleaseReadWriteLock          = 19,
     ORD_ExQueryPoolBlockSize           = 23,
     ORD_ExQueryNonVolatileSetting      = 24,
     ORD_ExSaveNonVolatileSetting       = 29,
@@ -104,7 +197,6 @@ enum KernelOrdinal : uint32_t {
     ORD_IoDeleteSymbolicLink           = 69,
     ORD_IoDismountVolume               = 90,
     ORD_IoDismountVolumeByName         = 91,
-    ORD_IoSynchronousDeviceIoControlRequest = 94,
     ORD_KeBugCheck                     = 95,
     ORD_KeBugCheckEx                   = 96,
     ORD_KeCancelTimer                  = 97,
@@ -171,7 +263,6 @@ enum KernelOrdinal : uint32_t {
     ORD_NtFreeVirtualMemory            = 199,
     ORD_NtOpenFile                     = 202,
     ORD_NtQueryInformationFile         = 211,
-    ORD_NtQueryDirectoryFile            = 208,
     ORD_NtQueryFullAttributesFile      = 210,
     ORD_NtQueryVolumeInformationFile   = 218,
     ORD_NtReadFile                     = 219,
@@ -213,6 +304,61 @@ enum KernelOrdinal : uint32_t {
     ORD_XeImageFileName                = 326,
     ORD_XeLoadSection                  = 327,
     ORD_XeUnloadSection                = 328,
+    ORD_PhyGetLinkState                  = 252,
+    ORD_PhyInitialize                   = 253,
+    ORD_XcSHAInit                      = 335,
+    ORD_XcSHAUpdate                    = 336,
+    ORD_XcSHAFinal                     = 337,
+    ORD_XcRC4Key                       = 338,
+    ORD_XcRC4Crypt                     = 339,
+    ORD_XcHMAC                         = 340,
+    ORD_ExReadWriteRefurbInfo               = 25,
+    ORD_ExReleaseReadWriteLock              = 28,
+    ORD_IoBuildSynchronousFsdRequest        = 62,
+    ORD_IoInvalidDeviceRequest              = 74,
+    ORD_IoStartNextPacket                   = 81,
+    ORD_IoStartPacket                       = 83,
+    ORD_IoSynchronousDeviceIoControlRequest = 84,
+    ORD_IoSynchronousFsdRequest             = 85,
+    ORD_IofCallDriver                       = 86,
+    ORD_IofCompleteRequest                  = 87,
+    ORD_KeDisconnectInterrupt               = 100,
+    ORD_KeQueryBasePriorityThread           = 124,
+    ORD_KeRemoveQueueDpc                    = 137,
+    ORD_KeRestoreFloatingPointState         = 139,
+    ORD_KeSaveFloatingPointState            = 142,
+    ORD_KeSynchronizeExecution              = 153,
+    ORD_MmLockUnlockPhysicalPage            = 176,
+    ORD_MmQueryAddressProtect               = 179,
+    ORD_MmQueryAllocationSize               = 180,
+    ORD_NtDeleteFile                        = 195,
+    ORD_NtFsControlFile                     = 200,
+    ORD_NtOpenSymbolicLinkObject            = 203,
+    ORD_NtQueryDirectoryFile                = 207,
+    ORD_NtQuerySymbolicLinkObject           = 215,
+    ORD_NtQueryVirtualMemory                = 217,
+    ORD_NtReleaseMutant                     = 221,
+    ORD_NtReleaseSemaphore                  = 222,
+    ORD_NtResumeThread                      = 224,
+    ORD_NtSetSystemTime                     = 228,
+    ORD_NtSignalAndWaitForSingleObjectEx    = 230,
+    ORD_ObReferenceObjectByName             = 247,
+    ORD_RtlCompareMemoryUlong               = 269,
+    ORD_RtlRaiseException                   = 302,
+    ORD_RtlTimeFieldsToTime                 = 304,
+    ORD_RtlTimeToTimeFields                 = 305,
+    ORD_RtlUnwind                           = 312,
+    ORD_RtlUpcaseUnicodeChar                = 313,
+    ORD_XcVerifyPKCS1Signature              = 344,
+    ORD_XcModExp                            = 345,
+    ORD_HalIsResetOrShutdownPending         = 358,
+    ORD_IoMarkIrpMustComplete               = 359,
+    ORD_HalInitiateShutdown                 = 360,
+    ORD_HalEnableSecureTrayEject            = 365,
+    ORD_XcDESKeyParity                  = 346,
+    ORD_XcKeyTable                      = 347,
+    ORD_XcBlockCrypt                    = 348,
+    ORD_XcBlockCryptCBC                 = 349,
     ORD_HalBootSMCVideoMode            = 356,
 };
 
@@ -1530,11 +1676,24 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
     }
 
-    case ORD_NtSetInformationFile:
-        // NTSTATUS NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG)
+    case ORD_NtSetInformationFile: {
+        // NTSTATUS NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID FileInfo, ULONG Length, FILE_INFORMATION_CLASS)
+        uint32_t handle     = stack_arg(exec, 0);
+        uint32_t info_ptr   = stack_arg(exec, 2);
+        uint32_t info_class = stack_arg(exec, 4);
+
+        HostFile* hf = heap->get_host_file(handle);
+        if (hf && hf->fp && info_class == 14 && info_ptr + 8 <= GUEST_RAM_SIZE) {
+            // FilePositionInformation: set file pointer
+            int64_t pos = 0;
+            memcpy(&pos, exec.ram + info_ptr, 8);
+            _fseeki64(hf->fp, pos, SEEK_SET);
+        }
+
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 5);
         return true;
+    }
 
     case ORD_NtQueryInformationFile: {
         // NTSTATUS NtQueryInformationFile(HANDLE FileHandle,
@@ -1899,14 +2058,6 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 2);
         return true;
 
-    case ORD_NtQueryDirectoryFile: {
-        // NTSTATUS NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
-        //     PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS,
-        //     PSTRING, BOOLEAN)
-        exec.ctx.gp[GP_EAX] = 0x80000006u; // STATUS_NO_MORE_FILES
-        stdcall_cleanup(exec, 10);
-        return true;
-    }
 
     case ORD_NtDuplicateObject: {
         // NTSTATUS NtDuplicateObject(HANDLE Source, PHANDLE Target, ULONG Options)
@@ -1919,11 +2070,6 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         return true;
     }
 
-    case ORD_IoSynchronousDeviceIoControlRequest:
-        // NTSTATUS IoSynchronousDeviceIoControlRequest(...)
-        exec.ctx.gp[GP_EAX] = 0;
-        stdcall_cleanup(exec, 8);
-        return true;
 
     case ORD_ObfReferenceObject:
         // void ObfReferenceObject(PVOID)
@@ -2161,9 +2307,6 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 1);
         return true;
 
-    case ORD_ExReleaseReadWriteLock:
-        stdcall_cleanup(exec, 1);
-        return true;
 
     case ORD_HalReadWritePCISpace: {
         // void HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber,
@@ -2259,6 +2402,482 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         }
         exec.ctx.gp[GP_EAX] = 0;
         stdcall_cleanup(exec, 8);
+        return true;
+    }
+
+
+    // ---- I/O manager stubs ----
+    case ORD_IoBuildSynchronousFsdRequest:
+        exec.ctx.gp[GP_EAX] = 0; // NULL IRP
+        stdcall_cleanup(exec, 6);
+        return true;
+    case ORD_IoInvalidDeviceRequest:
+        exec.ctx.gp[GP_EAX] = 0xC0000010u; // STATUS_INVALID_DEVICE_REQUEST
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_IoStartNextPacket:
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_IoStartPacket:
+        stdcall_cleanup(exec, 4);
+        return true;
+    case ORD_IoSynchronousDeviceIoControlRequest:
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 7);
+        return true;
+    case ORD_IoSynchronousFsdRequest:
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 4);
+        return true;
+    case ORD_IofCallDriver: {
+        // NTSTATUS fastcall IofCallDriver(PDEVICE_OBJECT Device, PIRP Irp)
+        // Args: ECX=Device, EDX=Irp
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        return true;
+    }
+    case ORD_IofCompleteRequest:
+        // VOID fastcall IofCompleteRequest(PIRP Irp, CCHAR Boost)
+        return true;
+    case ORD_IoMarkIrpMustComplete:
+        // BOOLEAN IoMarkIrpMustComplete(PIRP Irp)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    // ---- Kernel scheduler/DPC stubs ----
+    case ORD_KeDisconnectInterrupt:
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_KeQueryBasePriorityThread:
+        exec.ctx.gp[GP_EAX] = 8; // THREAD_PRIORITY_NORMAL
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_KeRemoveQueueDpc:
+        exec.ctx.gp[GP_EAX] = 0; // FALSE (wasn't queued)
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_KeRestoreFloatingPointState:
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_KeSaveFloatingPointState:
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_KeSynchronizeExecution:
+        // BOOLEAN KeSynchronizeExecution(PKINTERRUPT, PKSYNC_ROUTINE, PVOID)
+        // Just call the routine -- stub: return TRUE
+        exec.ctx.gp[GP_EAX] = 1;
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    // ---- Memory manager stubs ----
+    case ORD_MmLockUnlockPhysicalPage:
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_MmQueryAddressProtect:
+        exec.ctx.gp[GP_EAX] = 0x04; // PAGE_READWRITE
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_MmQueryAllocationSize:
+        exec.ctx.gp[GP_EAX] = 0x1000; // 4KB default
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    // ---- Nt object manager stubs ----
+    case ORD_NtDeleteFile: {
+        // NTSTATUS NtDeleteFile(POBJECT_ATTRIBUTES)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS (pretend)
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+    case ORD_NtFsControlFile:
+        exec.ctx.gp[GP_EAX] = 0xC0000002u; // STATUS_NOT_IMPLEMENTED
+        stdcall_cleanup(exec, 10);
+        return true;
+    case ORD_NtOpenSymbolicLinkObject:
+        // NTSTATUS NtOpenSymbolicLinkObject(PHANDLE, POBJECT_ATTRIBUTES)
+        exec.ctx.gp[GP_EAX] = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_NtQueryDirectoryFile: {
+        // NTSTATUS NtQueryDirectoryFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE,
+        //   PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PUNICODE_STRING, BOOLEAN)
+        // Return no more files
+        uint32_t iosb = stack_arg(exec, 4);
+        if (iosb + 8 <= GUEST_RAM_SIZE) {
+            uint32_t status = 0x80000006u; // STATUS_NO_MORE_FILES
+            uint32_t info = 0;
+            memcpy(exec.ram + iosb, &status, 4);
+            memcpy(exec.ram + iosb + 4, &info, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0x80000006u; // STATUS_NO_MORE_FILES
+        stdcall_cleanup(exec, 9);
+        return true;
+    }
+    case ORD_NtQuerySymbolicLinkObject:
+        exec.ctx.gp[GP_EAX] = 0xC0000008u; // STATUS_INVALID_HANDLE
+        stdcall_cleanup(exec, 3);
+        return true;
+    case ORD_NtQueryVirtualMemory: {
+        // NTSTATUS NtQueryVirtualMemory(PVOID Base, PMEMORY_BASIC_INFORMATION, ULONG Len, PULONG RetLen)
+        uint32_t info_ptr = stack_arg(exec, 1);
+        uint32_t info_len = stack_arg(exec, 2);
+        if (info_ptr + info_len <= GUEST_RAM_SIZE && info_len >= 28) {
+            memset(exec.ram + info_ptr, 0, info_len);
+            // Fill in basic info: AllocationBase, RegionSize, State=MEM_COMMIT, Protect=RW
+            uint32_t base = stack_arg(exec, 0) & ~0xFFF;
+            uint32_t region = 0x1000;
+            uint32_t state = 0x1000; // MEM_COMMIT
+            uint32_t protect = 0x04; // PAGE_READWRITE
+            memcpy(exec.ram + info_ptr + 0, &base, 4);    // BaseAddress
+            memcpy(exec.ram + info_ptr + 4, &base, 4);    // AllocationBase
+            memcpy(exec.ram + info_ptr + 8, &protect, 4); // AllocationProtect
+            memcpy(exec.ram + info_ptr + 12, &region, 4); // RegionSize
+            memcpy(exec.ram + info_ptr + 16, &state, 4);  // State
+            memcpy(exec.ram + info_ptr + 20, &protect, 4);// Protect
+            // Type=MEM_PRIVATE
+            uint32_t type = 0x20000;
+            memcpy(exec.ram + info_ptr + 24, &type, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 4);
+        return true;
+    }
+    case ORD_NtReleaseMutant:
+        // NTSTATUS NtReleaseMutant(HANDLE, PLONG PreviousCount)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_NtReleaseSemaphore: {
+        // NTSTATUS NtReleaseSemaphore(HANDLE, ULONG ReleaseCount, PULONG PreviousCount)
+        uint32_t prev_ptr = stack_arg(exec, 2);
+        if (prev_ptr && prev_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t prev = 0;
+            memcpy(exec.ram + prev_ptr, &prev, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+    case ORD_NtResumeThread: {
+        // NTSTATUS NtResumeThread(HANDLE, PULONG PreviousSuspendCount)
+        uint32_t prev_ptr = stack_arg(exec, 1);
+        if (prev_ptr && prev_ptr + 4 <= GUEST_RAM_SIZE) {
+            uint32_t prev = 0;
+            memcpy(exec.ram + prev_ptr, &prev, 4);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+    case ORD_NtSetSystemTime:
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 2);
+        return true;
+    case ORD_NtSignalAndWaitForSingleObjectEx:
+        // NTSTATUS(HANDLE SignalObj, HANDLE WaitObj, ULONG WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+        exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    // ---- Object manager stubs ----
+    case ORD_ObReferenceObjectByName:
+        // NTSTATUS(POBJECT_STRING, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PVOID, PVOID*)
+        exec.ctx.gp[GP_EAX] = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        stdcall_cleanup(exec, 8);
+        return true;
+
+    // ---- Ex/HAL stubs ----
+    case ORD_ExReadWriteRefurbInfo:
+        // NTSTATUS ExReadWriteRefurbInfo(PXBOX_REFURB_INFO, ULONG, BOOLEAN)
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 3);
+        return true;
+    case ORD_ExReleaseReadWriteLock:
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_HalIsResetOrShutdownPending:
+        exec.ctx.gp[GP_EAX] = 0; // FALSE
+        return true;
+    case ORD_HalInitiateShutdown:
+        fprintf(stderr, "[hle] HalInitiateShutdown called\n");
+        exec.ctx.halted = true;
+        return true;
+    case ORD_HalEnableSecureTrayEject:
+        stdcall_cleanup(exec, 0);
+        return true;
+
+    // ---- RTL stubs ----
+    case ORD_RtlCompareMemoryUlong: {
+        // SIZE_T RtlCompareMemoryUlong(PVOID Source, SIZE_T Length, ULONG Pattern)
+        uint32_t src_ptr = stack_arg(exec, 0);
+        uint32_t length  = stack_arg(exec, 1);
+        uint32_t pattern = stack_arg(exec, 2);
+        uint32_t matched = 0;
+        if (src_ptr + length <= GUEST_RAM_SIZE) {
+            for (uint32_t i = 0; i + 4 <= length; i += 4) {
+                uint32_t val;
+                memcpy(&val, exec.ram + src_ptr + i, 4);
+                if (val != pattern) break;
+                matched = i + 4;
+            }
+        }
+        exec.ctx.gp[GP_EAX] = matched;
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+    case ORD_RtlRaiseException:
+        // Just log and halt -- this is a fatal exception
+        fprintf(stderr, "[hle] RtlRaiseException at EIP=0x%08X\n", exec.ctx.eip);
+        exec.ctx.halted = true;
+        stdcall_cleanup(exec, 1);
+        return true;
+    case ORD_RtlTimeFieldsToTime: {
+        // BOOLEAN RtlTimeFieldsToTime(PTIME_FIELDS, PLARGE_INTEGER)
+        // Stub: write epoch time
+        uint32_t time_ptr = stack_arg(exec, 1);
+        if (time_ptr + 8 <= GUEST_RAM_SIZE) {
+            // Windows epoch: January 1, 1601 in 100ns intervals
+            // For Xbox, just use a reasonable time: 2004-01-01 = 127488000000000000
+            int64_t t = 127488000000000000LL;
+            memcpy(exec.ram + time_ptr, &t, 8);
+        }
+        exec.ctx.gp[GP_EAX] = 1; // TRUE
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+    case ORD_RtlTimeToTimeFields: {
+        // VOID RtlTimeToTimeFields(PLARGE_INTEGER, PTIME_FIELDS)
+        // TIME_FIELDS: Year(2), Month(2), Day(2), Hour(2), Minute(2), Second(2), Milliseconds(2), Weekday(2)
+        uint32_t tf_ptr = stack_arg(exec, 1);
+        if (tf_ptr + 16 <= GUEST_RAM_SIZE) {
+            memset(exec.ram + tf_ptr, 0, 16);
+            uint16_t year = 2004, month = 1, day = 1;
+            memcpy(exec.ram + tf_ptr + 0, &year, 2);
+            memcpy(exec.ram + tf_ptr + 2, &month, 2);
+            memcpy(exec.ram + tf_ptr + 4, &day, 2);
+        }
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+    case ORD_RtlUnwind:
+        // VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD, PVOID ReturnValue)
+        // This is complex SEH unwinding -- for now just return
+        stdcall_cleanup(exec, 4);
+        return true;
+    case ORD_RtlUpcaseUnicodeChar: {
+        // WCHAR RtlUpcaseUnicodeChar(WCHAR SourceChar)
+        uint32_t ch = stack_arg(exec, 0);
+        if (ch >= 'a' && ch <= 'z') ch -= 32;
+        exec.ctx.gp[GP_EAX] = ch;
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    // ---- Crypto stubs ----
+    case ORD_XcVerifyPKCS1Signature:
+        // BOOLEAN XcVerifyPKCS1Signature(PUCHAR Hash, PUCHAR PubKey, PUCHAR Sig)
+        exec.ctx.gp[GP_EAX] = 1; // TRUE -- pretend signature is valid
+        stdcall_cleanup(exec, 3);
+        return true;
+    case ORD_XcModExp:
+        // ULONG XcModExp(PULONG Result, PULONG Base, PULONG Exp, PULONG Mod, ULONG Len)
+        // Stub: set result to 0
+        {
+            uint32_t result_ptr = stack_arg(exec, 0);
+            uint32_t len = stack_arg(exec, 4);
+            if (result_ptr + len <= GUEST_RAM_SIZE && len > 0)
+                memset(exec.ram + result_ptr, 0, len);
+        }
+        exec.ctx.gp[GP_EAX] = 0;
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    case ORD_XcDESKeyParity: {
+        // VOID XcDESKeyParity(PUCHAR Key, ULONG KeyLen)
+        // Sets odd parity on each byte of a DES key
+        uint32_t key_ptr = stack_arg(exec, 0);
+        uint32_t key_len = stack_arg(exec, 1);
+        if (key_ptr + key_len <= GUEST_RAM_SIZE) {
+            for (uint32_t i = 0; i < key_len; ++i) {
+                uint8_t b = exec.ram[key_ptr + i] & 0xFE;
+                // Count bits, set parity bit for odd parity
+                uint8_t p = b;
+                p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+                exec.ram[key_ptr + i] = b | (~p & 1);
+            }
+        }
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_XcKeyTable:
+        // VOID XcKeyTable(ULONG Encrypt, PUCHAR KeyTable, PUCHAR Key)
+        // DES key schedule generation -- stub: zero the 128-byte key table
+        if (stack_arg(exec, 1) + 128 <= GUEST_RAM_SIZE)
+            memset(exec.ram + stack_arg(exec, 1), 0, 128);
+        stdcall_cleanup(exec, 3);
+        return true;
+
+    case ORD_XcBlockCrypt:
+        // VOID XcBlockCrypt(ULONG Encrypt, PUCHAR Output, PUCHAR Input, PUCHAR KeyTable, ULONG Operation)
+        // DES single block -- stub: copy input to output
+        {
+            uint32_t out_ptr = stack_arg(exec, 1);
+            uint32_t in_ptr  = stack_arg(exec, 2);
+            if (out_ptr + 8 <= GUEST_RAM_SIZE && in_ptr + 8 <= GUEST_RAM_SIZE)
+                memcpy(exec.ram + out_ptr, exec.ram + in_ptr, 8);
+        }
+        stdcall_cleanup(exec, 5);
+        return true;
+
+    case ORD_XcBlockCryptCBC:
+        // VOID XcBlockCryptCBC(ULONG Encrypt, ULONG InputLen, PUCHAR Output, PUCHAR Input,
+        //                      PUCHAR KeyTable, ULONG Operation, PUCHAR Feedback)
+        // DES CBC -- stub: copy input to output
+        {
+            uint32_t in_len  = stack_arg(exec, 1);
+            uint32_t out_ptr = stack_arg(exec, 2);
+            uint32_t in_ptr  = stack_arg(exec, 3);
+            if (out_ptr + in_len <= GUEST_RAM_SIZE && in_ptr + in_len <= GUEST_RAM_SIZE && in_len > 0)
+                memcpy(exec.ram + out_ptr, exec.ram + in_ptr, in_len);
+        }
+        stdcall_cleanup(exec, 7);
+        return true;
+
+    case ORD_PhyGetLinkState:
+        // BOOLEAN PhyGetLinkState(BOOLEAN param) -- return FALSE (cable not connected)
+        exec.ctx.gp[GP_EAX] = 0; // FALSE
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_PhyInitialize:
+        // BOOLEAN PhyInitialize(BOOLEAN param) -- Ethernet PHY; return FALSE (no network)
+        exec.ctx.gp[GP_EAX] = 0; // FALSE
+        stdcall_cleanup(exec, 1);
+        return true;
+
+    case ORD_XcSHAInit: {
+        // VOID XcSHAInit(PUCHAR SHAContext)  -- 116-byte context
+        uint32_t ctx_ptr = stack_arg(exec, 0);
+        if (ctx_ptr + 116 <= GUEST_RAM_SIZE) {
+            sha1_detail::SHA1_CTX ctx;
+            sha1_detail::sha1_init(&ctx);
+            memset(exec.ram + ctx_ptr, 0, 116);
+            memcpy(exec.ram + ctx_ptr, ctx.state, 20);
+        }
+        stdcall_cleanup(exec, 1);
+        return true;
+    }
+
+    case ORD_XcSHAUpdate: {
+        // VOID XcSHAUpdate(PUCHAR SHAContext, PUCHAR Data, ULONG DataLen)
+        uint32_t ctx_ptr  = stack_arg(exec, 0);
+        uint32_t data_ptr = stack_arg(exec, 1);
+        uint32_t data_len = stack_arg(exec, 2);
+        if (ctx_ptr + 116 <= GUEST_RAM_SIZE) {
+            sha1_detail::SHA1_CTX ctx;
+            memcpy(ctx.state, exec.ram + ctx_ptr, 20);
+            memcpy(&ctx.count, exec.ram + ctx_ptr + 20, 8);
+            memcpy(ctx.buffer, exec.ram + ctx_ptr + 28, 64);
+            if (data_ptr + data_len <= GUEST_RAM_SIZE && data_len > 0)
+                sha1_detail::sha1_update(&ctx, exec.ram + data_ptr, data_len);
+            memcpy(exec.ram + ctx_ptr, ctx.state, 20);
+            memcpy(exec.ram + ctx_ptr + 20, &ctx.count, 8);
+            memcpy(exec.ram + ctx_ptr + 28, ctx.buffer, 64);
+        }
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_XcSHAFinal: {
+        // VOID XcSHAFinal(PUCHAR SHAContext, PUCHAR Digest)
+        uint32_t ctx_ptr    = stack_arg(exec, 0);
+        uint32_t digest_ptr = stack_arg(exec, 1);
+        if (ctx_ptr + 116 <= GUEST_RAM_SIZE && digest_ptr + 20 <= GUEST_RAM_SIZE) {
+            sha1_detail::SHA1_CTX ctx;
+            memcpy(ctx.state, exec.ram + ctx_ptr, 20);
+            memcpy(&ctx.count, exec.ram + ctx_ptr + 20, 8);
+            memcpy(ctx.buffer, exec.ram + ctx_ptr + 28, 64);
+            uint8_t digest[20];
+            sha1_detail::sha1_final(&ctx, digest);
+            memcpy(exec.ram + digest_ptr, digest, 20);
+        }
+        stdcall_cleanup(exec, 2);
+        return true;
+    }
+
+    case ORD_XcRC4Key: {
+        // VOID XcRC4Key(PUCHAR RC4Context, ULONG KeyLen, PUCHAR Key)
+        uint32_t ctx_ptr = stack_arg(exec, 0);
+        uint32_t key_len = stack_arg(exec, 1);
+        uint32_t key_ptr = stack_arg(exec, 2);
+        if (ctx_ptr + 258 <= GUEST_RAM_SIZE) {
+            uint8_t* S = exec.ram + ctx_ptr;
+            for (int i = 0; i < 256; ++i) S[i] = (uint8_t)i;
+            uint8_t j = 0;
+            if (key_ptr + key_len <= GUEST_RAM_SIZE && key_len > 0) {
+                for (int i = 0; i < 256; ++i) {
+                    j = j + S[i] + exec.ram[key_ptr + (i % key_len)];
+                    uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+                }
+            }
+            exec.ram[ctx_ptr + 256] = 0;
+            exec.ram[ctx_ptr + 257] = 0;
+        }
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_XcRC4Crypt: {
+        // VOID XcRC4Crypt(PUCHAR RC4Context, ULONG DataLen, PUCHAR Data)
+        uint32_t ctx_ptr  = stack_arg(exec, 0);
+        uint32_t data_len = stack_arg(exec, 1);
+        uint32_t data_ptr = stack_arg(exec, 2);
+        if (ctx_ptr + 258 <= GUEST_RAM_SIZE && data_ptr + data_len <= GUEST_RAM_SIZE) {
+            uint8_t* S = exec.ram + ctx_ptr;
+            uint8_t si = exec.ram[ctx_ptr + 256];
+            uint8_t sj = exec.ram[ctx_ptr + 257];
+            for (uint32_t k = 0; k < data_len; ++k) {
+                si++; sj += S[si];
+                uint8_t tmp = S[si]; S[si] = S[sj]; S[sj] = tmp;
+                exec.ram[data_ptr + k] ^= S[(uint8_t)(S[si] + S[sj])];
+            }
+            exec.ram[ctx_ptr + 256] = si;
+            exec.ram[ctx_ptr + 257] = sj;
+        }
+        stdcall_cleanup(exec, 3);
+        return true;
+    }
+
+    case ORD_XcHMAC: {
+        // VOID XcHMAC(PBYTE Key, ULONG KeyLen, PBYTE Data, ULONG DataLen,
+        //             PBYTE Data2, ULONG Data2Len, PBYTE Digest)
+        uint32_t key_ptr   = stack_arg(exec, 0);
+        uint32_t key_len   = stack_arg(exec, 1);
+        uint32_t d1_ptr    = stack_arg(exec, 2);
+        uint32_t d1_len    = stack_arg(exec, 3);
+        uint32_t d2_ptr    = stack_arg(exec, 4);
+        uint32_t d2_len    = stack_arg(exec, 5);
+        uint32_t dig_ptr   = stack_arg(exec, 6);
+
+        const uint8_t* key  = (key_ptr + key_len <= GUEST_RAM_SIZE) ? exec.ram + key_ptr : nullptr;
+        const uint8_t* dat1 = (d1_ptr + d1_len <= GUEST_RAM_SIZE && d1_len) ? exec.ram + d1_ptr : nullptr;
+        const uint8_t* dat2 = (d2_ptr + d2_len <= GUEST_RAM_SIZE && d2_len) ? exec.ram + d2_ptr : nullptr;
+
+        if (key && dig_ptr + 20 <= GUEST_RAM_SIZE) {
+            uint8_t digest[20];
+            sha1_detail::hmac_sha1(key, key_len,
+                                   dat1, dat1 ? d1_len : 0,
+                                   dat2, dat2 ? d2_len : 0,
+                                   digest);
+            memcpy(exec.ram + dig_ptr, digest, 20);
+        } else if (dig_ptr + 20 <= GUEST_RAM_SIZE) {
+            memset(exec.ram + dig_ptr, 0, 20);
+        }
+        stdcall_cleanup(exec, 7);
         return true;
     }
 

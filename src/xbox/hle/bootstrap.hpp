@@ -246,12 +246,10 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
     // T: = title persistent data (Partition1 in practice)
     sys.hle_heap.mount_drive("\\??\\T:", "T", xbe_dir);
 
-    // Y: = system cache partition — must be a separate empty directory
-    // because the XBE directory may contain xodash/ (Xbox Live update).
-    // On a clean Xbox this partition is empty.
-    std::string cache_y = xbe_dir + "/cache_y";
-    _mkdir(cache_y.c_str());
-    sys.hle_heap.mount_drive("\\??\\Y:", "Y", cache_y);
+    // Y: = system cache partition (Partition3).
+    // Map to the XBE directory so xodash/ (Xbox Live update dash) is found.
+    // On a real Xbox the online update is cached here from Xbox Live.
+    sys.hle_heap.mount_drive("\\??\\Y:", "Y", xbe_dir);
 
     // Z: = title utility cache partition
     sys.hle_heap.mount_drive("\\??\\Z:", "Z", xbe_dir);

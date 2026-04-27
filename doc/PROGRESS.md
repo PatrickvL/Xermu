@@ -605,7 +605,65 @@
 - **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
 - **Status**: DONE
 
-### Step 42: Add partition1 device mount + directory-open support (HEAD)
+### Step 43: HLE — file seek, Xbox crypto, network stubs, 43 kernel ordinals
+
+- **Problem**: Dashboard boot fataled at `HalReturnToFirmware(4)` during the
+  xodash/xonlinedash.xbe validation phase.  Root cause: `NtSetInformationFile`
+  was stubbed as a no-op, so the dashboard's seek-then-read pattern read the
+  wrong certificate data from xonlinedash.xbe.  After fixing that, the dashboard
+  hit unhandled Xbox crypto functions (XcHMAC, XcSHAInit, etc.), network PHY
+  init (PhyInitialize), and 43 other missing kernel ordinals.
+
+- **Fix 1 — NtSetInformationFile**: Now handles `FilePositionInformation`
+  (class 14) by calling `_fseeki64()` on the host file handle.
+
+- **Fix 2 — Y: drive mount**: Changed Y: drive from `cache_y` subdirectory
+  to the XBE directory itself, so `y:\xodash\xonlinedash.xbe` resolves to
+  the actual file on disk.
+
+- **Fix 3 — Xbox crypto (SHA-1, HMAC-SHA-1, RC4, DES)**: Added a minimal
+  SHA-1 implementation and full HLE stubs for 12 crypto ordinals:
+  - XcSHAInit (335), XcSHAUpdate (336), XcSHAFinal (337)
+  - XcRC4Key (338), XcRC4Crypt (339)
+  - XcHMAC (340) — HMAC-SHA-1 with dual data buffers
+  - XcDESKeyParity (346), XcKeyTable (347), XcBlockCrypt (348),
+    XcBlockCryptCBC (349)
+  - XcVerifyPKCS1Signature (344) — returns TRUE (signature valid)
+  - XcModExp (345) — stub returns zero
+
+- **Fix 4 — Network PHY stubs**: PhyGetLinkState (252) and PhyInitialize (253)
+  return FALSE (no network cable).
+
+- **Fix 5 — 43 additional kernel ordinals**: Added stubs for all remaining
+  ordinals imported by xboxdash.xbe, covering:
+  - I/O manager: IoBuild*, IoStart*, IofCallDriver, IofCompleteRequest, etc.
+  - Kernel scheduler: KeRemoveQueueDpc, KeSynchronizeExecution,
+    KeSaveFloatingPointState, KeRestoreFloatingPointState, etc.
+  - Memory manager: MmLockUnlockPhysicalPage, MmQueryAddressProtect, etc.
+  - Nt objects: NtDeleteFile, NtQueryDirectoryFile, NtQueryVirtualMemory,
+    NtReleaseMutant, NtReleaseSemaphore, NtResumeThread, etc.
+  - Object manager: ObReferenceObjectByName
+  - RTL helpers: RtlCompareMemoryUlong, RtlTimeFieldsToTime,
+    RtlTimeToTimeFields, RtlUnwind, RtlUpcaseUnicodeChar
+  - HAL: HalIsResetOrShutdownPending, HalInitiateShutdown,
+    HalEnableSecureTrayEject
+
+- **Fix 6 — Enum corrections**: Fixed three incorrect ordinal numbers that
+  had been in the enum:
+  - ExReleaseReadWriteLock: 19→28
+  - IoSynchronousDeviceIoControlRequest: 94→84
+  - NtQueryDirectoryFile: 208→207
+
+- **Result**: Dashboard now passes xodash validation, crypto verification,
+  and network init.  Reaches NV2A GPU initialization where it busy-waits
+  on KeStallExecutionProcessor, then fatals because GPU MMIO isn't responding.
+  Next blocker: NV2A register stubs.
+
+- **Files**: src/xbox/hle/hle_kernel.hpp, src/xbox/hle/bootstrap.hpp
+- **Result**: 55/55 pass (test_basic + test_nboxkrnl_boot)
+- **Status**: DONE
+
+### Step 42: Add partition1 device mount + directory-open support (aa6f3ba)
 - **Problem**: `NtOpenFile('\Device\Harddisk0\partition1\')` returned "no mount"
   because only `partition2` had a device mount.  Additionally, `open_host_file()`
   used `fopen("rb")` which fails on directories — the partition root open always
