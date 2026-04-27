@@ -844,19 +844,20 @@ inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
     emit_ccall_arg2_imm(e, is_write ? 1 : 0); // arg2 = is_write
     emit_call_abs(e, reinterpret_cast<void*>(translate_va_jit));
 
-    // Check for fault: EAX == ~0u
-    // CMP EAX, -1  →  83 F8 FF
-    e.emit8(0x83); e.emit8(0xF8); e.emit8(0xFF);
-    // JNE +N (skip fault handler); short jump, patch later
-    e.emit8(0x75);
+    // Check for fault: translate_va_jit sets ctx->stop_reason on failure.
+    // We cannot use the return value (~0u) as sentinel because PA 0xFFFFFFFF
+    // is a legitimate MMIO address returned by page table walks.
+    // CMP DWORD [R13 + stop_reason], 0  (STOP_NONE)
+    //   REX.B=0x41, 83 /7 (CMP r/m32,imm8), ModRM=01_111_101 (mod=01,reg=7,rm=5=R13), disp8, imm8
+    e.emit8(REX_B); e.emit8(0x83); e.emit8(0x7D);
+    e.emit8(CTX_STOP_REASON); e.emit8(0x00);
+    // JE +N (skip fault handler — stop_reason == STOP_NONE means success)
+    e.emit8(0x74);
     uint8_t* skip = e.cur();
     e.emit8(0x00); // placeholder
 
-    // Fault path: store STOP_PAGE_FAULT, fault_eip, then exit trace.
-    // MOV DWORD [R13 + stop_reason], STOP_PAGE_FAULT (2)
-    e.emit8(REX_B); e.emit8(0xC7); e.emit8(0x45);
-    e.emit8(CTX_STOP_REASON);
-    e.emit32(STOP_PAGE_FAULT);
+    // Fault path: stop_reason + CR2 already set by translate_va_jit.
+    // Store fault_eip as the guest EIP for the run loop's #PF delivery.
     // MOV DWORD [R13 + next_eip], fault_eip
     e.emit8(REX_B); e.emit8(0xC7); e.emit8(0x45);
     e.emit8(CTX_NEXT_EIP);
@@ -866,7 +867,7 @@ inline void emit_translate_r14(Emitter& e, bool is_write, uint32_t fault_eip) {
     e.emit8(0x9D); // POPFQ — balance the PUSHFQ
     e.emit8(0xC3); // RET
 
-    // Patch the JNE skip target
+    // Patch the JE skip target
     *skip = (uint8_t)(e.cur() - skip - 1);
 
     // Normal path: R14D = EAX (PA)

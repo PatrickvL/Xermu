@@ -133,6 +133,7 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
 
 fault:
     ctx->cr2 = va;
+    ctx->stop_reason = STOP_PAGE_FAULT;
     return ~0u;
 }
 

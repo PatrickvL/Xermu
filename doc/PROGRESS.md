@@ -559,3 +559,22 @@
   src/xbox/nboxkrnl_boot.hpp
 - **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
 - **Status**: DONE
+
+### Step 40: Fix PA sentinel collision in translate_va_jit (HEAD)
+- **Problem**: `translate_va_jit` returned `~0u` (0xFFFFFFFF) as the fault
+  sentinel, but 0xFFFFFFFF is a legitimate PA returned by page table walks
+  for MMIO-region PTEs.  The emitted JIT code compared `CMP EAX, -1` /
+  `JNE` to detect faults, so a valid PA of 0xFFFFFFFF was misinterpreted
+  as a page fault.  This caused a false `#PF` at EIP=0x80012959 with
+  CR2=0x00000000 (the CR2 was stale from no real fault occurring).
+- **Fix**: `translate_va_jit` now sets `ctx->stop_reason = STOP_PAGE_FAULT`
+  on fault.  The emitted JIT code checks `CMP DWORD [R13+stop_reason], 0`
+  (STOP_NONE) instead of comparing the return value.  The return value
+  ~0u is kept for C helper compatibility but is no longer the primary
+  fault indicator.
+- **Result**: nboxkrnl now boots past page pool initialisation into AVL
+  tree insertion before hitting a real `#PF` at VA 3 (ESI=-1 in tree
+  node insertion).  The kernel's own `#PF` handler runs and bugchecks.
+- **Files**: src/cpu/emitter.hpp, src/cpu/jit_helpers.cpp
+- **Result**: 52/52 pass (test_basic + test_nboxkrnl_boot)
+- **Status**: DONE

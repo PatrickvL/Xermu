@@ -1098,18 +1098,36 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 uint32_t pde = 0;
                 if (pde_pa + 4 <= GUEST_RAM_SIZE)
                     memcpy(&pde, ram + pde_pa, 4);
-                fprintf(stderr, "[exec] #PF at EIP=%08X CR2=%08X PDE[%03X]=%08X fs_base=%08X\n",
-                        ctx.eip, cr2, pdi, pde, ctx.fs_base);
-                // Dump physical memory at PA 0x2E278 (KiPcr.PrcbData.CurrentThread)
-                uint32_t ct_val = 0;
-                memcpy(&ct_val, ram + 0x2E278, 4);
-                // Also try translating VA 0x8002E278
-                uint32_t ct_pa = translate_va(0x8002E278u, false);
-                uint32_t ct_via_va = 0;
-                if (ct_pa != ~0u && ct_pa + 4 <= GUEST_RAM_SIZE)
-                    memcpy(&ct_via_va, ram + ct_pa, 4);
-                fprintf(stderr, "[exec]   PA[0x2E278]=%08X  VA[0x8002E278]->PA=%08X->val=%08X\n",
-                        ct_val, ct_pa, ct_via_va);
+                fprintf(stderr, "[exec] #PF at EIP=%08X CR2=%08X PDE[%03X]=%08X fs_base=%08X paging=%d\n",
+                        ctx.eip, cr2, pdi, pde, ctx.fs_base,
+                        (ctx.cr0 & 0x80000000u) ? 1 : 0);
+                fprintf(stderr, "[exec]   EAX=%08X EBX=%08X ECX=%08X EDX=%08X\n",
+                        ctx.gp[0], ctx.gp[3], ctx.gp[1], ctx.gp[2]);
+                fprintf(stderr, "[exec]   ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
+                        ctx.gp[4], ctx.gp[5], ctx.gp[6], ctx.gp[7]);
+                // Also dump the IDT entry for vector 14
+                uint32_t idt_desc = ctx.idtr_base + 14 * 8;
+                uint32_t idt_pa = idt_desc;
+                if (paging_enabled()) idt_pa = translate_va(idt_desc, false);
+                if (idt_pa != ~0u && idt_pa + 8 <= GUEST_RAM_SIZE) {
+                    uint8_t idt_bytes[8];
+                    memcpy(idt_bytes, ram + idt_pa, 8);
+                    uint32_t handler = ((uint32_t)idt_bytes[7] << 24) | ((uint32_t)idt_bytes[6] << 16)
+                                     | ((uint32_t)idt_bytes[1] << 8) | idt_bytes[0];
+                    fprintf(stderr, "[exec]   IDT[14] @ PA=%08X: %02X%02X %02X%02X %02X%02X %02X%02X → handler=%08X\n",
+                            idt_pa, idt_bytes[0], idt_bytes[1], idt_bytes[2], idt_bytes[3],
+                            idt_bytes[4], idt_bytes[5], idt_bytes[6], idt_bytes[7], handler);
+                    fprintf(stderr, "[exec]   IDTR: base=%08X limit=%04X\n",
+                            ctx.idtr_base, ctx.idtr_limit);
+                }
+                // Dump last 16 trace ring entries
+                fprintf(stderr, "[exec]   Trace history (oldest first):\n");
+                for (int i = 0; i < TRACE_RING_SIZE; ++i) {
+                    int idx = (trace_ring_idx + i) % TRACE_RING_SIZE;
+                    if (trace_ring[idx].eip == 0 && trace_ring[idx].esp == 0) continue;
+                    fprintf(stderr, "[exec]     EIP=%08X ESP=%08X EBP=%08X\n",
+                            trace_ring[idx].eip, trace_ring[idx].esp, trace_ring[idx].ebp);
+                }
             }
             // Error code: bit 0 = 0 (not present), bit 2 = 0 (supervisor).
             // Full error code computation would check P, W/R, U/S bits;
@@ -1158,7 +1176,15 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
         // Check for HALT condition (EIP == 0xFFFFFFFF).
         if (ctx.eip == 0xFFFF'FFFFu) {
-            fprintf(stderr, "[exec] EIP=%08X â€” halting\n", ctx.eip);
+            fprintf(stderr, "[exec] EIP=%08X -- halting\n", ctx.eip);
+            // Dump trace ring
+            fprintf(stderr, "[exec] Trace history:\n");
+            for (int i = 0; i < TRACE_RING_SIZE; ++i) {
+                int idx = (trace_ring_idx + i) % TRACE_RING_SIZE;
+                if (trace_ring[idx].eip == 0 && trace_ring[idx].esp == 0) continue;
+                fprintf(stderr, "  EIP=%08X ESP=%08X EBP=%08X\n",
+                        trace_ring[idx].eip, trace_ring[idx].esp, trace_ring[idx].ebp);
+            }
             ctx.halted = true;
             break;
         }
