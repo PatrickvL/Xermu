@@ -895,6 +895,40 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                                 handled = true;
                             }
                         }
+                        // Pass 3: MOV reg,[ESP+disp8]; DEC reg; MOV [ESP+disp8],reg; JNZ
+                        // This is a countdown delay loop. Fast-forward by
+                        // zeroing the counter register so DEC sets ZF=0 and
+                        // JNZ falls through.
+                        if (!handled && eip + 12 <= GUEST_RAM_SIZE) {
+                            uint8_t b0 = ram[eip];
+                            // 8B 44 24 dd = MOV EAX,[ESP+disp8]  (or other reg)
+                            if (b0 == 0x8B) {
+                                uint8_t modrm = ram[eip + 1];
+                                if ((modrm & 0xC7) == 0x44) { // mod=01, r/m=4 (SIB)
+                                    uint8_t sib = ram[eip + 2];
+                                    if (sib == 0x24) { // SIB = base=ESP, no index
+                                        uint8_t disp = ram[eip + 3];
+                                        unsigned reg = (modrm >> 3) & 7;
+                                        // Check DEC reg follows at offset 4
+                                        uint8_t b4 = ram[eip + 4];
+                                        if (b4 >= 0x48 && b4 <= 0x4F &&
+                                            (unsigned)(b4 - 0x48) == reg) {
+                                            // Set reg to 1 so after DEC: 1→0, ZF=1, JNZ falls through
+                                            ctx.gp[reg] = 1;
+                                            // Also write 1 to the stack counter so the stored
+                                            // value matches (in case code re-reads it)
+                                            uint32_t sp = ctx.gp[GP_ESP];
+                                            uint32_t addr = sp + disp;
+                                            if (addr + 4 <= GUEST_RAM_SIZE) {
+                                                uint32_t one = 1;
+                                                memcpy(ram + addr, &one, 4);
+                                            }
+                                            handled = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if (!handled) {
                         // Unrecognized loop pattern: yield to run_step so time
@@ -902,12 +936,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         ctx.halted = true;
                     }
                     // Track "stale" spins: if the same address keeps triggering
-                    // spin detection across many cycles, it's an outer loop
-                    // that keeps re-entering. Yield to let time advance.
+                    // spin detection, yield to let HW devices advance.
                     if (stale_eip == eip) {
                         ++stale_count;
                         if (stale_count >= 64) {
-                            ctx.halted = true; // yield
+                            ctx.halted = true;
                             stale_count = 0;
                         }
                     } else {

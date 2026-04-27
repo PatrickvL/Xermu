@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+
+// Forward declaration for NV2A PRAMIN mapping
+namespace xbox { struct Nv2aState; }
 #include <unordered_map>
 #include <algorithm>
 
@@ -283,6 +286,11 @@ struct XbeHeap {
     uint32_t limit;       // end of allocatable region
     uint32_t next_handle; // fake handle counter
 
+    // GPU instance memory (set by MmClaimGpuInstanceMemory)
+    uint32_t gpu_instance_base = 0;
+    uint32_t gpu_instance_size = 0;
+    void*    nv2a_ptr = nullptr;  // pointer to Nv2aState, set during boot
+
     // Pending threads created by PsCreateSystemThread(Ex)
     std::vector<PendingThread> pending_threads;
 
@@ -484,6 +492,8 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         if (align < 0x1000) align = 0x1000;
         uint32_t addr = heap->alloc(size, align);
         if (addr) memset(exec.ram + addr, 0, size);
+        fprintf(stderr, "[hle] MmAllocateContiguousMemoryEx: size=%08X align=%08X -> addr=%08X\n",
+                size, align, addr);
         exec.ctx.gp[GP_EAX] = addr;
         stdcall_cleanup(exec, 5);
         return true;
@@ -1651,6 +1661,15 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         if (pad_ptr + 4 <= GUEST_RAM_SIZE) {
             uint32_t pad = 0;
             memcpy(exec.ram + pad_ptr, &pad, 4);
+        }
+        // Wire PRAMIN to this GPU instance memory in guest RAM
+        heap->gpu_instance_base = addr;
+        heap->gpu_instance_size = num_bytes > 0 ? num_bytes : 0x1000;
+        if (heap->nv2a_ptr) {
+            auto* nv = static_cast<xbox::Nv2aState*>(heap->nv2a_ptr);
+            nv->pramin_ram      = exec.ram;
+            nv->pramin_ram_base = addr;
+            nv->pramin_ram_size = num_bytes > 0 ? num_bytes : 0x1000;
         }
         exec.ctx.gp[GP_EAX] = addr;
         stdcall_cleanup(exec, 2);

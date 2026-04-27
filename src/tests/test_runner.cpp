@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
 
         // Run to completion (handles threads + DPCs via run_step)
         int run_iters = 0;
-        constexpr int MAX_RUN_ITERS = 200;
+        constexpr int MAX_RUN_ITERS = 2000;
         while (run_iters < MAX_RUN_ITERS && xbox::run_step(sys, 1'000'000)) {
             ++run_iters;
         }

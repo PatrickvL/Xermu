@@ -179,12 +179,26 @@ struct Nv2aState {
     // PRAMIN: Private Raster Memory (GPU instance memory).
     // Mapped at NV2A_BASE + 0x700000 (1 MB). Contains RAMHT, RAMFC, RAMRO,
     // and GPU object instances used by PFIFO and PGRAPH.
+    //
+    // On real Xbox, PRAMIN maps to the GPU instance memory region of physical
+    // RAM (returned by MmClaimGpuInstanceMemory). We support this by letting
+    // pramin_ram/pramin_ram_base redirect PRAMIN accesses to guest RAM.
     static constexpr uint32_t PRAMIN_SIZE = 1024 * 1024;  // 1 MB
     uint8_t pramin[PRAMIN_SIZE] = {};
+
+    // Guest RAM backing for PRAMIN. When set, PRAMIN accesses go to
+    // guest RAM at pramin_ram_base instead of the internal pramin[] array.
+    uint8_t* pramin_ram      = nullptr;   // pointer to guest RAM
+    uint32_t pramin_ram_base = 0;         // guest PA of GPU instance memory
+    uint32_t pramin_ram_size = 0;         // size of GPU instance memory
 
     // PTIMER: 56-bit freerunning nanosecond counter (not a flat register).
     uint64_t ptimer_ns = 0;
     static constexpr uint64_t NS_PER_TICK = 100;
+
+    // PBUS PCI config space mirror (offsets 0x800-0x8FF within PBUS block).
+    // On real NV2A, PBUS[0x800+reg] mirrors the GPU's own PCI config space.
+    uint8_t pbus_pci_mirror[256] = {};
 
     // Pointer to PGRAPH state shadow (set by xbox_setup, used for diag reads).
     struct PgraphState;  // forward decl — full definition in pgraph.hpp
@@ -209,6 +223,7 @@ struct Nv2aState {
 
     Nv2aState() {
         pmc_regs[pmc::BOOT_0 / 4]             = pmc::NV2A_CHIP_ID;
+        pmc_regs[0x044 / 4]                   = pmc::NV2A_CHIP_ID; // BOOT_42 mirror
         pmc_regs[pmc::ENABLE / 4]             = 0xFFFFFFFF;  // all subsystems enabled
         pbus_regs[pbus::FBIO_RAM / 4]         = pbus::FBIO_DDR_SDRAM;
         ptimer_regs[ptimer::NUM / 4]           = 1;
@@ -219,6 +234,26 @@ struct Nv2aState {
         pramdac_regs[pramdac::NVPLL / 4]       = 0x00011C01;
         pramdac_regs[pramdac::MPLL / 4]        = 0x00011801;
         pramdac_regs[pramdac::VPLL / 4]        = 0x00031801;
+
+        // PBUS PCI config space mirror — mirrors NV2A's own PCI config.
+        // NV2A = bus 0, dev 2, fn 0:
+        //   Vendor 0x10DE, Device 0x02A0, Class 03/00/00, Rev A1.
+        //   BAR0 = 0xFD000000 (NV2A MMIO).
+        auto pci_w16 = [&](uint8_t off, uint16_t v) { memcpy(pbus_pci_mirror + off, &v, 2); };
+        auto pci_w32 = [&](uint8_t off, uint32_t v) { memcpy(pbus_pci_mirror + off, &v, 4); };
+        pci_w16(0x00, 0x10DE);         // Vendor ID
+        pci_w16(0x02, 0x02A0);         // Device ID
+        pci_w16(0x04, 0x0007);         // Command: I/O, Mem, BusMaster
+        pci_w16(0x06, 0x00B0);         // Status: cap list, 66MHz, fast B2B
+        pbus_pci_mirror[0x08] = 0xA1;  // Revision
+        pbus_pci_mirror[0x09] = 0x00;  // Prog IF
+        pbus_pci_mirror[0x0A] = 0x00;  // Subclass
+        pbus_pci_mirror[0x0B] = 0x03;  // Class (VGA)
+        pbus_pci_mirror[0x0E] = 0x00;  // Header type 0
+        pci_w32(0x10, 0xFD000000);     // BAR0 (NV2A MMIO, memory)
+        pci_w32(0x14, 0xF0000000);     // BAR1 (FB aperture, prefetchable)
+        pbus_pci_mirror[0x3C] = 3;     // Interrupt line (IRQ 3)
+        pbus_pci_mirror[0x3D] = 1;     // Interrupt pin (INTA#)
     }
 
     void tick_timer() {
@@ -356,12 +391,6 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
-    static bool first_read = true;
-    if (first_read) {
-        fprintf(stderr, "[nv2a] first read: PA=%08X off=%06X\n", pa, off);
-        first_read = false;
-    }
-
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
         if (off == pmc::INTR_0) return nv->pmc_intr_0();  // computed
@@ -371,6 +400,12 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     // --- PBUS (0x001000) ---
     if (off < 0x002000) {
         uint32_t r = off - 0x001000;
+        // PCI config space mirror at PBUS offsets 0x800-0x8FF.
+        if (r >= 0x800 && r < 0x900) {
+            uint32_t v;
+            memcpy(&v, nv->pbus_pci_mirror + (r - 0x800), 4);
+            return v;
+        }
         if (r / 4 < Nv2aState::PBUS_COUNT) return nv->pbus_regs[r / 4];
         return 0;
     }
@@ -435,11 +470,36 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     // --- PRAMIN (0x700000) ---
     if (off >= 0x700000 && off < 0x800000) {
         uint32_t r = off - 0x700000;
+        // If guest RAM backing is set, redirect to GPU instance memory in RAM.
+        if (nv->pramin_ram && r + 4 <= nv->pramin_ram_size) {
+            uint32_t v;
+            memcpy(&v, nv->pramin_ram + nv->pramin_ram_base + r, 4);
+            return v;
+        }
         if (r + 3 < Nv2aState::PRAMIN_SIZE) {
             uint32_t v;
             memcpy(&v, nv->pramin + r, 4);
             return v;
         }
+        return 0;
+    }
+    // --- USER (0x800000): GPU channel control area ---
+    // Each channel is 64KB. Xbox uses channel 0.
+    // Register 0x40 = DMA_PUT, 0x44 = DMA_GET (mirrors PFIFO CACHE1).
+    if (off >= 0x800000) {
+        uint32_t chan_off = off & 0xFFFF;
+        if (chan_off == 0x44) {
+            static int get_log = 0;
+            if (get_log < 5) {
+                ++get_log;
+                fprintf(stderr, "[nv2a] USER DMA_GET read: returning %08X (PUT=%08X)\n",
+                        nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4],
+                        nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4]);
+            }
+            return nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+        }
+        if (chan_off == 0x40)
+            return nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
         return 0;
     }
 
@@ -450,6 +510,13 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
+    // Log all NV2A writes (limited to first 500 for debugging)
+    static int nv2a_wlog = 0;
+    if (nv2a_wlog < 500) {
+        ++nv2a_wlog;
+        fprintf(stderr, "[nv2a] W off=%06X val=%08X\n", off, val);
+    }
+
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
         if (off / 4 < Nv2aState::PMC_COUNT) nv->pmc_regs[off / 4] = val;
@@ -459,6 +526,11 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off < 0x002000) {
         uint32_t r = off - 0x001000;
         if (r == pbus::INTR) { nv->pbus_regs[r / 4] &= ~val; return; }
+        // PCI config space mirror at PBUS offsets 0x800-0x8FF.
+        if (r >= 0x800 && r < 0x900) {
+            memcpy(nv->pbus_pci_mirror + (r - 0x800), &val, 4);
+            return;
+        }
         if (r / 4 < Nv2aState::PBUS_COUNT) nv->pbus_regs[r / 4] = val;
         return;
     }
@@ -470,12 +542,53 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
             nv->pfifo_regs[r / 4] &= ~val;
             return;
         }
-        // Registers that trigger fifo_notify on write
+        // Store register first
+        if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
+        // Log DMA_PUT writes for debugging
+        if (r == pfifo::CACHE1_DMA_PUT) {
+            fprintf(stderr, "[nv2a] PFIFO DMA_PUT write: val=%08X GET=%08X PUSH=%08X PUSH0=%08X\n",
+                    val, nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4],
+                    nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4],
+                    nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4]);
+        }
+
+        // When CACHE1_PUSH1 is written (channel select) or PUSH0 is enabled,
+        // load DMA_PUT/DMA_GET from RAMFC context in PRAMIN.
+        if ((r == pfifo::CACHE1_PUSH1 || (r == pfifo::CACHE1_PUSH0 && (val & 1))) &&
+            nv->pramin_ram) {
+            // Read RAMFC base from NV_PFIFO_RAMFC register.
+            // bits[24:12] = PRAMIN base address >> 4 (in 16-byte units on NV2A)
+            uint32_t ramfc_reg = nv->pfifo_regs[0x0214 / 4]; // PFIFO offset 0x0214
+            uint32_t ramfc_base = ((ramfc_reg >> 12) & 0x1FFF) << 4;  // byte offset in PRAMIN
+            uint32_t channel = nv->pfifo_regs[pfifo::CACHE1_PUSH1 / 4] & 0x1F;
+            // NV2A: 64 bytes per channel context in RAMFC
+            uint32_t ctx_off = ramfc_base + channel * 64;
+            // Read DMA_PUT and DMA_GET from RAMFC context
+            uint32_t ram_addr = nv->pramin_ram_base + ctx_off;
+            if (ram_addr + 64 <= nv->pramin_ram_base + nv->pramin_ram_size) {
+                uint32_t put, get;
+                memcpy(&put, nv->pramin_ram + ram_addr + 0, 4);
+                memcpy(&get, nv->pramin_ram + ram_addr + 4, 4);
+                fprintf(stderr, "[nv2a] RAMFC ch%u @%05X: put=%08X get=%08X (RAMFC reg=%08X)\n",
+                        channel, ctx_off, put, get, ramfc_reg);
+                // Dump first 16 dwords of context
+                fprintf(stderr, "[nv2a] RAMFC ctx:");
+                for (uint32_t i = 0; i < 64; i += 4) {
+                    uint32_t v; memcpy(&v, nv->pramin_ram + ram_addr + i, 4);
+                    fprintf(stderr, " %08X", v);
+                }
+                fprintf(stderr, "\n");
+                if (put != 0 || get != 0) {
+                    nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = put;
+                    nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
+                }
+            }
+        }
+
         bool notify = (r == pfifo::CACHE1_DMA_PUT  ||
                        r == pfifo::CACHE1_PUSH0     ||
                        r == pfifo::CACHE1_DMA_PUSH  ||
                        r == pfifo::CACHE1_DMA_GET);
-        if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
         if (notify && nv->fifo_notify)
             nv->fifo_notify(nv->fifo_notify_user);
         return;
@@ -523,8 +636,29 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // --- PRAMIN (0x700000) ---
     if (off >= 0x700000 && off < 0x800000) {
         uint32_t r = off - 0x700000;
+        if (nv->pramin_ram && r + 4 <= nv->pramin_ram_size) {
+            memcpy(nv->pramin_ram + nv->pramin_ram_base + r, &val, 4);
+            return;
+        }
         if (r + 3 < Nv2aState::PRAMIN_SIZE)
             memcpy(nv->pramin + r, &val, 4);
+        return;
+    }
+    // --- USER (0x800000): GPU channel control area ---
+    if (off >= 0x800000) {
+        uint32_t chan_off = off & 0xFFFF;
+        if (chan_off == 0x40) {
+            // DMA_PUT: update PFIFO registers and ensure push is enabled.
+            // The USER interface implies the channel is active — enable
+            // DMA push and PUSH0 so tick_fifo processes commands.
+            fprintf(stderr, "[nv2a] USER DMA_PUT write: val=%08X (current GET=%08X)\n",
+                    val, nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4]);
+            nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = val;
+            nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
+            nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
+            if (nv->fifo_notify)
+                nv->fifo_notify(nv->fifo_notify_user);
+        }
         return;
     }
 }

@@ -38,7 +38,16 @@ struct XboxHardware {
     MiscIoState misc;
     uint8_t*    ram = nullptr;
     uint32_t    ram_size = 0;
-    uint32_t    tick_accum = 0;  // accumulator for KeTickCount timing
+    uint32_t    tick_accum = 0;     // accumulator for KeTickCount timing
+
+    // ACPI PM Timer: 24-bit counter at 3.579545 MHz.
+    // Each tick callback represents ~1 µs of guest time, so we
+    // increment by ~3.58 ticks per callback.
+    uint32_t    acpi_pmtmr = 0;     // 24-bit free-running counter
+
+    // ACPI GPE0 status/enable registers (ports 0x80C0-0x80C1)
+    uint8_t     acpi_gpe0_sts = 0;
+    uint8_t     acpi_gpe0_en  = 0;
 };
 
 static void hw_tick_callback(void* user) {
@@ -47,6 +56,10 @@ static void hw_tick_callback(void* user) {
     hw->nv2a.tick_timer();
     hw->usb0.tick_frame();
     hw->usb1.tick_frame();
+
+    // Process NV2A PFIFO push buffer commands so DMA_GET advances.
+    if (hw->ram)
+        hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
 
     // Increment KeTickCount approximately every ~1ms.
     // Each tick callback fires once per trace; ~1000 traces ≈ 1ms.
@@ -60,10 +73,33 @@ static void hw_tick_callback(void* user) {
         memcpy(hw->ram + KE_TICK_ADDR, &tick, 4);
     }
 
+    // Advance ACPI PM Timer (~3.58 ticks per µs callback).
+    hw->acpi_pmtmr = (hw->acpi_pmtmr + 4) & 0x00FFFFFFu;
+
     if (hw->nv2a.vblank_irq_pending) {
         hw->nv2a.vblank_irq_pending = false;
         hw->pic.raise_irq(1);
     }
+}
+
+// ACPI PM Timer (port 0x8008): 24-bit free-running counter at 3.579545 MHz.
+static uint32_t acpi_pmtmr_read(uint16_t, unsigned, void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    return hw->acpi_pmtmr;
+}
+
+// ACPI GPE0 status/enable (ports 0x80C0-0x80C1).
+static uint32_t acpi_gpe0_read(uint16_t port, unsigned, void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    if (port == 0x80C0) return hw->acpi_gpe0_sts;
+    return hw->acpi_gpe0_en;
+}
+static void acpi_gpe0_write(uint16_t port, uint32_t val, unsigned, void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    if (port == 0x80C0)
+        hw->acpi_gpe0_sts &= ~(uint8_t)val;  // write-1-to-clear
+    else
+        hw->acpi_gpe0_en = (uint8_t)val;
 }
 
 inline XboxHardware* xbox_setup(Executor& exec) {
@@ -144,6 +180,12 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     // IDE Bus Master DMA (BAR4 = 0xFF60, 16 ports)
     for (uint16_t p = 0xFF60; p <= 0xFF6F; p++)
         exec.register_io(p, ide_bm_read, ide_bm_write, &hw->ide);
+
+    // ACPI PM Timer (0x8008, 32-bit 3.579545 MHz counter)
+    exec.register_io(0x8008, acpi_pmtmr_read, nullptr, hw);
+    // ACPI GPE0 block (0x80C0-0x80C1): status/enable registers
+    exec.register_io(0x80C0, acpi_gpe0_read, acpi_gpe0_write, hw);
+    exec.register_io(0x80C1, acpi_gpe0_read, acpi_gpe0_write, hw);
 
     // Start the NV2A PFIFO processing thread — must be last, after all
     // hardware wiring is complete.

@@ -25,3 +25,5 @@ data/
 stderr.txt
 stdout.txt
 imgui.ini
+*.log
+*.py

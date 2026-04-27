@@ -46,6 +46,7 @@ struct XboxSystem {
     xbe::XbeHeap              hle_heap;
     xbe::XbeInfo              xbe_info {};
     bool                      running  = false;
+    bool                      started  = false;   // true after first run_step
     uint32_t                  entry_eip = 0;
 
     XboxSystem() : exec(std::make_unique<Executor>()) {}
@@ -177,6 +178,7 @@ inline bool boot_hle(XboxSystem& sys, const BootConfig& cfg,
 
     sys.exec->hle_handler = xbe::default_hle_handler;
     sys.exec->hle_user    = &sys.hle_heap;
+    sys.hle_heap.nv2a_ptr = &sys.hw->nv2a;  // for PRAMIN mapping in MmClaimGpuInstanceMemory
 
     sys.entry_eip = sys.xbe_info.entry_point;
     sys.running = true;
@@ -618,6 +620,10 @@ inline bool boot_lle_kernel(XboxSystem& sys, const BootConfig& cfg,
 inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     if (!sys.running) return false;
 
+    // Compute resume EIP before DPC dispatch (DPCs modify ctx.eip).
+    uint32_t resume_eip = sys.started ? sys.exec->ctx.eip : sys.entry_eip;
+    sys.started = true;
+
     // Fire any pending DPCs before running guest code.
     // DPC routines are called at DISPATCH_LEVEL between timeslices.
     while (!sys.hle_heap.pending_dpcs.empty()) {
@@ -643,9 +649,20 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
         // DPC routine has finished (or hit max_steps) — continue
     }
 
+    // If MmClaimGpuInstanceMemory was called, wire up PRAMIN to guest RAM.
+    if (sys.hle_heap.gpu_instance_base && !sys.hw->nv2a.pramin_ram) {
+        sys.hw->nv2a.pramin_ram      = sys.exec->ram;
+        sys.hw->nv2a.pramin_ram_base = sys.hle_heap.gpu_instance_base;
+        sys.hw->nv2a.pramin_ram_size = sys.hle_heap.gpu_instance_size;
+    }
+
     sys.exec->ctx.halted = false;
     sys.exec->ctx.stop_reason = STOP_NONE;
-    sys.exec->run(sys.entry_eip, max_steps);
+
+    // On the first call, start at entry_eip.  On subsequent calls (after a
+    // spin-yield or DPC), resume from where the executor left off so we
+    // don't restart the program from the beginning every time.
+    sys.exec->run(resume_eip, max_steps);
 
     // Check for error stops — these are always permanent
     uint32_t sr = sys.exec->ctx.stop_reason;
@@ -684,6 +701,7 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
 
         // Set entry EIP for next frame — don't run it now
         sys.entry_eip = t.start_routine;
+        sys.exec->ctx.eip = t.start_routine;  // so resume picks it up
         return true;  // still running — will dispatch thread next frame
     }
 
