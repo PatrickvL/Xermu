@@ -76,7 +76,13 @@ the appropriate device emulator. Clean memory accesses go through
     │   ├── pe_loader.hpp         Win32 PE loader (for testing with native PEs)
     │   ├── ram_mirror.hpp        RAM mirror/tiling logic
     │   ├── misc_io.hpp           Miscellaneous I/O ports
+    │   ├── nboxkrnl_boot.hpp     nboxkrnl PE loader and page table setup
+    │   ├── nboxkrnl_host.hpp     Host I/O port protocol (0x200–0x210)
+    │   ├── nboxkrnl_io.hpp       Async file I/O system for nboxkrnl
+    │   ├── nboxkrnl_paths.hpp    Disk partition and XBE path setup
+    │   ├── nboxkrnl_keys.hpp     EEPROM key configuration
     │   └── hle/                  Xbox kernel HLE (High-Level Emulation)
+    │       ├── bootstrap.hpp     Shared boot logic, auto-detect, scan_boot_files
     │       ├── xbe_loader.hpp    XBE file parser, section loader, thunk resolver
     │       └── hle_kernel.hpp    Kernel ordinal handler (~150 stubs), XbeHeap
     └── tests/
@@ -84,6 +90,12 @@ the appropriate device emulator. Clean memory accesses go through
         ├── test_runner.cpp       Test runner: loads .bin, runs in JIT, checks exit
         ├── test_pe_loader.cpp    PE loader unit test
         ├── test_pgraph.cpp       PGRAPH state unit test
+        ├── test_nboxkrnl_boot.cpp  nboxkrnl PE loading and page table tests
+        ├── test_nboxkrnl_e2e.cpp   nboxkrnl end-to-end boot test
+        ├── test_nboxkrnl_io.cpp    nboxkrnl async I/O system tests
+        ├── test_nboxkrnl_keys.cpp  EEPROM key loading tests
+        ├── test_nboxkrnl_paths.cpp Partition and path setup tests
+        ├── test_nboxkrnl_ports.cpp Host I/O port protocol tests
         └── *.asm                 50+ NASM test files (ALU, FPU, SSE, MMIO, HLE, …)
 ```
 
@@ -131,16 +143,19 @@ section management through emulated kernel stubs.
 
 ### Boot Modes
 
-Xermu supports three boot modes:
+Xermu supports four boot modes with automatic fallback:
 
 | Mode | Description | Required Files |
 |------|-------------|----------------|
-| **HLE** | XBE runs with high-level emulated kernel stubs | Dashboard XBE |
+| **nboxkrnl** | XBE runs under the nboxkrnl replacement kernel | `nboxkrnl.exe` + XBE |
 | **LLE Kernel** | XBE runs with real `xboxkrnl.exe` (HLE fallback for missing exports) | `xboxkrnl.exe` + XBE |
 | **LLE BIOS** | Full low-level boot from BIOS ROM through reset vector | BIOS ROM (+ optional MCPX) |
+| **HLE** | XBE runs with high-level emulated kernel stubs | Dashboard XBE |
 
-**HLE mode** (default): Kernel calls are intercepted via `INT 0x20` stubs and
-handled in C++. Fastest to set up — only needs an XBE file.
+**nboxkrnl mode** (preferred): Loads the [nboxkrnl](https://github.com/ergo720/nboxkrnl)
+replacement kernel as a Native PE into guest RAM. nboxkrnl implements Xbox
+kernel exports natively, communicating with the host via I/O ports (0x200–0x210)
+for file I/O, debug output, and timing. No HLE stubs are used.
 
 **LLE Kernel mode**: Loads the real `xboxkrnl.exe` as a PE image into guest RAM.
 XBE kernel thunks are resolved against the kernel's export table, so function
@@ -151,17 +166,41 @@ stubs automatically.
 through real-mode init and protected-mode transition. Requires a BIOS ROM dump;
 an MCPX boot ROM is optional.
 
+**HLE mode**: Kernel calls are intercepted via `INT 0x20` stubs and
+handled in C++. Fastest to set up — only needs an XBE file.
+
+### Auto-Detect Boot Cascade
+
+When no explicit boot mode flags are given, both `xermu` and `test_runner`
+automatically scan `data/` for available files and try boot methods in
+priority order:
+
+1. **nboxkrnl** — if `nboxkrnl.exe` + dashboard XBE found
+2. **BIOS LLE** — if a BIOS ROM is found
+3. **HLE** — if a dashboard XBE is found
+
+This means placing `nboxkrnl.exe` in `data/` is sufficient to boot the
+dashboard — no flags needed.
+
 #### Command-line usage
 
 ```bash
-# HLE mode — XBE with emulated kernel
+# Auto-detect (nboxkrnl → BIOS → HLE) — no flags needed if files are in data/
+./build/Release/xermu
 ./build/Release/xermu data/xbox\ dash\ orig_5960/xboxdash.xbe
+
+# Explicit nboxkrnl mode
+./build/Release/xermu --nboxkrnl data/nboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
 
 # LLE Kernel mode — XBE with real xboxkrnl.exe
 ./build/Release/xermu --kernel data/xboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
 
-# Headless test runner variants
-./build/Release/test_runner --xbox data/xbox\ dash\ orig_5960/xboxdash.xbe
+# LLE BIOS mode
+./build/Release/xermu --bios data/xbox5838.bin [--mcpx data/mcpx_1.0.bin]
+
+# Headless test runner (also supports auto-detect)
+./build/Release/test_runner data/xbox\ dash\ orig_5960/xboxdash.xbe
+./build/Release/test_runner --nboxkrnl data/nboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
 ./build/Release/test_runner --xbox --kernel data/xboxkrnl.exe data/xbox\ dash\ orig_5960/xboxdash.xbe
 ./build/Release/test_runner --bios data/xbox5838.bin [--mcpx data/mcpx_1.0.bin]
 ```
@@ -173,13 +212,14 @@ The GUI automatically scans for known files on startup. Place files in the
 
 | File | Searched paths |
 |------|---------------|
+| nboxkrnl | `data/nboxkrnl.exe`, `data/nboxkrnl/nboxkrnl.exe` |
 | Dashboard XBE | `data/xbox dash orig_5960/xboxdash.xbe`, `data/xboxdash.xbe`, `data/dashboard/xboxdash.xbe` |
 | BIOS ROM | `data/bios.bin`, `data/xbox5838.bin`, `data/xbox5960.bin`, `data/xbox4627.bin`, `data/complex_*.bin`, `data/xboxrom.bin` |
 | MCPX ROM | `data/mcpx_1.0.bin`, `data/mcpx_1.1.bin`, `data/mcpx.bin` |
 | Kernel PE | `data/xboxkrnl.exe`, `data/xboxkrnl_5838.exe`, `data/xboxkrnl_5960.exe` |
 
-When detected, additional boot buttons appear in the GUI (e.g. "Boot Dashboard
-(LLE Kernel)" when both the kernel PE and a dashboard XBE are found).
+When detected, the auto-boot cascade selects the best available mode
+automatically. nboxkrnl is preferred when present.
 
 ## Current Status
 
