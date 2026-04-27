@@ -931,21 +931,31 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         }
                     }
                     if (!handled) {
-                        // Unrecognized loop pattern: yield to run_step so time
-                        // advances and the polled condition may become true.
-                        ctx.halted = true;
+                        // Unrecognized loop pattern.
+                        // In HLE/XBE mode (hle_handler set), yield to run_step
+                        // so the cooperative scheduler can advance time.
+                        // In BIOS/LLE mode (no hle_handler), do NOT halt —
+                        // the loop is legitimate code (RC4, decompression, etc.)
+                        // and there's no scheduler to resume it.
+                        if (hle_handler) {
+                            ctx.halted = true;
+                        }
+                        // else: let the loop continue naturally
                     }
                     // Track "stale" spins: if the same address keeps triggering
                     // spin detection, yield to let HW devices advance.
-                    if (stale_eip == eip) {
-                        ++stale_count;
-                        if (stale_count >= 64) {
-                            ctx.halted = true;
-                            stale_count = 0;
+                    // Only in HLE mode — BIOS loops are legitimate.
+                    if (hle_handler) {
+                        if (stale_eip == eip) {
+                            ++stale_count;
+                            if (stale_count >= 64) {
+                                ctx.halted = true;
+                                stale_count = 0;
+                            }
+                        } else {
+                            stale_eip = eip;
+                            stale_count = 1;
                         }
-                    } else {
-                        stale_eip = eip;
-                        stale_count = 1;
                     }
                     spin_count = 0;
                 }

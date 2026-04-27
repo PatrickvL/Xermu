@@ -1,3 +1,4 @@
+#include <cstdio>
 // ---------------------------------------------------------------------------
 // jit_helpers.cpp — C-linkage helper functions called from JIT-compiled code.
 //

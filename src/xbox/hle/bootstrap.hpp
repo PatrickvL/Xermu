@@ -30,6 +30,7 @@ struct BootConfig {
     std::string xiso_path;         // XISO image to mount as D:
     std::string kernel_path;       // xboxkrnl.exe for LLE-kernel mode
     std::string rc4_key_path;      // 16-byte RC4 key file for 2BL decryption
+    std::string inner_key_path;    // 16-byte inner RC4 key (restores NOP-filled key)
     std::string dump_kernel_path;  // output path for dumped kernel image
 
     bool is_hle()  const { return !xbe_path.empty() && kernel_path.empty(); }
@@ -441,6 +442,51 @@ inline bool boot_lle(XboxSystem& sys, const BootConfig& cfg,
         return false;
     }
     say("[boot] BIOS loaded into flash");
+
+    // --- Restore inner RC4 key if provided ---
+    // Pre-decrypted BIOS dumps often have the inner key at flash offset
+    // 0x3FF9C NOP-filled (0x90) to prevent key redistribution.  If the
+    // correct 16-byte inner key is supplied, write it into the flash to
+    // restore the 2BL's kernel verification + decryption chain.
+    bool inner_key_restored = false;
+    if (!cfg.inner_key_path.empty()) {
+        auto ik = read_file_to_vec(cfg.inner_key_path);
+        if (ik.size() == 16) {
+            constexpr uint32_t INNER_KEY_OFF = 0x3FF9C;
+            memcpy(sys.hw->flash.data + INNER_KEY_OFF, ik.data(), 16);
+            // Mirror into all 4 copies
+            for (uint32_t m = 1; m < 4; ++m)
+                memcpy(sys.hw->flash.data + m * 0x40000 + INNER_KEY_OFF,
+                       ik.data(), 16);
+            say("[boot] Inner RC4 key restored in flash");
+            inner_key_restored = true;
+        } else {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "[boot] Inner key file must be 16 bytes (got %zu)",
+                     ik.size());
+            say(msg);
+        }
+    }
+
+    // --- Patch 2BL: bypass SHA-1 hash verification (if no inner key) ---
+    // The 2BL at offset 0x3D7AC has "JE fail" (0F 84 9C 00 00 00) that
+    // checks the SHA-1 integrity hash of the kernel data.  Pre-decrypted
+    // BIOSes with NOP-filled inner keys will always fail this check.
+    // Bypass it so the boot continues (the kernel decryption will still
+    // fail without the correct inner key, but at least the code path
+    // exercises the full 2BL flow).
+    if (!inner_key_restored) {
+        constexpr uint32_t PATCH_OFF = 0x3D7AC;
+        uint8_t* p = sys.hw->flash.data + PATCH_OFF;
+        if (p[0] == 0x0F && p[1] == 0x84) {
+            memset(p, 0x90, 6);
+            for (uint32_t m = 1; m < 4; ++m)
+                memcpy(sys.hw->flash.data + m * 0x40000 + PATCH_OFF,
+                       p, 6);
+            say("[boot] Patched 2BL: bypassed SHA-1 hash verification (no inner key)");
+        }
+    }
 
     // --- Obtain the RC4 key for 2BL decryption ---
     // Priority: explicit key file > extract from MCPX ROM > none (skip decrypt)

@@ -78,7 +78,8 @@ static void io_irq_trigger_write(uint16_t, uint32_t val, unsigned, void* user) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: test_runner [--xbox] <test.bin> [load_pa_hex]\n"
-                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>] [--rc4-key <key.bin>] [--dump-kernel <out.exe>]\n"
+                        "       test_runner --bios <bios.bin> [--mcpx <mcpx.bin>] [--rc4-key <key.bin>]\n"
+                        "                   [--inner-key <key.bin>] [--dump-kernel <out.exe>]\n"
                         "       test_runner --xbox --kernel <xboxkrnl.exe> <game.xbe>\n");
         return 2;
     }
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
     const char* mcpx_path = nullptr;
     const char* kernel_path = nullptr;
     const char* rc4_key_path = nullptr;
+    const char* inner_key_path = nullptr;
     const char* dump_kernel_path = nullptr;
     int argi = 1;
 
@@ -119,6 +121,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
             rc4_key_path = argv[argi++];
+        } else if (strcmp(argv[argi], "--inner-key") == 0) {
+            argi++;
+            if (argi >= argc) {
+                fprintf(stderr, "--inner-key requires a 16-byte key file path\n");
+                return 2;
+            }
+            inner_key_path = argv[argi++];
         } else if (strcmp(argv[argi], "--dump-kernel") == 0) {
             argi++;
             if (argi >= argc) {
@@ -144,6 +153,7 @@ int main(int argc, char** argv) {
         cfg.bios_path = bios_path;
         if (mcpx_path) cfg.mcpx_path = mcpx_path;
         if (rc4_key_path) cfg.rc4_key_path = rc4_key_path;
+        if (inner_key_path) cfg.inner_key_path = inner_key_path;
         if (dump_kernel_path) cfg.dump_kernel_path = dump_kernel_path;
 
         xbox::XboxSystem sys;
@@ -152,26 +162,27 @@ int main(int argc, char** argv) {
         // Run 2BL to completion — it processes the init table, sets up
         // the memory controller, decrypts/decompresses the kernel into RAM,
         // then jumps to KiSystemStartup.
-        // Run in a loop with run_step() to handle halts and retries.
-        for (int attempt = 0; attempt < 20 && sys.running; ++attempt) {
-            sys.exec->ctx.halted = false;
-            sys.exec->ctx.stop_reason = STOP_NONE;
+        // Single large run: the spin detector no longer halts legitimate
+        // loops (RC4, decompress) in LLE mode.  The execution stops on
+        // HLT (2BL error path: CLI;HLT) or max steps.
+        {
+            fprintf(stderr, "[bios] CPU state: CR0=0x%08X EIP=0x%08X ESP=0x%08X\n",
+                    sys.exec->ctx.cr0, sys.entry_eip, sys.exec->ctx.gp[GP_ESP]);
+            fprintf(stderr, "[bios] GDT: base=0x%08X limit=0x%04X  IDT: base=0x%08X limit=0x%04X\n",
+                    sys.exec->ctx.gdtr_base, sys.exec->ctx.gdtr_limit,
+                    sys.exec->ctx.idtr_base, sys.exec->ctx.idtr_limit);
 
-            // On first attempt, print CPU state
-            if (attempt == 0) {
-                fprintf(stderr, "[bios] CPU state: CR0=0x%08X EIP=0x%08X ESP=0x%08X\n",
-                        sys.exec->ctx.cr0, sys.entry_eip, sys.exec->ctx.gp[GP_ESP]);
-                fprintf(stderr, "[bios] GDT: base=0x%08X limit=0x%04X  IDT: base=0x%08X limit=0x%04X\n",
-                        sys.exec->ctx.gdtr_base, sys.exec->ctx.gdtr_limit,
-                        sys.exec->ctx.idtr_base, sys.exec->ctx.idtr_limit);
-            }
-
-            sys.exec->run(sys.entry_eip, 500'000'000);
+            sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
 
             uint32_t sr = sys.exec->ctx.stop_reason;
             uint32_t eip = sys.exec->ctx.eip;
-            fprintf(stderr, "[bios] attempt %d: EIP=0x%08X stop=%u halted=%d EAX=0x%08X\n",
-                    attempt, eip, sr, sys.exec->ctx.halted, sys.exec->ctx.gp[GP_EAX]);
+            fprintf(stderr, "[bios] Final: EIP=0x%08X stop=%u halted=%d EAX=0x%08X\n",
+                    eip, sr, sys.exec->ctx.halted, sys.exec->ctx.gp[GP_EAX]);
+            fprintf(stderr, "[bios] CR0=0x%08X CR3=0x%08X ESP=0x%08X\n",
+                    sys.exec->ctx.cr0, sys.exec->ctx.cr3, sys.exec->ctx.gp[GP_ESP]);
+            fprintf(stderr, "[bios] GDT: base=0x%08X limit=0x%04X  IDT: base=0x%08X limit=0x%04X\n",
+                    sys.exec->ctx.gdtr_base, sys.exec->ctx.gdtr_limit,
+                    sys.exec->ctx.idtr_base, sys.exec->ctx.idtr_limit);
 
             // Dump bytes at current EIP for diagnostics
             if (eip < GUEST_RAM_SIZE - 16) {
@@ -180,28 +191,33 @@ int main(int argc, char** argv) {
                     fprintf(stderr, " %02X", sys.exec->ram[eip + i]);
                 fprintf(stderr, "\n");
             }
-            // On first attempt, also dump the 2BL header at 0x400000
-            if (attempt == 0 && 0x400040 < GUEST_RAM_SIZE) {
-                fprintf(stderr, "  2BL @400000:");
+            // Dump the kernel load region at 0x80010000 (physical 0x10000)
+            uint32_t kbase = 0x10000;
+            if (kbase + 64 < GUEST_RAM_SIZE) {
+                fprintf(stderr, "  kernel @%08X:", kbase);
                 for (int i = 0; i < 64; ++i) {
-                    if (i % 16 == 0 && i > 0) fprintf(stderr, "\n              ");
-                    fprintf(stderr, " %02X", sys.exec->ram[0x400000 + i]);
+                    if (i % 16 == 0 && i > 0) fprintf(stderr, "\n                  ");
+                    fprintf(stderr, " %02X", sys.exec->ram[kbase + i]);
                 }
                 fprintf(stderr, "\n");
             }
-
-            if (sr == STOP_INVALID_OPCODE || sr == STOP_DIVIDE_ERROR) {
-                // Hit an unhandled instruction — continue from next EIP
-                sys.entry_eip = sys.exec->ctx.next_eip;
-                continue;
+            // Dump the 2BL kernel decryption buffer at 0x3FA000
+            uint32_t krnl_buf = 0x003FA000;
+            if (krnl_buf + 64 < GUEST_RAM_SIZE) {
+                fprintf(stderr, "  krnl_buf @%08X:", krnl_buf);
+                for (int i = 0; i < 64; ++i) {
+                    if (i % 16 == 0 && i > 0) fprintf(stderr, "\n                  ");
+                    fprintf(stderr, " %02X", sys.exec->ram[krnl_buf + i]);
+                }
+                fprintf(stderr, "\n");
+                // Also show entry offset location
+                uint32_t ep_off = 0x35F8;
+                if (krnl_buf + ep_off + 4 < GUEST_RAM_SIZE) {
+                    uint32_t ep_val = *(uint32_t*)(sys.exec->ram + krnl_buf + ep_off);
+                    fprintf(stderr, "  entry offset @%08X: 0x%08X -> entry=0x%08X\n",
+                            krnl_buf + ep_off, ep_val, ep_val + krnl_buf);
+                }
             }
-            if (sys.exec->ctx.halted) {
-                // HLT — kernel might be waiting for interrupts
-                sys.entry_eip = eip + 1; // skip HLT
-                continue;
-            }
-            // Max steps exhausted — continue from current EIP
-            sys.entry_eip = eip;
         }
 
         printf("[test_runner] Final: EIP=0x%08X EAX=0x%08X\n",
