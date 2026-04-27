@@ -111,20 +111,84 @@ inline uint32_t HLE_STUB_BASE  = 0x00080000u;
 inline uint32_t KDATA_BASE     = 0x00081000u;
 
 // Kernel data area layout (offsets from KDATA_BASE)
-static constexpr uint32_t KDATA_OFF_KeTickCount        = 0x000;
-static constexpr uint32_t KDATA_OFF_XboxHardwareInfo   = 0x004;
-static constexpr uint32_t KDATA_OFF_XboxKrnlVersion    = 0x00C;
-static constexpr uint32_t KDATA_OFF_LaunchDataPage     = 0x014;
-static constexpr uint32_t KDATA_OFF_XeImageFileName    = 0x018;
-static constexpr uint32_t KDATA_OFF_XeImageFileNameBuf = 0x020;
+// The area is 0x1000 bytes (4KB page) to hold all data exports.
+static constexpr uint32_t KDATA_SIZE                         = 0x1000;
+static constexpr uint32_t KDATA_OFF_KeTickCount              = 0x000; // DWORD
+static constexpr uint32_t KDATA_OFF_XboxHardwareInfo         = 0x004; // 8 bytes
+static constexpr uint32_t KDATA_OFF_XboxKrnlVersion          = 0x00C; // 8 bytes
+static constexpr uint32_t KDATA_OFF_LaunchDataPage           = 0x014; // DWORD ptr
+static constexpr uint32_t KDATA_OFF_XeImageFileName          = 0x018; // ANSI_STRING
+static constexpr uint32_t KDATA_OFF_XeImageFileNameBuf       = 0x020; // 64 bytes
+static constexpr uint32_t KDATA_OFF_HalDiskCachePartCount    = 0x060; // DWORD
+static constexpr uint32_t KDATA_OFF_HalDiskModelNumber       = 0x064; // ANSI_STRING
+static constexpr uint32_t KDATA_OFF_HalDiskModelNumberBuf    = 0x06C; // 40 bytes
+static constexpr uint32_t KDATA_OFF_HalDiskSerialNumber      = 0x094; // ANSI_STRING
+static constexpr uint32_t KDATA_OFF_HalDiskSerialNumberBuf   = 0x09C; // 20 bytes
+static constexpr uint32_t KDATA_OFF_KdDebuggerEnabled        = 0x0B0; // BOOLEAN
+static constexpr uint32_t KDATA_OFF_KdDebuggerNotPresent     = 0x0B1; // BOOLEAN
+static constexpr uint32_t KDATA_OFF_KeInterruptTime          = 0x0B4; // 12 bytes
+static constexpr uint32_t KDATA_OFF_KeSystemTime             = 0x0C0; // 12 bytes
+static constexpr uint32_t KDATA_OFF_KeTimeIncrement          = 0x0CC; // DWORD
+static constexpr uint32_t KDATA_OFF_KiBugCheckData           = 0x0D0; // 20 bytes
+static constexpr uint32_t KDATA_OFF_HalBootSMCVideoMode      = 0x0E4; // DWORD
+static constexpr uint32_t KDATA_OFF_IdexChannelObject        = 0x0E8; // 128 bytes
+static constexpr uint32_t KDATA_OFF_MmGlobalData             = 0x168; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ExEventObjectType        = 0x188; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ExMutantObjectType       = 0x1A8; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ExSemaphoreObjectType    = 0x1C8; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ExTimerObjectType        = 0x1E8; // 32 bytes
+static constexpr uint32_t KDATA_OFF_IoCompletionObjectType   = 0x208; // 32 bytes
+static constexpr uint32_t KDATA_OFF_IoDeviceObjectType       = 0x228; // 32 bytes
+static constexpr uint32_t KDATA_OFF_IoFileObjectType         = 0x248; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ObDirectoryObjectType    = 0x268; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ObpObjectHandleTable     = 0x288; // 32 bytes
+static constexpr uint32_t KDATA_OFF_ObSymbolicLinkObjectType = 0x2A8; // 32 bytes
+static constexpr uint32_t KDATA_OFF_PsThreadObjectType       = 0x2C8; // 32 bytes
+static constexpr uint32_t KDATA_OFF_XboxEEPROMKey            = 0x2E8; // 16 bytes
+static constexpr uint32_t KDATA_OFF_XboxHDKey                = 0x2F8; // 16 bytes
+static constexpr uint32_t KDATA_OFF_XboxSignatureKey         = 0x308; // 16 bytes
+static constexpr uint32_t KDATA_OFF_XboxLANKey               = 0x318; // 16 bytes
+static constexpr uint32_t KDATA_OFF_XboxAltSigKeys           = 0x328; // 256 bytes
+static constexpr uint32_t KDATA_OFF_XePublicKeyData          = 0x428; // 284 bytes
 
 // Convenience accessors (use current KDATA_BASE)
-inline uint32_t KDATA_KeTickCount()        { return KDATA_BASE + KDATA_OFF_KeTickCount; }
-inline uint32_t KDATA_XboxHardwareInfo()   { return KDATA_BASE + KDATA_OFF_XboxHardwareInfo; }
-inline uint32_t KDATA_XboxKrnlVersion()    { return KDATA_BASE + KDATA_OFF_XboxKrnlVersion; }
-inline uint32_t KDATA_LaunchDataPage()     { return KDATA_BASE + KDATA_OFF_LaunchDataPage; }
-inline uint32_t KDATA_XeImageFileName()    { return KDATA_BASE + KDATA_OFF_XeImageFileName; }
-inline uint32_t KDATA_XeImageFileNameBuf() { return KDATA_BASE + KDATA_OFF_XeImageFileNameBuf; }
+inline uint32_t KDATA_KeTickCount()              { return KDATA_BASE + KDATA_OFF_KeTickCount; }
+inline uint32_t KDATA_XboxHardwareInfo()         { return KDATA_BASE + KDATA_OFF_XboxHardwareInfo; }
+inline uint32_t KDATA_XboxKrnlVersion()          { return KDATA_BASE + KDATA_OFF_XboxKrnlVersion; }
+inline uint32_t KDATA_LaunchDataPage()           { return KDATA_BASE + KDATA_OFF_LaunchDataPage; }
+inline uint32_t KDATA_XeImageFileName()          { return KDATA_BASE + KDATA_OFF_XeImageFileName; }
+inline uint32_t KDATA_XeImageFileNameBuf()       { return KDATA_BASE + KDATA_OFF_XeImageFileNameBuf; }
+inline uint32_t KDATA_HalDiskCachePartCount()    { return KDATA_BASE + KDATA_OFF_HalDiskCachePartCount; }
+inline uint32_t KDATA_HalDiskModelNumber()       { return KDATA_BASE + KDATA_OFF_HalDiskModelNumber; }
+inline uint32_t KDATA_HalDiskModelNumberBuf()    { return KDATA_BASE + KDATA_OFF_HalDiskModelNumberBuf; }
+inline uint32_t KDATA_HalDiskSerialNumber()      { return KDATA_BASE + KDATA_OFF_HalDiskSerialNumber; }
+inline uint32_t KDATA_HalDiskSerialNumberBuf()   { return KDATA_BASE + KDATA_OFF_HalDiskSerialNumberBuf; }
+inline uint32_t KDATA_KdDebuggerEnabled()        { return KDATA_BASE + KDATA_OFF_KdDebuggerEnabled; }
+inline uint32_t KDATA_KdDebuggerNotPresent()     { return KDATA_BASE + KDATA_OFF_KdDebuggerNotPresent; }
+inline uint32_t KDATA_KeInterruptTime()          { return KDATA_BASE + KDATA_OFF_KeInterruptTime; }
+inline uint32_t KDATA_KeSystemTime()             { return KDATA_BASE + KDATA_OFF_KeSystemTime; }
+inline uint32_t KDATA_KeTimeIncrement()          { return KDATA_BASE + KDATA_OFF_KeTimeIncrement; }
+inline uint32_t KDATA_KiBugCheckData()           { return KDATA_BASE + KDATA_OFF_KiBugCheckData; }
+inline uint32_t KDATA_HalBootSMCVideoMode()      { return KDATA_BASE + KDATA_OFF_HalBootSMCVideoMode; }
+inline uint32_t KDATA_IdexChannelObject()        { return KDATA_BASE + KDATA_OFF_IdexChannelObject; }
+inline uint32_t KDATA_MmGlobalData()             { return KDATA_BASE + KDATA_OFF_MmGlobalData; }
+inline uint32_t KDATA_ExEventObjectType()        { return KDATA_BASE + KDATA_OFF_ExEventObjectType; }
+inline uint32_t KDATA_ExMutantObjectType()       { return KDATA_BASE + KDATA_OFF_ExMutantObjectType; }
+inline uint32_t KDATA_ExSemaphoreObjectType()    { return KDATA_BASE + KDATA_OFF_ExSemaphoreObjectType; }
+inline uint32_t KDATA_ExTimerObjectType()        { return KDATA_BASE + KDATA_OFF_ExTimerObjectType; }
+inline uint32_t KDATA_IoCompletionObjectType()   { return KDATA_BASE + KDATA_OFF_IoCompletionObjectType; }
+inline uint32_t KDATA_IoDeviceObjectType()       { return KDATA_BASE + KDATA_OFF_IoDeviceObjectType; }
+inline uint32_t KDATA_IoFileObjectType()         { return KDATA_BASE + KDATA_OFF_IoFileObjectType; }
+inline uint32_t KDATA_ObDirectoryObjectType()    { return KDATA_BASE + KDATA_OFF_ObDirectoryObjectType; }
+inline uint32_t KDATA_ObpObjectHandleTable()     { return KDATA_BASE + KDATA_OFF_ObpObjectHandleTable; }
+inline uint32_t KDATA_ObSymbolicLinkObjectType() { return KDATA_BASE + KDATA_OFF_ObSymbolicLinkObjectType; }
+inline uint32_t KDATA_PsThreadObjectType()       { return KDATA_BASE + KDATA_OFF_PsThreadObjectType; }
+inline uint32_t KDATA_XboxEEPROMKey()            { return KDATA_BASE + KDATA_OFF_XboxEEPROMKey; }
+inline uint32_t KDATA_XboxHDKey()                { return KDATA_BASE + KDATA_OFF_XboxHDKey; }
+inline uint32_t KDATA_XboxSignatureKey()         { return KDATA_BASE + KDATA_OFF_XboxSignatureKey; }
+inline uint32_t KDATA_XboxLANKey()               { return KDATA_BASE + KDATA_OFF_XboxLANKey; }
+inline uint32_t KDATA_XboxAltSigKeys()           { return KDATA_BASE + KDATA_OFF_XboxAltSigKeys; }
+inline uint32_t KDATA_XePublicKeyData()          { return KDATA_BASE + KDATA_OFF_XePublicKeyData; }
 
 // Forward declarations (defined after KernelOrdinal enum below)
 inline uint32_t kernel_data_addr(uint32_t ordinal);

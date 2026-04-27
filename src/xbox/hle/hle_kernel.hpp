@@ -222,14 +222,58 @@ inline uint32_t kernel_data_addr(uint32_t ordinal) {
     case ORD_XboxKrnlVersion:   return KDATA_XboxKrnlVersion();
     case ORD_LaunchDataPage:    return KDATA_LaunchDataPage();
     case ORD_XeImageFileName:   return KDATA_XeImageFileName();
-    default:                    return 0;
+    case 40:  return KDATA_HalDiskCachePartCount();  // HalDiskCachePartitionCount
+    case 41:  return KDATA_HalDiskModelNumber();     // HalDiskModelNumber
+    case 42:  return KDATA_HalDiskSerialNumber();    // HalDiskSerialNumber
+    case 88:  return KDATA_KdDebuggerEnabled();      // KdDebuggerEnabled
+    case 89:  return KDATA_KdDebuggerNotPresent();   // KdDebuggerNotPresent
+    case 120: return KDATA_KeInterruptTime();        // KeInterruptTime
+    case 154: return KDATA_KeSystemTime();           // KeSystemTime
+    case 157: return KDATA_KeTimeIncrement();        // KeTimeIncrement
+    case 162: return KDATA_KiBugCheckData();         // KiBugCheckData
+    case 356: return KDATA_HalBootSMCVideoMode();    // HalBootSMCVideoMode
+    case 357: return KDATA_IdexChannelObject();      // IdexChannelObject
+    case 102: return KDATA_MmGlobalData();           // MmGlobalData
+    case 16:  return KDATA_ExEventObjectType();      // ExEventObjectType
+    case 22:  return KDATA_ExMutantObjectType();     // ExMutantObjectType
+    case 30:  return KDATA_ExSemaphoreObjectType();  // ExSemaphoreObjectType
+    case 31:  return KDATA_ExTimerObjectType();      // ExTimerObjectType
+    case 64:  return KDATA_IoCompletionObjectType(); // IoCompletionObjectType
+    case 70:  return KDATA_IoDeviceObjectType();     // IoDeviceObjectType
+    case 71:  return KDATA_IoFileObjectType();       // IoFileObjectType
+    case 240: return KDATA_ObDirectoryObjectType();  // ObDirectoryObjectType
+    case 245: return KDATA_ObpObjectHandleTable();   // ObpObjectHandleTable
+    case 249: return KDATA_ObSymbolicLinkObjectType(); // ObSymbolicLinkObjectType
+    case 259: return KDATA_PsThreadObjectType();     // PsThreadObjectType
+    case 321: return KDATA_XboxEEPROMKey();          // XboxEEPROMKey
+    case 323: return KDATA_XboxHDKey();              // XboxHDKey
+    case 325: return KDATA_XboxSignatureKey();       // XboxSignatureKey
+    case 353: return KDATA_XboxLANKey();             // XboxLANKey
+    case 354: return KDATA_XboxAltSigKeys();         // XboxAlternateSignatureKeys
+    case 355: return KDATA_XePublicKeyData();        // XePublicKeyData
+    default:  return 0;
     }
 }
 
-// Initialize kernel data exports in guest RAM
+// Helper: write an ANSI_STRING {Length, MaxLength, Buffer} into guest RAM.
+// `str_va` is the VA of the ANSI_STRING struct (8 bytes), `buf_va` is where
+// the character data lives.  Mirrors RtlInitAnsiString but runs on the host.
+inline void write_guest_ansi_string(uint8_t* ram, uint32_t str_va,
+                                    uint32_t buf_va, const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    uint16_t max_len = len + 1;
+    memcpy(ram + str_va + 0, &len, 2);
+    memcpy(ram + str_va + 2, &max_len, 2);
+    memcpy(ram + str_va + 4, &buf_va, 4);
+    memcpy(ram + buf_va, text, len + 1);
+}
+
+// Initialize kernel data exports in guest RAM.
+// Sets up scalar values, time counters, ANSI_STRING data exports, and
+// hardware info.  Object type stubs are left zeroed (valid address is enough).
 inline void init_kernel_data(uint8_t* ram) {
-    // Zero the area first
-    memset(ram + KDATA_BASE, 0, 0x120);
+    // Zero the entire 4KB KDATA area first
+    memset(ram + KDATA_BASE, 0, KDATA_SIZE);
 
     // KeTickCount: start at 1
     uint32_t tick = 1;
@@ -249,15 +293,43 @@ inline void init_kernel_data(uint8_t* ram) {
     uint32_t null_ptr = 0;
     memcpy(ram + KDATA_LaunchDataPage(), &null_ptr, 4);
 
-    // XeImageFileName: "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe"
-    const char* img_name = "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe";
-    uint16_t name_len = (uint16_t)strlen(img_name);
-    uint16_t max_len = name_len + 1;
-    memcpy(ram + KDATA_XeImageFileName(), &name_len, 2);
-    memcpy(ram + KDATA_XeImageFileName() + 2, &max_len, 2);
-    uint32_t buf_addr = KDATA_XeImageFileNameBuf();
-    memcpy(ram + KDATA_XeImageFileName() + 4, &buf_addr, 4);
-    memcpy(ram + KDATA_XeImageFileNameBuf(), img_name, name_len + 1);
+    // XeImageFileName: ANSI_STRING for the running image
+    write_guest_ansi_string(ram, KDATA_XeImageFileName(),
+        KDATA_XeImageFileNameBuf(),
+        "\\Device\\Harddisk0\\Partition2\\xboxdash.xbe");
+
+    // HalDiskCachePartitionCount: 3 (X, Y, Z)
+    uint32_t cache_parts = 3;
+    memcpy(ram + KDATA_HalDiskCachePartCount(), &cache_parts, 4);
+
+    // HalDiskModelNumber / HalDiskSerialNumber: ANSI_STRINGs
+    write_guest_ansi_string(ram, KDATA_HalDiskModelNumber(),
+        KDATA_HalDiskModelNumberBuf(), "XXXXXX");
+    write_guest_ansi_string(ram, KDATA_HalDiskSerialNumber(),
+        KDATA_HalDiskSerialNumberBuf(), "123456");
+
+    // KdDebuggerEnabled: FALSE (0)
+    ram[KDATA_KdDebuggerEnabled()] = 0;
+    // KdDebuggerNotPresent: TRUE (1)
+    ram[KDATA_KdDebuggerNotPresent()] = 1;
+
+    // KeInterruptTime: KSYSTEM_TIME (LowPart, High1Time, High2Time) — start at 0
+    // KeSystemTime: KSYSTEM_TIME — start at 0 (init_kernel_data is called once)
+
+    // KeTimeIncrement: 10000 (= 1ms in 100ns units, matching Xbox timer tick)
+    uint32_t time_inc = 10000;
+    memcpy(ram + KDATA_KeTimeIncrement(), &time_inc, 4);
+
+    // KiBugCheckData: 5 DWORDs, all zero (no bug check)
+
+    // HalBootSMCVideoMode: 1 = NTSC
+    uint32_t smc_mode = 1;
+    memcpy(ram + KDATA_HalBootSMCVideoMode(), &smc_mode, 4);
+
+    // IdexChannelObject: zeroed is fine (not actively used in HLE)
+    // MmGlobalData: zeroed (not actively used)
+    // Object type structures: zeroed is OK — they just need valid addresses
+    // Encryption keys: all zero (no real key data in HLE mode)
 }
 
 // Simple bump allocator for guest heap (contiguous memory requests)
@@ -317,16 +389,26 @@ struct XbeHeap {
         return base;
     }
 
-    // Set up default mount points based on the XBE file path
+    // Set up the XBE path (mounts are configured separately by boot_hle)
     void set_xbe_path(const std::string& xbe_path) {
-        // Extract directory from XBE path
         size_t last_sep = xbe_path.find_last_of("/\\");
         xbe_directory = (last_sep != std::string::npos) ? xbe_path.substr(0, last_sep) : ".";
+    }
 
-        // Default mounts: Xbox partition 2 = dashboard directory
-        mounts.push_back({"\\Device\\Harddisk0\\Partition2", xbe_directory});
-        mounts.push_back({"\\??\\C:", xbe_directory});
-        mounts.push_back({"\\??\\D:", xbe_directory}); // D: also commonly used
+    // Add a mount point (both NT object path and bare letter form)
+    void mount_drive(const char* nt_prefix, const char* letter,
+                     const std::string& host_dir) {
+        mounts.push_back({nt_prefix, host_dir});
+        // Add bare letter variants (e.g. "c:", "C:")
+        char lower[3] = { (char)tolower(letter[0]), ':', 0 };
+        char upper[3] = { (char)toupper(letter[0]), ':', 0 };
+        mounts.push_back({lower, host_dir});
+        mounts.push_back({upper, host_dir});
+    }
+
+    // Add a device mount (NT path only, no drive letter)
+    void mount_device(const char* device_path, const std::string& host_dir) {
+        mounts.push_back({device_path, host_dir});
     }
 
     // Translate Xbox path to host path
@@ -1249,12 +1331,27 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     // ---- I/O Manager stubs ----
 
-    case ORD_IoCreateDevice:
-        // NTSTATUS IoCreateDevice(PDRIVER_OBJECT, ULONG, PSTRING, ULONG,
-        //                         BOOLEAN, PDEVICE_OBJECT*)
+    case ORD_IoCreateDevice: {
+        // NTSTATUS IoCreateDevice(PDRIVER_OBJECT DriverObject, ULONG ExtensionSize,
+        //     PSTRING DeviceName, ULONG DeviceType, BOOLEAN Exclusive,
+        //     OUT PDEVICE_OBJECT *DeviceObject)
+        uint32_t ext_size   = stack_arg(exec, 1);
+        uint32_t dev_obj_pp = stack_arg(exec, 5);
+        // Allocate a fake DEVICE_OBJECT (>= 0xB8 bytes) + extension
+        uint32_t obj_size = 0xB8 + ext_size;
+        uint32_t obj_addr = heap->alloc(obj_size);
+        if (obj_addr) memset(exec.ram + obj_addr, 0, obj_size);
+        if (dev_obj_pp + 4 <= GUEST_RAM_SIZE)
+            memcpy(exec.ram + dev_obj_pp, &obj_addr, 4);
+        // Write DeviceExtension pointer at offset 0x28 in DEVICE_OBJECT
+        if (obj_addr && obj_addr + 0x2C <= GUEST_RAM_SIZE) {
+            uint32_t ext_ptr = (ext_size > 0) ? obj_addr + 0xB8 : 0;
+            memcpy(exec.ram + obj_addr + 0x28, &ext_ptr, 4);
+        }
         exec.ctx.gp[GP_EAX] = 0; // STATUS_SUCCESS
         stdcall_cleanup(exec, 6);
         return true;
+    }
 
     case ORD_IoCreateFile: {
         // NTSTATUS IoCreateFile(OUT PHANDLE, ACCESS, OBJ_ATTRS, IO_STATUS,
@@ -1560,30 +1657,54 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         uint32_t handle_ptr  = stack_arg(exec, 0);
         uint32_t obj_attrs   = stack_arg(exec, 2);
         uint32_t iosb_ptr    = stack_arg(exec, 3);
+        uint32_t create_disp = stack_arg(exec, 7); // CreateDisposition
+        uint32_t create_opts = stack_arg(exec, 8); // CreateOptions
 
         std::string xbox_path = read_object_name(exec, obj_attrs);
         std::string host_path = heap->translate_path(xbox_path);
 
+        // CreateDisposition: FILE_SUPERSEDE=0, FILE_OPEN=1, FILE_CREATE=2,
+        // FILE_OPEN_IF=3, FILE_OVERWRITE=4, FILE_OVERWRITE_IF=5
+        constexpr uint32_t FILE_OPEN = 1;
+        constexpr uint32_t FILE_OVERWRITE = 4;
+        // CreateOptions
+        constexpr uint32_t FILE_DIRECTORY_FILE = 0x00000001;
+        bool open_only = (create_disp == FILE_OPEN || create_disp == FILE_OVERWRITE);
+        bool is_dir    = (create_opts & FILE_DIRECTORY_FILE) != 0;
+
         uint32_t h = 0;
         uint32_t status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+        bool is_device_open = false;   // true if opening a volume root
         if (!host_path.empty()) {
+            // Check if this is a bare device/volume open (path == mount base)
+            for (auto& m : heap->mounts) {
+                if (_strnicmp(xbox_path.c_str(), m.xbox_prefix.c_str(),
+                              m.xbox_prefix.size()) == 0 &&
+                    xbox_path.size() == m.xbox_prefix.size()) {
+                    is_device_open = true;
+                    break;
+                }
+            }
             h = heap->open_host_file(host_path);
             if (h) {
                 status = 0; // STATUS_SUCCESS
                 fprintf(stderr, "[hle] NtCreateFile: '%s' -> handle 0x%X\n",
                         xbox_path.c_str(), h);
-            } else {
-                // Mount matched but file doesn't exist — return a fake handle.
-                // This covers directory creates and files the guest expects to
-                // create (CreateDisposition = FILE_OPEN_IF / FILE_CREATE).
+            } else if (is_device_open || is_dir || !open_only) {
+                // Device/volume open, directory operation, or create disposition.
                 h = heap->next_handle++;
                 status = 0;
-                fprintf(stderr, "[hle] NtCreateFile: '%s' -> fake handle 0x%X (created)\n",
-                        xbox_path.c_str(), h);
+                fprintf(stderr, "[hle] NtCreateFile: '%s' -> fake handle 0x%X (%s)\n",
+                        xbox_path.c_str(), h,
+                        is_device_open ? "device" : "created");
+            } else {
+                // Mount matched, file doesn't exist, and disposition is
+                // FILE_OPEN — return not-found (e.g. xonlinedash.xbe check).
+                fprintf(stderr, "[hle] NtCreateFile: '%s' -> not found (%s) disp=%u\n",
+                        xbox_path.c_str(), host_path.c_str(), create_disp);
             }
         } else {
-            // No mount matched — return not-found so the guest doesn't
-            // try to use a non-existent file (e.g. xonlinedash.xbe).
+            // No mount matched — return not-found.
             fprintf(stderr, "[hle] NtCreateFile: '%s' -> not found (no mount)\n",
                     xbox_path.c_str());
         }
@@ -2121,11 +2242,6 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         stdcall_cleanup(exec, 8);
         return true;
     }
-
-    case ORD_HalBootSMCVideoMode:
-        // ULONG HalBootSMCVideoMode - DATA export, not a function
-        exec.ctx.gp[GP_EAX] = 1; // NTSC-M
-        return true;
 
         default:
         // Unhandled: log and halt (cannot continue safely because
