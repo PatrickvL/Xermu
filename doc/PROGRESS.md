@@ -478,3 +478,13 @@
 - **Files**: src/xbox/nboxkrnl_io.hpp, src/xbox/nboxkrnl_host.hpp,
   src/tests/test_nboxkrnl_io.cpp, CMakeLists.txt
 - **Status**: DONE
+
+### Step 35: nboxkrnl M4 — XBE path and disk partition setup
+- **nboxkrnl_paths.hpp**: New file with `setup_paths()` utility that creates
+  HDD partition directories (data/hdd/Partition{0..5}/) and configures the
+  XBE launch path in nboxkrnl format (\Device\CdRom0\<name>.xbe).
+- **Supports**: XBE files (DVD dir = parent directory).  XISO placeholder.
+- **test_nboxkrnl_paths**: 2 tests — XBE setup + bad extension rejection.
+- **Files**: src/xbox/nboxkrnl_paths.hpp, src/tests/test_nboxkrnl_paths.cpp,
+  CMakeLists.txt
+- **Status**: DONE

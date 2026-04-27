@@ -167,6 +167,18 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Test: nboxkrnl path setup
+# ---------------------------------------------------------------------------
+add_executable(test_nboxkrnl_paths ${COMMON_SOURCES} src/tests/test_nboxkrnl_paths.cpp)
+target_include_directories(test_nboxkrnl_paths PRIVATE src src/cpu)
+target_link_libraries(test_nboxkrnl_paths PRIVATE Zydis)
+if(MSVC)
+    target_compile_options(test_nboxkrnl_paths PRIVATE /W3)
+else()
+    target_compile_options(test_nboxkrnl_paths PRIVATE -Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
 add_executable(xermu ${COMMON_SOURCES} src/main.cpp)
