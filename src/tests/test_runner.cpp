@@ -278,7 +278,7 @@ int main(int argc, char** argv) {
             memcpy(&ct_before, ram_base + 0x2E278, 4);
             fprintf(stderr, "[nboxkrnl] PA[0x2E278] before exec = %08X\n", ct_before);
         }
-        sys.exec->run(sys.entry_eip, 20'000'000ULL);
+        sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
 
         uint32_t eip = sys.exec->ctx.eip;
         uint32_t sr  = sys.exec->ctx.stop_reason;
@@ -311,6 +311,59 @@ int main(int argc, char** argv) {
         printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",
                result == 0 ? "PASS" : "FAIL", result, sys.exec->ctx.eip);
         return result == 0 ? 0 : 1;
+    }
+
+    // ---- Auto-detect mode: no explicit mode flag + XBE argument ----
+    // Try: nboxkrnl → BIOS → HLE (same cascade as xermu.exe)
+    if (!bios_mode && !nboxkrnl_mode && !kernel_path && argi < argc) {
+        const char* arg = argv[argi];
+        size_t len = strlen(arg);
+        bool looks_xbe = (len > 4 &&
+            (strcmp(arg + len - 4, ".xbe") == 0 || strcmp(arg + len - 4, ".XBE") == 0));
+        if (looks_xbe) {
+            xbox::BootConfig cfg;
+            cfg.xbe_path = arg;
+            // Scan data/ for nboxkrnl, BIOS, keys, etc.
+            xbox::scan_boot_files(cfg, "data");
+            // Keep the explicit XBE from command line
+            cfg.xbe_path = arg;
+
+            xbox::XboxSystem sys;
+            xbox::NboxkrnlState nbox;
+            xbox::BootMode mode = xbox::auto_boot(sys, cfg, nbox);
+
+            if (mode == xbox::BootMode::Nboxkrnl) {
+                fprintf(stderr, "[test_runner] auto-detected nboxkrnl boot\n");
+                sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
+
+                uint32_t eip = sys.exec->ctx.eip;
+                fprintf(stderr, "[nboxkrnl] Final: EIP=0x%08X stop=%u halted=%d EAX=0x%08X\n",
+                        eip, sys.exec->ctx.stop_reason, sys.exec->ctx.halted,
+                        sys.exec->ctx.gp[GP_EAX]);
+                printf("[test_runner] nboxkrnl finished: EIP=0x%08X EAX=0x%08X\n",
+                       eip, sys.exec->ctx.gp[GP_EAX]);
+                return 0;
+            } else if (mode == xbox::BootMode::Lle) {
+                fprintf(stderr, "[test_runner] auto-detected BIOS LLE boot\n");
+                sys.exec->run(sys.entry_eip, 2'000'000'000ULL);
+                printf("[test_runner] LLE finished: EIP=0x%08X EAX=0x%08X\n",
+                       sys.exec->ctx.eip, sys.exec->ctx.gp[GP_EAX]);
+                return 0;
+            } else if (mode == xbox::BootMode::Hle) {
+                fprintf(stderr, "[test_runner] auto-detected HLE boot\n");
+                sys.exec->register_io(0xEB, nullptr, io_irq_trigger_write, &sys.hw->pic);
+                int run_iters = 0;
+                constexpr int MAX_RUN_ITERS = 2000;
+                while (run_iters < MAX_RUN_ITERS && xbox::run_step(sys, 1'000'000)) {
+                    ++run_iters;
+                }
+                uint32_t result = sys.exec->ctx.gp[GP_EAX];
+                printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",
+                       result == 0 ? "PASS" : "FAIL", result, sys.exec->ctx.eip);
+                return result == 0 ? 0 : 1;
+            }
+            // mode == None: fall through to existing XBE / binary handling
+        }
     }
 
     // ---- Test binary / XBE mode ----

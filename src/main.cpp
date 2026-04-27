@@ -337,10 +337,12 @@ struct AppContext {
     AppState               state       = AppState::Menu;
     xbox::XboxSystem       sys;
     xbox::BootConfig       cfg;
+    xbox::NboxkrnlState    nbox;       // kept alive for nboxkrnl boot mode
+    xbox::BootMode         boot_mode = xbox::BootMode::None;
     std::string            status_msg  = "Ready";
     std::vector<std::string> log_lines;
 
-    // Paths found on disk
+    // Paths found on disk (legacy — now also mirrored in cfg)
     std::string            dashboard_xbe;  // auto-detected dashboard
     std::string            bios_path;
     std::string            mcpx_path;
@@ -395,74 +397,17 @@ static std::string find_data_root(const char* argv0) {
     return "data";  // fallback: CWD-relative
 }
 
-// Scan data/ for known files
+// Scan data/ for known files — delegates to shared scan_boot_files, then
+// copies results into AppContext legacy fields for UI display.
 static void scan_data_dir(AppContext& app, const std::string& data_root) {
-    auto probe = [&](const char* rel) -> std::string {
-        std::string full = data_root + "/" + rel;
-        FILE* f = fopen(full.c_str(), "rb");
-        if (f) { fclose(f); return full; }
-        return {};
-    };
+    xbox::scan_boot_files(app.cfg, data_root);
 
-    // Dashboard XBE — several common dump layouts
-    const char* dash_rel[] = {
-        "xbox dash orig_5960/xboxdash.xbe",
-        "xboxdash.xbe",
-        "dashboard/xboxdash.xbe",
-    };
-    for (auto& r : dash_rel) {
-        auto p = probe(r);
-        if (!p.empty()) { app.dashboard_xbe = p; break; }
-    }
-
-    // BIOS ROM images (256 KB or 1 MB)
-    const char* bios_rel[] = {
-        "bios.bin",
-        "xbox5838.bin",
-        "xbox5960.bin",
-        "xbox4627.bin",
-        "xbox4034.bin",
-        "complex_4627.bin",
-        "complex_5838.bin",
-        "xboxrom.bin",
-    };
-    for (auto& r : bios_rel) {
-        auto p = probe(r);
-        if (!p.empty()) { app.bios_path = p; break; }
-    }
-
-    // MCPX boot ROM (512 bytes)
-    const char* mcpx_rel[] = {
-        "mcpx_1.0.bin",
-        "mcpx_1.1.bin",
-        "mcpx.bin",
-    };
-    for (auto& r : mcpx_rel) {
-        auto p = probe(r);
-        if (!p.empty()) { app.mcpx_path = p; break; }
-    }
-
-    // RC4 key file (16 bytes) for 2BL decryption
-    const char* key_rel[] = {
-        "rc4_key.bin",
-        "mcpx_key.bin",
-    };
-    for (auto& r : key_rel) {
-        auto p = probe(r);
-        if (!p.empty()) { app.rc4_key_path = p; break; }
-    }
-
-    // xboxkrnl.exe — extracted kernel PE
-    const char* kernel_rel[] = {
-        "xboxkrnl.exe",
-        "xboxkrnl_5838.exe",
-        "xboxkrnl_5960.exe",
-        "xboxkrnl_4627.exe",
-    };
-    for (auto& r : kernel_rel) {
-        auto p = probe(r);
-        if (!p.empty()) { app.kernel_path = p; break; }
-    }
+    // Mirror into legacy AppContext fields used by UI
+    app.dashboard_xbe = app.cfg.xbe_path;
+    app.bios_path     = app.cfg.bios_path;
+    app.mcpx_path     = app.cfg.mcpx_path;
+    app.rc4_key_path  = app.cfg.rc4_key_path;
+    app.kernel_path   = app.cfg.kernel_path;
 }
 
 // File dialog helper — uses SDL3 file dialog (async callback)
@@ -706,28 +651,38 @@ int main(int argc, char** argv) {
     scan_data_dir(app, data_root);
 
     // Handle command-line args:
-    //   xermu [--kernel xboxkrnl.exe] <game.xbe>   — HLE or LLE-kernel mode
-    //   xermu --bios <bios.bin> [--mcpx <mcpx.bin>] — LLE BIOS boot
-    if (argc >= 2) {
+    //   xermu                                        — auto-detect: nboxkrnl → BIOS → HLE
+    //   xermu <game.xbe>                             — auto-detect with specific XBE
+    //   xermu --nboxkrnl <nboxkrnl.exe> <game.xbe>  — explicit nboxkrnl mode
+    //   xermu --kernel <xboxkrnl.exe> <game.xbe>    — LLE-kernel mode
+    //   xermu --bios [<bios.bin>] [--mcpx <mcpx.bin>] — LLE BIOS boot
+    {
         int cli_argi = 1;
         std::string cli_kernel;
+        std::string cli_nboxkrnl;
         std::string cli_bios;
         std::string cli_mcpx;
+        bool explicit_mode = false;
 
         // Parse flags
         while (cli_argi < argc && argv[cli_argi][0] == '-') {
             std::string flag = argv[cli_argi];
-            if (flag == "--kernel" && cli_argi + 1 < argc) {
+            if (flag == "--nboxkrnl" && cli_argi + 1 < argc) {
+                cli_nboxkrnl = argv[++cli_argi];
+                ++cli_argi;
+                explicit_mode = true;
+            } else if (flag == "--kernel" && cli_argi + 1 < argc) {
                 cli_kernel = argv[++cli_argi];
                 ++cli_argi;
+                explicit_mode = true;
             } else if (flag == "--bios") {
-                // --bios with optional path; if next arg looks like a file use it
                 ++cli_argi;
                 if (cli_argi < argc && argv[cli_argi][0] != '-') {
                     cli_bios = argv[cli_argi++];
                 } else {
                     cli_bios = app.bios_path;  // use auto-detected
                 }
+                explicit_mode = true;
             } else if (flag == "--mcpx" && cli_argi + 1 < argc) {
                 cli_mcpx = argv[++cli_argi];
                 ++cli_argi;
@@ -736,34 +691,54 @@ int main(int argc, char** argv) {
             }
         }
 
-        auto log_fn = [&](const char* msg) { app.log(msg); };
-
-        if (!cli_bios.empty()) {
-            // LLE BIOS boot
-            app.cfg.bios_path = cli_bios;
-            if (!cli_mcpx.empty()) app.cfg.mcpx_path = cli_mcpx;
-            else if (!app.mcpx_path.empty()) app.cfg.mcpx_path = app.mcpx_path;
-            if (!app.rc4_key_path.empty()) app.cfg.rc4_key_path = app.rc4_key_path;
-            if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
-                app.state = AppState::Running;
-            } else {
-                app.log("[ui] LLE BIOS boot failed");
-            }
-        } else if (cli_argi < argc) {
-            // XBE mode (HLE or LLE-kernel)
+        // Positional XBE argument overrides auto-detected dashboard
+        if (cli_argi < argc) {
             std::string arg = argv[cli_argi];
             if (arg.size() > 4 && (arg.substr(arg.size()-4) == ".xbe" || arg.substr(arg.size()-4) == ".XBE")) {
                 app.cfg.xbe_path = arg;
-                app.cfg.kernel_path = cli_kernel;
-                bool ok = cli_kernel.empty()
-                    ? xbox::boot_hle(app.sys, app.cfg, log_fn)
-                    : xbox::boot_lle_kernel(app.sys, app.cfg, log_fn);
-                if (ok) {
+            }
+        }
+
+        auto log_fn = [&](const char* msg) { app.log(msg); };
+
+        if (explicit_mode) {
+            // Explicit mode flags — use the specific boot method requested
+            if (!cli_bios.empty()) {
+                app.cfg.bios_path = cli_bios;
+                if (!cli_mcpx.empty()) app.cfg.mcpx_path = cli_mcpx;
+                if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
+                    app.boot_mode = xbox::BootMode::Lle;
                     app.state = AppState::Running;
                 } else {
-                    app.log("[ui] Boot failed for command-line XBE");
+                    app.log("[ui] LLE BIOS boot failed");
+                }
+            } else if (!cli_nboxkrnl.empty() && !app.cfg.xbe_path.empty()) {
+                app.cfg.nboxkrnl_path = cli_nboxkrnl;
+                std::string saved = app.cfg.kernel_path;
+                app.cfg.kernel_path = cli_nboxkrnl;
+                if (xbox::boot_nboxkrnl_system(app.sys, app.cfg, app.nbox, log_fn)) {
+                    app.boot_mode = xbox::BootMode::Nboxkrnl;
+                    app.state = AppState::Running;
+                } else {
+                    app.log("[ui] nboxkrnl boot failed");
+                }
+                app.cfg.kernel_path = saved;
+            } else if (!cli_kernel.empty() && !app.cfg.xbe_path.empty()) {
+                app.cfg.kernel_path = cli_kernel;
+                if (xbox::boot_lle_kernel(app.sys, app.cfg, log_fn)) {
+                    app.boot_mode = xbox::BootMode::LleKernel;
+                    app.state = AppState::Running;
+                } else {
+                    app.log("[ui] LLE-kernel boot failed");
                 }
             }
+        } else {
+            // No explicit flags — auto-detect: nboxkrnl → BIOS → HLE
+            app.boot_mode = xbox::auto_boot(app.sys, app.cfg, app.nbox, log_fn);
+            if (app.boot_mode != xbox::BootMode::None) {
+                app.state = AppState::Running;
+            }
+            // If nothing found, stay in Menu state (user can pick a file)
         }
     }
 
@@ -822,12 +797,25 @@ int main(int argc, char** argv) {
 
         // Run emulation steps if active
         if (app.state == AppState::Running && app.sys.running) {
-            if (!xbox::run_step(app.sys, 500'000)) {
-                app.state = AppState::Halted;
-                char msg[128];
-                snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
-                         app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
-                app.log(msg);
+            if (app.boot_mode == xbox::BootMode::Nboxkrnl) {
+                // nboxkrnl mode: run the kernel directly (no HLE scheduler)
+                app.sys.exec->ctx.halted = false;
+                app.sys.exec->run(app.sys.exec->ctx.eip, 500'000);
+                if (app.sys.exec->ctx.halted) {
+                    app.state = AppState::Halted;
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
+                             app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
+                    app.log(msg);
+                }
+            } else {
+                if (!xbox::run_step(app.sys, 500'000)) {
+                    app.state = AppState::Halted;
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
+                             app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
+                    app.log(msg);
+                }
             }
         }
 

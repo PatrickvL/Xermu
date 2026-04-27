@@ -11,6 +11,11 @@
 #include "xbox/xbox.hpp"
 #include "xbox/pe_loader.hpp"
 #include "xbox/hle/hle_kernel.hpp"
+#include "xbox/nboxkrnl_boot.hpp"
+#include "xbox/nboxkrnl_host.hpp"
+#include "xbox/nboxkrnl_io.hpp"
+#include "xbox/nboxkrnl_paths.hpp"
+#include "xbox/nboxkrnl_keys.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -30,14 +35,106 @@ struct BootConfig {
     std::string mcpx_path;         // optional MCPX ROM for LLE boot
     std::string xiso_path;         // XISO image to mount as D:
     std::string kernel_path;       // xboxkrnl.exe for LLE-kernel mode
+    std::string nboxkrnl_path;     // nboxkrnl.exe for nboxkrnl mode
     std::string rc4_key_path;      // 16-byte RC4 key file for 2BL decryption
     std::string inner_key_path;    // 16-byte inner RC4 key (restores NOP-filled key)
     std::string dump_kernel_path;  // output path for dumped kernel image
 
-    bool is_hle()  const { return !xbe_path.empty() && kernel_path.empty(); }
-    bool is_lle()  const { return !bios_path.empty(); }
+    bool is_nboxkrnl()   const { return !xbe_path.empty() && !nboxkrnl_path.empty(); }
+    bool is_hle()        const { return !xbe_path.empty() && kernel_path.empty() && nboxkrnl_path.empty(); }
+    bool is_lle()        const { return !bios_path.empty(); }
     bool is_lle_kernel() const { return !xbe_path.empty() && !kernel_path.empty(); }
 };
+
+// ---------------------------------------------------------------------------
+// probe_file -- returns true if a file exists and can be opened for reading.
+// ---------------------------------------------------------------------------
+inline bool probe_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f) { fclose(f); return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// probe_path -- returns the first existing file from a list of candidates.
+// ---------------------------------------------------------------------------
+inline std::string probe_path(const std::string& base,
+                              const char* const* candidates, int count) {
+    for (int i = 0; i < count; ++i) {
+        std::string full = base + "/" + candidates[i];
+        if (probe_file(full.c_str())) return full;
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// scan_boot_files -- populate a BootConfig with auto-detected paths.
+// ---------------------------------------------------------------------------
+inline void scan_boot_files(BootConfig& cfg, const std::string& data_root) {
+    // nboxkrnl.exe
+    {
+        static const char* paths[] = {
+            "nboxkrnl.exe",
+            "nboxkrnl/nboxkrnl.exe",
+        };
+        cfg.nboxkrnl_path = probe_path(data_root, paths, 2);
+    }
+    // xboxkrnl.exe
+    {
+        static const char* paths[] = {
+            "xboxkrnl.exe",
+            "xboxkrnl_5838.exe",
+            "xboxkrnl_5960.exe",
+            "xboxkrnl_4627.exe",
+        };
+        cfg.kernel_path = probe_path(data_root, paths, 4);
+    }
+    // Dashboard XBE
+    {
+        static const char* paths[] = {
+            "xbox dash orig_5960/xboxdash.xbe",
+            "xboxdash.xbe",
+            "dashboard/xboxdash.xbe",
+        };
+        cfg.xbe_path = probe_path(data_root, paths, 3);
+    }
+    // BIOS ROM images
+    {
+        static const char* paths[] = {
+            "bios.bin",
+            "xbox5838.bin",
+            "xbox5960.bin",
+            "xbox4627.bin",
+            "xbox4034.bin",
+            "complex_4627.bin",
+            "complex_5838.bin",
+            "xboxrom.bin",
+        };
+        cfg.bios_path = probe_path(data_root, paths, 8);
+    }
+    // MCPX boot ROM
+    {
+        static const char* paths[] = {
+            "mcpx_1.0.bin",
+            "mcpx_1.1.bin",
+            "mcpx.bin",
+        };
+        cfg.mcpx_path = probe_path(data_root, paths, 3);
+    }
+    // RC4 key file
+    {
+        static const char* paths[] = {
+            "rc4_key.bin",
+            "mcpx_key.bin",
+        };
+        cfg.rc4_key_path = probe_path(data_root, paths, 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BootMode -- result of auto_boot indicating which mode was used.
+// ---------------------------------------------------------------------------
+enum class BootMode { None, Nboxkrnl, Lle, LleKernel, Hle };
 
 // ---------------------------------------------------------------------------
 // XboxSystem — owns the executor, hardware, and HLE heap.
@@ -901,16 +998,6 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
 // disk partitions, EEPROM keys, loads the kernel PE, configures page tables
 // and CPU state, and returns with sys.entry_eip set to KernelEntry.
 // ---------------------------------------------------------------------------
-} // namespace xbox
-
-#include "xbox/nboxkrnl_boot.hpp"
-#include "xbox/nboxkrnl_host.hpp"
-#include "xbox/nboxkrnl_io.hpp"
-#include "xbox/nboxkrnl_paths.hpp"
-#include "xbox/nboxkrnl_keys.hpp"
-
-namespace xbox {
-
 struct NboxkrnlState {
     nboxkrnl::HostState    host;
     nboxkrnl::IoSystem     io;
@@ -964,6 +1051,53 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
     say(kmsg);
 
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// auto_boot -- try boot methods in priority order:
+//   1. nboxkrnl (if nboxkrnl_path + xbe_path present)
+//   2. BIOS LLE (if bios_path present)
+//   3. HLE      (if xbe_path present)
+// Returns the mode that succeeded, or None.
+// The caller owns `nbox` and must keep it alive for nboxkrnl mode.
+// ---------------------------------------------------------------------------
+inline BootMode auto_boot(XboxSystem& sys, BootConfig& cfg,
+                          NboxkrnlState& nbox,
+                          std::function<void(const char*)> log = nullptr)
+{
+    auto say = [&](const char* msg) { if (log) log(msg); else fprintf(stderr, "%s\n", msg); };
+
+    // 1. nboxkrnl
+    if (!cfg.nboxkrnl_path.empty() && !cfg.xbe_path.empty()) {
+        say("[auto] trying nboxkrnl boot...");
+        std::string saved_kernel = cfg.kernel_path;
+        cfg.kernel_path = cfg.nboxkrnl_path;
+        if (boot_nboxkrnl_system(sys, cfg, nbox, log)) {
+            cfg.kernel_path = saved_kernel;
+            return BootMode::Nboxkrnl;
+        }
+        cfg.kernel_path = saved_kernel;
+        say("[auto] nboxkrnl boot failed, trying next...");
+    }
+
+    // 2. BIOS LLE
+    if (!cfg.bios_path.empty()) {
+        say("[auto] trying BIOS LLE boot...");
+        if (boot_lle(sys, cfg, log))
+            return BootMode::Lle;
+        say("[auto] BIOS LLE boot failed, trying next...");
+    }
+
+    // 3. HLE fallback
+    if (!cfg.xbe_path.empty()) {
+        say("[auto] trying HLE boot...");
+        if (boot_hle(sys, cfg, log))
+            return BootMode::Hle;
+        say("[auto] HLE boot failed");
+    }
+
+    return BootMode::None;
 }
 
 } // namespace xbox
