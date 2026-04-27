@@ -79,8 +79,8 @@ struct Executor {
     // VEH handle (Windows only) for 4 GB fastmem fault interception.
     void*          veh_handle_ = nullptr;
 
-    // I/O port dispatch table (small fixed table — only a handful needed).
-    static constexpr int MAX_IO_PORTS = 64;
+    // I/O port dispatch table.
+    static constexpr int MAX_IO_PORTS = 128;
     IoPortEntry io_ports[MAX_IO_PORTS] {};
     int         n_io_ports = 0;
 
@@ -167,6 +167,15 @@ struct Executor {
 
     // Load segment base address from GDT descriptor given a selector.
     uint32_t load_segment_base(uint16_t sel);
+
+    // -----------------------------------------------------------------------
+    // Block memory access helpers (paging-aware, page-boundary-safe).
+    // Copy 'size' bytes between a host buffer and guest virtual memory.
+    // Handles page table translation and page boundary crossings.
+    // Returns true on success, false if a page fault would occur.
+    // -----------------------------------------------------------------------
+    bool read_guest_block(uint32_t va, uint32_t size, void* buf);
+    bool write_guest_block(uint32_t va, uint32_t size, const void* buf);
 };
 
 // ---------------------------------------------------------------------------

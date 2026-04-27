@@ -437,3 +437,15 @@
 - **Files**: src/cpu/context.hpp, src/cpu/privileged.cpp
 - **Result**: 52/52 pass
 - **Status**: DONE
+
+### Step 32: nboxkrnl M1 — Guest memory block R/W helpers
+- **read_guest_block / write_guest_block**: New methods on `Executor` that copy
+  arbitrary-length byte ranges between host buffers and guest virtual memory.
+  Handle page table translation and 4 KB page boundary crossings.  When paging
+  is disabled (CR0.PG=0), VA is used as-is.
+- **MAX_IO_PORTS**: Increased from 64 to 128 to accommodate nboxkrnl host ports.
+- **test_block_rw**: 5 unit tests — no-paging identity, kernel-mirror (0x80000000),
+  page-boundary crossing, multi-page 8 KB block, unmapped-VA fault detection.
+- **Files**: src/cpu/executor.hpp, src/cpu/executor.cpp, src/tests/test_block_rw.cpp,
+  CMakeLists.txt
+- **Status**: DONE

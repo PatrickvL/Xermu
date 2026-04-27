@@ -512,6 +512,62 @@ fault:
 }
 
 // ---------------------------------------------------------------------------
+// Block memory read: copy 'size' bytes from guest VA to host buffer.
+// Handles paging translation and page boundary crossings.
+// Returns false if any page translation faults.
+// ---------------------------------------------------------------------------
+
+bool Executor::read_guest_block(uint32_t va, uint32_t size, void* buf) {
+    auto* dst = static_cast<uint8_t*>(buf);
+    while (size > 0) {
+        uint32_t pa;
+        if (paging_enabled()) {
+            pa = translate_va(va, /*is_write=*/false);
+            if (pa == ~0u) return false;
+        } else {
+            pa = va;
+        }
+        if (pa >= GUEST_RAM_SIZE) return false;
+
+        uint32_t page_remain = GUEST_PAGE_SIZE - (pa & (GUEST_PAGE_SIZE - 1));
+        uint32_t chunk = (size < page_remain) ? size : page_remain;
+        memcpy(dst, ram + pa, chunk);
+        dst  += chunk;
+        va   += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Block memory write: copy 'size' bytes from host buffer to guest VA.
+// Handles paging translation and page boundary crossings.
+// Returns false if any page translation faults.
+// ---------------------------------------------------------------------------
+
+bool Executor::write_guest_block(uint32_t va, uint32_t size, const void* buf) {
+    auto* src = static_cast<const uint8_t*>(buf);
+    while (size > 0) {
+        uint32_t pa;
+        if (paging_enabled()) {
+            pa = translate_va(va, /*is_write=*/true);
+            if (pa == ~0u) return false;
+        } else {
+            pa = va;
+        }
+        if (pa >= GUEST_RAM_SIZE) return false;
+
+        uint32_t page_remain = GUEST_PAGE_SIZE - (pa & (GUEST_PAGE_SIZE - 1));
+        uint32_t chunk = (size < page_remain) ? size : page_remain;
+        memcpy(ram + pa, src, chunk);
+        src  += chunk;
+        va   += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Real-mode boot stub interpreter.
 //
 // The x86 reset vector (0xFFFFFFF0) executes in 16-bit real mode.  The Xbox

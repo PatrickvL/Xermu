@@ -119,6 +119,22 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Test: block R/W helpers (read_guest_block / write_guest_block)
+# ---------------------------------------------------------------------------
+add_executable(test_block_rw ${COMMON_SOURCES} src/tests/test_block_rw.cpp)
+target_include_directories(test_block_rw PRIVATE src src/cpu)
+target_link_libraries(test_block_rw PRIVATE Zydis)
+
+if(MSVC)
+    target_compile_options(test_block_rw PRIVATE /W3)
+else()
+    target_compile_options(test_block_rw PRIVATE -Wall -Wextra -O2)
+    if(UNIX)
+        target_link_libraries(test_block_rw PRIVATE m)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
 add_executable(xermu ${COMMON_SOURCES} src/main.cpp)
