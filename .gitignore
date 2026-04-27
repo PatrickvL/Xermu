@@ -17,13 +17,22 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Binaries
+# Binaries / data (user-supplied, not in repo)
 data/
 
-# Logs / temp
-*.txt
-stderr.txt
-stdout.txt
-imgui.ini
+# Logs, output, temp files
 *.log
+*.ini
+
+# Debug / analysis scripts
 *.py
+
+# Output captures
+boot_output.txt
+full_output.txt
+run_output.txt
+output.txt
+test_output.txt
+xermu_run.txt
+stderr*.txt
+stdout*.txt

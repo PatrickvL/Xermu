@@ -315,7 +315,7 @@ int main() {
     CHECK(pgraph.reg(SET_CULL_FACE) == 0x0404, "cull_face == FRONT (0x0404)");
 
     // FIFO stats
-    CHECK(nv2a.pfifo_regs[pfifo::EXT_METHODS / 4] == pgraph.total_methods,
+    CHECK(nv2a.diag_methods == pgraph.total_methods,
           "fifo_methods == pgraph.total_methods");
     CHECK(nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4] == pos, "DMA_GET == PUT (drained)");
 

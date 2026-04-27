@@ -15,6 +15,7 @@
 #include "pic.hpp"
 #include "pit.hpp"
 #include "misc_io.hpp"
+#include "acpi.hpp"
 #include "cpu/executor.hpp"
 #include <cstring>
 
@@ -36,18 +37,10 @@ struct XboxHardware {
     PicPair     pic;
     PitState    pit;
     MiscIoState misc;
+    AcpiState   acpi;
     uint8_t*    ram = nullptr;
     uint32_t    ram_size = 0;
     uint32_t    tick_accum = 0;     // accumulator for KeTickCount timing
-
-    // ACPI PM Timer: 24-bit counter at 3.579545 MHz.
-    // Each tick callback represents ~1 µs of guest time, so we
-    // increment by ~3.58 ticks per callback.
-    uint32_t    acpi_pmtmr = 0;     // 24-bit free-running counter
-
-    // ACPI GPE0 status/enable registers (ports 0x80C0-0x80C1)
-    uint8_t     acpi_gpe0_sts = 0;
-    uint8_t     acpi_gpe0_en  = 0;
 };
 
 static void hw_tick_callback(void* user) {
@@ -74,32 +67,16 @@ static void hw_tick_callback(void* user) {
     }
 
     // Advance ACPI PM Timer (~3.58 ticks per µs callback).
-    hw->acpi_pmtmr = (hw->acpi_pmtmr + 4) & 0x00FFFFFFu;
-
-    if (hw->nv2a.vblank_irq_pending) {
-        hw->nv2a.vblank_irq_pending = false;
-        hw->pic.raise_irq(1);
-    }
+    hw->acpi.tick();
 }
 
-// ACPI PM Timer (port 0x8008): 24-bit free-running counter at 3.579545 MHz.
-static uint32_t acpi_pmtmr_read(uint16_t, unsigned, void* user) {
-    auto* hw = static_cast<XboxHardware*>(user);
-    return hw->acpi_pmtmr;
-}
-
-// ACPI GPE0 status/enable (ports 0x80C0-0x80C1).
-static uint32_t acpi_gpe0_read(uint16_t port, unsigned, void* user) {
-    auto* hw = static_cast<XboxHardware*>(user);
-    if (port == 0x80C0) return hw->acpi_gpe0_sts;
-    return hw->acpi_gpe0_en;
-}
-static void acpi_gpe0_write(uint16_t port, uint32_t val, unsigned, void* user) {
-    auto* hw = static_cast<XboxHardware*>(user);
-    if (port == 0x80C0)
-        hw->acpi_gpe0_sts &= ~(uint8_t)val;  // write-1-to-clear
+// NV2A IRQ callback: assert/deassert PIC IRQ 3 (PCI INTA# routing on Xbox).
+static void nv2a_irq_callback(void* user, bool level) {
+    auto* pic = static_cast<PicPair*>(user);
+    if (level)
+        pic->raise_irq(3);
     else
-        hw->acpi_gpe0_en = (uint8_t)val;
+        pic->lower_irq(3);
 }
 
 inline XboxHardware* xbox_setup(Executor& exec) {
@@ -126,6 +103,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     // Wire PFIFO notification → NV2A thread.
     hw->nv2a.fifo_notify      = nv2a_thread_notify;
     hw->nv2a.fifo_notify_user = &hw->nv2a_thread;
+
+    // Wire NV2A PCI INTA# → PIC IRQ 3.
+    hw->nv2a.irq_callback = nv2a_irq_callback;
+    hw->nv2a.irq_user     = &hw->pic;
 
     hw->mmio.add(APU_BASE, APU_SIZE,
                  apu_read, apu_write, &hw->apu);
@@ -181,11 +162,14 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     for (uint16_t p = 0xFF60; p <= 0xFF6F; p++)
         exec.register_io(p, ide_bm_read, ide_bm_write, &hw->ide);
 
+    // ACPI PM1a event registers (0x8000-0x8001)
+    exec.register_io(0x8000, acpi_pm1a_read, acpi_pm1a_write, &hw->acpi);
+    exec.register_io(0x8001, acpi_pm1a_read, acpi_pm1a_write, &hw->acpi);
     // ACPI PM Timer (0x8008, 32-bit 3.579545 MHz counter)
-    exec.register_io(0x8008, acpi_pmtmr_read, nullptr, hw);
+    exec.register_io(0x8008, acpi_pmtmr_read, nullptr, &hw->acpi);
     // ACPI GPE0 block (0x80C0-0x80C1): status/enable registers
-    exec.register_io(0x80C0, acpi_gpe0_read, acpi_gpe0_write, hw);
-    exec.register_io(0x80C1, acpi_gpe0_read, acpi_gpe0_write, hw);
+    exec.register_io(0x80C0, acpi_gpe0_read, acpi_gpe0_write, &hw->acpi);
+    exec.register_io(0x80C1, acpi_gpe0_read, acpi_gpe0_write, &hw->acpi);
 
     // Start the NV2A PFIFO processing thread — must be last, after all
     // hardware wiring is complete.

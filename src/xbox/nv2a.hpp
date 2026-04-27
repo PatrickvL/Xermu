@@ -28,13 +28,14 @@ static constexpr uint32_t ENABLE    = 0x200;   // subsystem enable
 // BOOT_0 default: NV2A chip revision
 static constexpr uint32_t NV2A_CHIP_ID     = 0x02A000A1;
 
-// PMC_INTR_0 bit assignments
-static constexpr uint32_t INTR_PFIFO  = (1u << 0);
-static constexpr uint32_t INTR_PVIDEO = (1u << 1);
-static constexpr uint32_t INTR_PTIMER = (1u << 4);
-static constexpr uint32_t INTR_PGRAPH = (1u << 8);
+// PMC_INTR_0 bit assignments (per xemu / NV2A hardware docs)
+static constexpr uint32_t INTR_PFIFO  = (1u << 8);
+static constexpr uint32_t INTR_PGRAPH = (1u << 12);
+static constexpr uint32_t INTR_PVIDEO = (1u << 16);
+static constexpr uint32_t INTR_PTIMER = (1u << 20);
 static constexpr uint32_t INTR_PCRTC  = (1u << 24);
 static constexpr uint32_t INTR_PBUS   = (1u << 28);
+static constexpr uint32_t INTR_SW     = (1u << 31);
 } // namespace pmc
 
 namespace pbus {
@@ -55,20 +56,30 @@ static constexpr uint32_t RUNOUT_STATUS   = 0x0400;
 static constexpr uint32_t CACHES          = 0x0500;
 static constexpr uint32_t MODE            = 0x0504;
 // CACHE1 registers (block-relative 0x1000-0x1FFF)
-static constexpr uint32_t CACHE1_PUSH0    = 0x1200;
-static constexpr uint32_t CACHE1_PUSH1    = 0x1210;
-static constexpr uint32_t CACHE1_STATUS   = 0x1214;
-static constexpr uint32_t CACHE1_DMA_PUSH = 0x1220;
-static constexpr uint32_t CACHE1_DMA_STATE = 0x1228; // computed: busy flag
-static constexpr uint32_t CACHE1_DMA_PUT  = 0x1240;
-static constexpr uint32_t CACHE1_DMA_GET  = 0x1244;
-static constexpr uint32_t CACHE1_DMA_SUBROUTINE = 0x124C; // bits[28:2] return addr, bit[0] active
-static constexpr uint32_t CACHE1_PULL0    = 0x1250;
-// Emulator extensions (diagnostics / testing)
-static constexpr uint32_t EXT_METHODS     = 0x1F00;  // methods dispatched count
-static constexpr uint32_t EXT_DWORDS      = 0x1F04;  // dwords consumed count
-static constexpr uint32_t EXT_JUMPS       = 0x1F08;  // jump commands count
-static constexpr uint32_t EXT_CALLS       = 0x1F0C;  // call commands count
+// Offsets match xemu / NV2A hardware documentation.
+static constexpr uint32_t CACHE1_PUSH0         = 0x1200;
+static constexpr uint32_t CACHE1_PUSH1         = 0x1204;  // channel ID + mode
+static constexpr uint32_t CACHE1_PUT           = 0x1210;  // internal cache PUT pointer
+static constexpr uint32_t CACHE1_STATUS        = 0x1214;
+static constexpr uint32_t CACHE1_DMA_PUSH      = 0x1220;
+static constexpr uint32_t CACHE1_DMA_FETCH     = 0x1224;
+static constexpr uint32_t CACHE1_DMA_STATE     = 0x1228;
+static constexpr uint32_t CACHE1_DMA_INSTANCE  = 0x122C;
+static constexpr uint32_t CACHE1_DMA_PUT       = 0x1240;
+static constexpr uint32_t CACHE1_DMA_GET       = 0x1244;
+static constexpr uint32_t CACHE1_REF           = 0x1248;
+static constexpr uint32_t CACHE1_DMA_SUBROUTINE = 0x124C;
+static constexpr uint32_t CACHE1_PULL0         = 0x1250;
+static constexpr uint32_t CACHE1_PULL1         = 0x1254;
+static constexpr uint32_t CACHE1_GET           = 0x1270;
+static constexpr uint32_t CACHE1_ENGINE        = 0x1280;
+static constexpr uint32_t CACHE1_DMA_DCOUNT    = 0x12A0;
+static constexpr uint32_t CACHE1_DMA_GET_JMP_SHADOW = 0x12A4;
+// Base PFIFO registers
+static constexpr uint32_t RAMHT         = 0x0210;
+static constexpr uint32_t RAMFC         = 0x0214;
+static constexpr uint32_t RAMRO         = 0x0218;
+static constexpr uint32_t DMA           = 0x0508;
 
 // Status bits
 static constexpr uint32_t STATUS_IDLE     = 0x10;    // CACHE1_STATUS / RUNOUT idle
@@ -207,7 +218,6 @@ struct Nv2aState {
     // PCRTC vblank
     uint32_t vblank_counter = 0;
     static constexpr uint32_t VBLANK_PERIOD = 16667;
-    bool     vblank_irq_pending = false;
 
     // GPU method handler — called for each (subchannel, method, data) tuple.
     using MethodHandler = void(*)(void* user, uint32_t subchannel,
@@ -220,6 +230,18 @@ struct Nv2aState {
     using FifoNotify = void(*)(void* user);
     FifoNotify fifo_notify      = nullptr;
     void*      fifo_notify_user = nullptr;
+
+    // IRQ callback — called by nv2a_update_irq() to assert/deassert PCI INTA#.
+    // On Xbox, NV2A PCI INTA# is routed to PIC IRQ 3.
+    using IrqCallback = void(*)(void* user, bool level);
+    IrqCallback irq_callback = nullptr;
+    void*       irq_user     = nullptr;
+
+    // Diagnostic counters for PFIFO activity.
+    uint32_t diag_methods  = 0;
+    uint32_t diag_dwords   = 0;
+    uint32_t diag_jumps    = 0;
+    uint32_t diag_calls    = 0;
 
     Nv2aState() {
         pmc_regs[pmc::BOOT_0 / 4]             = pmc::NV2A_CHIP_ID;
@@ -269,29 +291,50 @@ struct Nv2aState {
             vblank_counter = 0;
             if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1)
                 pcrtc_regs[pcrtc::INTR / 4] |= 1;
-            if ((pmc_regs[pmc::INTR_EN / 4] & pmc::INTR_PCRTC) &&
-                (pcrtc_regs[pcrtc::INTR / 4] & 1))
-                vblank_irq_pending = true;
         }
+        update_irq();
     }
 
-    uint32_t pmc_intr_0() const {
-        // Computed: aggregates pending interrupts from sub-blocks.
-        // Each sub-block's INTR register is non-zero if any interrupt is pending.
-        // PMC_INTR_0 bit assignments (NV2A):
-        //   bit  0 = PFIFO
-        //   bit  1 = PVIDEO
-        //   bit  4 = PTIMER
-        //   bit  8 = PGRAPH  (not yet wired)
-        //   bit 24 = PCRTC
-        //   bit 28 = PBUS
-        uint32_t val = 0;
-        if (pfifo_regs[pfifo::INTR / 4])   val |= pmc::INTR_PFIFO;
-        if (pvideo_regs[pvideo::INTR / 4])  val |= pmc::INTR_PVIDEO;
-        if (ptimer_regs[ptimer::INTR / 4])  val |= pmc::INTR_PTIMER;
-        if (pcrtc_regs[pcrtc::INTR / 4])    val |= pmc::INTR_PCRTC;
-        if (pbus_regs[pbus::INTR / 4])      val |= pmc::INTR_PBUS;
-        return val;
+    // Aggregate sub-block interrupts into PMC_INTR_0 and assert/deassert
+    // PCI INTA# (PIC IRQ 3). Mirrors xemu's nv2a_update_irq().
+    void update_irq() {
+        uint32_t& pending = pmc_regs[pmc::INTR_0 / 4];
+
+        // PFIFO
+        if (pfifo_regs[pfifo::INTR / 4] & pfifo_regs[pfifo::INTR_EN / 4])
+            pending |= pmc::INTR_PFIFO;
+        else
+            pending &= ~pmc::INTR_PFIFO;
+
+        // PCRTC
+        if (pcrtc_regs[pcrtc::INTR / 4] & pcrtc_regs[pcrtc::INTR_EN / 4])
+            pending |= pmc::INTR_PCRTC;
+        else
+            pending &= ~pmc::INTR_PCRTC;
+
+        // PTIMER
+        if (ptimer_regs[ptimer::INTR / 4] & ptimer_regs[ptimer::INTR_EN / 4])
+            pending |= pmc::INTR_PTIMER;
+        else
+            pending &= ~pmc::INTR_PTIMER;
+
+        // PVIDEO
+        if (pvideo_regs[pvideo::INTR / 4] & pvideo_regs[pvideo::INTR_EN / 4])
+            pending |= pmc::INTR_PVIDEO;
+        else
+            pending &= ~pmc::INTR_PVIDEO;
+
+        // PBUS
+        if (pbus_regs[pbus::INTR / 4] & pbus_regs[pbus::INTR_EN / 4])
+            pending |= pmc::INTR_PBUS;
+        else
+            pending &= ~pmc::INTR_PBUS;
+
+        // Assert/deassert PCI INTA# (routed to PIC IRQ 3 on Xbox).
+        if (irq_callback) {
+            bool level = (pending & pmc_regs[pmc::INTR_EN / 4]) != 0;
+            irq_callback(irq_user, level);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -306,10 +349,6 @@ struct Nv2aState {
         auto& dma_put  = pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
         auto& status   = pfifo_regs[pfifo::CACHE1_STATUS / 4];
         auto& subr     = pfifo_regs[pfifo::CACHE1_DMA_SUBROUTINE / 4];
-        auto& ext_methods = pfifo_regs[pfifo::EXT_METHODS / 4];
-        auto& ext_dwords  = pfifo_regs[pfifo::EXT_DWORDS / 4];
-        auto& ext_jumps   = pfifo_regs[pfifo::EXT_JUMPS / 4];
-        auto& ext_calls   = pfifo_regs[pfifo::EXT_CALLS / 4];
 
         if (!(dma_push & pfifo::DMA_PUSH_ENABLE)) return;
         if (!(push0 & 1)) return;
@@ -333,7 +372,7 @@ struct Nv2aState {
             if ((hdr & 0xC0000000u) == 0x40000000u) {
                 // JUMP
                 get = hdr & 0x1FFFFFFCu;
-                ext_jumps++;
+                diag_jumps++;
                 continue;
             }
 
@@ -342,7 +381,7 @@ struct Nv2aState {
                 if (!(subr & 1)) {
                     subr = (get & 0x1FFFFFFC) | 1;
                     get = hdr & 0xFFFFFFFCu;
-                    ext_calls++;
+                    diag_calls++;
                 }
                 continue;
             }
@@ -373,12 +412,12 @@ struct Nv2aState {
                     uint32_t m = (type == 0) ? (method + i * 4) : method;
                     if (method_handler)
                         method_handler(method_user, subchannel, m, data);
-                    ext_methods++;
+                    diag_methods++;
                 }
             }
         }
 done:
-        ext_dwords += consumed;
+        diag_dwords += consumed;
         dma_get = get;
         if (get == put)
             status = pfifo::STATUS_IDLE;
@@ -393,7 +432,7 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
 
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
-        if (off == pmc::INTR_0) return nv->pmc_intr_0();  // computed
+        // PMC_INTR_0 is maintained by update_irq(), read directly.
         if (off / 4 < Nv2aState::PMC_COUNT) return nv->pmc_regs[off / 4];
         return 0;
     }
@@ -519,13 +558,20 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
 
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
+        if (off == pmc::INTR_0) {
+            // W1C: clear bits written as 1.
+            nv->pmc_regs[off / 4] &= ~val;
+            nv->update_irq();
+            return;
+        }
         if (off / 4 < Nv2aState::PMC_COUNT) nv->pmc_regs[off / 4] = val;
+        if (off == pmc::INTR_EN) nv->update_irq();
         return;
     }
     // --- PBUS (0x001000) ---
     if (off < 0x002000) {
         uint32_t r = off - 0x001000;
-        if (r == pbus::INTR) { nv->pbus_regs[r / 4] &= ~val; return; }
+        if (r == pbus::INTR) { nv->pbus_regs[r / 4] &= ~val; nv->update_irq(); return; }
         // PCI config space mirror at PBUS offsets 0x800-0x8FF.
         if (r >= 0x800 && r < 0x900) {
             memcpy(nv->pbus_pci_mirror + (r - 0x800), &val, 4);
@@ -540,10 +586,12 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         // W1C interrupt status
         if (r == pfifo::INTR) {
             nv->pfifo_regs[r / 4] &= ~val;
+            nv->update_irq();
             return;
         }
         // Store register first
         if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
+        if (r == pfifo::INTR_EN) nv->update_irq();
         // Log DMA_PUT writes for debugging
         if (r == pfifo::CACHE1_DMA_PUT) {
             fprintf(stderr, "[nv2a] PFIFO DMA_PUT write: val=%08X GET=%08X PUSH=%08X PUSH0=%08X\n",
@@ -596,15 +644,17 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // --- PVIDEO (0x008000) ---
     if (off >= 0x008000 && off < 0x009000) {
         uint32_t r = off - 0x008000;
-        if (r == pvideo::INTR) { nv->pvideo_regs[r / 4] &= ~val; return; }
+        if (r == pvideo::INTR) { nv->pvideo_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PVIDEO_COUNT) nv->pvideo_regs[r / 4] = val;
+        if (r == pvideo::INTR_EN) nv->update_irq();
         return;
     }
     // --- PTIMER (0x009000) ---
     if (off >= 0x009000 && off < 0x00A000) {
         uint32_t r = off - 0x009000;
-        if (r == ptimer::INTR) { nv->ptimer_regs[r / 4] &= ~val; return; }
+        if (r == ptimer::INTR) { nv->ptimer_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PTIMER_COUNT) nv->ptimer_regs[r / 4] = val;
+        if (r == ptimer::INTR_EN) nv->update_irq();
         return;
     }
     // --- PFB (0x100000) ---
@@ -616,15 +666,17 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     // --- PGRAPH control (0x400000) ---
     if (off >= 0x400000 && off < 0x401000) {
         uint32_t r = off - 0x400000;
-        if (r == pgraph_ctl::INTR) { nv->pgraph_regs[r / 4] &= ~val; return; }
+        if (r == pgraph_ctl::INTR) { nv->pgraph_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PGRAPH_COUNT) nv->pgraph_regs[r / 4] = val;
+        if (r == pgraph_ctl::INTR_EN) nv->update_irq();
         return;
     }
     // --- PCRTC (0x600000) ---
     if (off >= 0x600000 && off < 0x601000) {
         uint32_t r = off - 0x600000;
-        if (r == pcrtc::INTR) { nv->pcrtc_regs[r / 4] &= ~val; return; }
+        if (r == pcrtc::INTR) { nv->pcrtc_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PCRTC_COUNT) nv->pcrtc_regs[r / 4] = val;
+        if (r == pcrtc::INTR_EN) nv->update_irq();
         return;
     }
     // --- PRAMDAC (0x680000) ---
