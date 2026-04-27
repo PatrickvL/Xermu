@@ -140,7 +140,7 @@ bool Executor::init(MmioMap* mmio) {
         ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
     }
     if (!ram) return false;
-    memset(ram, 0xCC, GUEST_RAM_SIZE); // INT3 fill (debug aid)
+    memset(ram, 0, GUEST_RAM_SIZE); // zero-fill (matches Xbox kernel boot)
 
     if (!cc.init()) return false;
 
@@ -689,10 +689,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     int trace_ring_idx = 0;
 
     // Spin-loop detection: if the same trace is executed many times in a row,
-    // skip the rest of the countdown by zeroing the loop counter on the stack.
+    // scan for CMP immediate and fast-forward the counter register.
     uint32_t spin_eip    = 0;
     uint32_t spin_count  = 0;
-    static constexpr uint32_t SPIN_THRESHOLD = 512;
+    uint32_t stale_eip   = 0;   // tracks repeated spin triggers at same addr
+    uint32_t stale_count = 0;
+    static constexpr uint32_t SPIN_THRESHOLD = 32;
 
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) {
@@ -830,16 +832,88 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         prev_trace = t;
 
         // Spin-loop detection: if the trace loops back to itself many times,
-        // it's a busy-wait countdown. Break out of run() to yield to the
-        // run_step loop which handles device ticks and thread dispatch.
+        // it's a busy-wait or memclear loop. Break out by scanning the trace
+        // for the CMP immediate and setting the register to that value.
         if (ctx.eip == eip) {
             if (spin_eip == eip) {
                 ++spin_count;
                 if (spin_count >= SPIN_THRESHOLD) {
-                    // Force EAX to 0 — most countdown loops use EAX.
-                    // This is safe: the loop will just exit on the next
-                    // iteration when the DEC hits zero.
-                    ctx.gp[GP_EAX] = 0;
+                    // Heuristic: scan the code at EIP for loop-exit patterns
+                    // and fast-forward the counter register to exit the loop.
+                    // Two-pass scan: CMP patterns first (multi-byte, safe),
+                    // then DEC/INC single-byte patterns only at offset 0.
+                    bool handled = false;
+                    if (eip + 32 <= GUEST_RAM_SIZE) {
+                        // Pass 1: look for CMP r32, imm or DEC [mem] patterns
+                        for (uint32_t off = 0; off < 24 && !handled; ++off) {
+                            uint8_t b = ram[eip + off];
+                            // CMP EAX, imm32 (opcode 3D)
+                            if (b == 0x3D && off + 5 <= 28) {
+                                uint32_t imm;
+                                memcpy(&imm, ram + eip + off + 1, 4);
+                                ctx.gp[GP_EAX] = imm;
+                                handled = true;
+                            }
+                            // 81 F8..FF = CMP r32, imm32 (/7 = CMP in ModR/M)
+                            else if (b == 0x81 && off + 6 <= 28) {
+                                uint8_t modrm = ram[eip + off + 1];
+                                if ((modrm & 0xF8) == 0xF8) { // /7 reg-direct
+                                    uint32_t imm;
+                                    memcpy(&imm, ram + eip + off + 2, 4);
+                                    unsigned reg = modrm & 7;
+                                    ctx.gp[reg] = imm;
+                                    handled = true;
+                                }
+                            }
+                            // 83 F8..FF = CMP r32, imm8
+                            else if (b == 0x83 && off + 3 <= 28) {
+                                uint8_t modrm = ram[eip + off + 1];
+                                if ((modrm & 0xF8) == 0xF8) {
+                                    uint32_t imm = (uint32_t)(int32_t)(int8_t)ram[eip + off + 2];
+                                    unsigned reg = modrm & 7;
+                                    ctx.gp[reg] = imm;
+                                    handled = true;
+                                }
+                            }
+                            // FF /1 = DEC [EBP+disp8]  (FF 4D xx)
+                            else if (b == 0xFF && off + 3 <= 28 && ram[eip + off + 1] == 0x4D) {
+                                int8_t disp = (int8_t)ram[eip + off + 2];
+                                uint32_t addr = ctx.gp[GP_EBP] + (int32_t)disp;
+                                if (addr + 4 <= GUEST_RAM_SIZE) {
+                                    uint32_t one = 1;
+                                    memcpy(ram + addr, &one, 4);
+                                }
+                                handled = true;
+                            }
+                        }
+                        // Pass 2: only at offset 0, check for DEC r32 (48..4F)
+                        if (!handled) {
+                            uint8_t b0 = ram[eip];
+                            if (b0 >= 0x48 && b0 <= 0x4F) {
+                                unsigned reg = b0 - 0x48;
+                                ctx.gp[reg] = 1;
+                                handled = true;
+                            }
+                        }
+                    }
+                    if (!handled) {
+                        // Unrecognized loop pattern: yield to run_step so time
+                        // advances and the polled condition may become true.
+                        ctx.halted = true;
+                    }
+                    // Track "stale" spins: if the same address keeps triggering
+                    // spin detection across many cycles, it's an outer loop
+                    // that keeps re-entering. Yield to let time advance.
+                    if (stale_eip == eip) {
+                        ++stale_count;
+                        if (stale_count >= 64) {
+                            ctx.halted = true; // yield
+                            stale_count = 0;
+                        }
+                    } else {
+                        stale_eip = eip;
+                        stale_count = 1;
+                    }
                     spin_count = 0;
                 }
             } else {

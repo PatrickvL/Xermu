@@ -1613,14 +1613,16 @@ void generate_mmio_helpers(uint8_t* page, size_t page_cap, MmioHelpers& out) {
     auto emit_shared_tail = [&](void* fn) -> uint8_t* {
         uint8_t* entry = e.cur();
 #ifdef _WIN32
-        e.emit8(0x48); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x20); // SUB RSP, 32
+        // 40 = 32 (shadow space) + 8 (alignment fix: the helper entry's
+        // PUSHFQ+LEA-8 leaves RSP ≡ 8 mod 16; +8 here realigns to 16).
+        e.emit8(0x48); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x28); // SUB RSP, 40
 #endif
         // MOVABS R14, fn  (REX.WB=0x49, B8+6=0xBE, imm64)
         e.emit8(REX_WB); e.emit8(0xBE); e.emit64((uint64_t)(uintptr_t)fn);
         // CALL R14  (REX.B=0x41, FF /2 D6)
         e.emit8(REX_B); e.emit8(0xFF); e.emit8(0xD6);
 #ifdef _WIN32
-        e.emit8(0x48); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x20); // ADD RSP, 32
+        e.emit8(0x48); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x28); // ADD RSP, 40
 #endif
         emit_load_all_gp(e);
         emit_restore_flags(e);  // LEA RSP,[RSP+8]; POPFQ

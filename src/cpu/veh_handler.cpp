@@ -142,6 +142,12 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
                 (unsigned long long)fault_addr, (unsigned long long)base,
                 (void*)(uintptr_t)ctx_regs->Rip,
                 (long long)ep->ExceptionRecord->ExceptionInformation[0]);
+        if (ctx_regs->R13) {
+            auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
+            fprintf(stderr, "[veh]   guest EIP=0x%08X ESP=0x%08X EAX=0x%08X ECX=0x%08X\n",
+                    gctx->eip, gctx->gp[4/*ESP*/], gctx->gp[0/*EAX*/], gctx->gp[1/*ECX*/]);
+        }
+        fflush(stderr);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -160,6 +166,7 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     if (!exec->cc.contains(rip)) {
         fprintf(stderr, "[veh] AV in fastmem but RIP=%p outside code cache, PA=0x%08X access=%lld\n",
                 (void*)rip, guest_pa, (long long)access_type);
+        fflush(stderr);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
