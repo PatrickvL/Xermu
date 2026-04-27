@@ -619,26 +619,11 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     }
 
     case ORD_HalReturnToFirmware:
-        // If there are pending threads, run the next one instead of halting.
+        // Thread/program exit. The scheduler in run_step promotes pending
+        // threads and switches between alive thread slots.
         stdcall_cleanup(exec, 1);
-        if (!heap->pending_threads.empty()) {
-            PendingThread t = heap->pending_threads.front();
-            heap->pending_threads.erase(heap->pending_threads.begin());
-            fprintf(stderr, "[hle] HalReturnToFirmware: running pending thread routine=0x%08X\n",
-                    t.start_routine);
-            uint32_t esp = exec.ctx.gp[GP_ESP];
-            uint32_t halt_addr = hle_stub_addr(ORD_HalReturnToFirmware);
-            // Push start context as argument
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &t.start_context, 4);
-            // Push return address
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
-            exec.ctx.gp[GP_ESP] = esp;
-            exec.ctx.eip = t.start_routine;
-        } else {
-            exec.ctx.halted = true;
-        }
+        exec.ctx.eip = 0xFFFFFFFF;
+        exec.ctx.halted = true;
         return true;
 
     case ORD_KeGetCurrentThread:
@@ -795,32 +780,11 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     }
 
     case ORD_PsTerminateSystemThread:
-        // Current thread exits. Run next pending thread if any.
+        // Current thread exits. The scheduler in run_step will switch to
+        // the next alive thread.
         stdcall_cleanup(exec, 1);
-        if (!heap->pending_threads.empty()) {
-            PendingThread t = heap->pending_threads.front();
-            heap->pending_threads.erase(heap->pending_threads.begin());
-            fprintf(stderr, "[hle] PsTerminateSystemThread: switching to thread routine=0x%08X ctx=0x%08X\n",
-                    t.start_routine, t.start_context);
-            // Allocate a fresh stack for the new thread (64 KB).
-            constexpr uint32_t THREAD_STACK_SIZE = 0x10000u;
-            uint32_t stack_base = heap->alloc(THREAD_STACK_SIZE);
-            uint32_t esp = stack_base ? (stack_base + THREAD_STACK_SIZE) : exec.ctx.gp[GP_ESP];
-            // Push a return address that will halt (use HalReturnToFirmware stub)
-            uint32_t halt_addr = hle_stub_addr(ORD_HalReturnToFirmware);
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
-            // Push start context as argument
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &t.start_context, 4);
-            // Push the return address (HalReturnToFirmware, so thread exit halts)
-            esp -= 4;
-            if (esp + 4 <= GUEST_RAM_SIZE) memcpy(exec.ram + esp, &halt_addr, 4);
-            exec.ctx.gp[GP_ESP] = esp;
-            exec.ctx.eip = t.start_routine;
-        } else {
-            exec.ctx.halted = true;
-        }
+        exec.ctx.eip = 0xFFFFFFFF;
+        exec.ctx.halted = true;
         exec.ctx.gp[GP_EAX] = 0;
         return true;
 

@@ -40,6 +40,16 @@ struct BootConfig {
 // ---------------------------------------------------------------------------
 // XboxSystem — owns the executor, hardware, and HLE heap.
 // ---------------------------------------------------------------------------
+
+// Saved CPU context for cooperative thread scheduling.
+struct ThreadSlot {
+    uint32_t gp[8]   = {};    // EAX..EDI
+    uint32_t eip     = 0;
+    uint32_t eflags  = 0x202;
+    uint32_t fs_base = 0;
+    bool     alive   = true;  // false = finished, can be removed
+};
+
 struct XboxSystem {
     std::unique_ptr<Executor> exec;
     XboxHardware*             hw       = nullptr;
@@ -48,6 +58,10 @@ struct XboxSystem {
     bool                      running  = false;
     bool                      started  = false;   // true after first run_step
     uint32_t                  entry_eip = 0;
+
+    // Cooperative round-robin thread slots.
+    std::vector<ThreadSlot>   threads;
+    int                       current_thread = -1; // index, or -1 = no threads
 
     XboxSystem() : exec(std::make_unique<Executor>()) {}
 
@@ -64,6 +78,38 @@ struct XboxSystem {
         delete hw;
         hw = nullptr;
         running = false;
+    }
+
+    // Save current CPU context into the thread slot at `idx`.
+    void save_thread(int idx) {
+        if (idx < 0 || idx >= (int)threads.size()) return;
+        auto& t = threads[idx];
+        memcpy(t.gp, exec->ctx.gp, sizeof(t.gp));
+        t.eip     = exec->ctx.eip;
+        t.eflags  = exec->ctx.eflags;
+        t.fs_base = exec->ctx.fs_base;
+    }
+
+    // Restore CPU context from the thread slot at `idx`.
+    void restore_thread(int idx) {
+        if (idx < 0 || idx >= (int)threads.size()) return;
+        auto& t = threads[idx];
+        memcpy(exec->ctx.gp, t.gp, sizeof(t.gp));
+        exec->ctx.eip     = t.eip;
+        exec->ctx.eflags  = t.eflags;
+        exec->ctx.fs_base = t.fs_base;
+    }
+
+    // Find the next alive thread after `from` (wraps around).
+    // Returns -1 if none alive.
+    int next_alive_thread(int from) const {
+        int n = (int)threads.size();
+        if (n == 0) return -1;
+        for (int i = 1; i <= n; i++) {
+            int idx = (from + i) % n;
+            if (threads[idx].alive) return idx;
+        }
+        return -1;
     }
 };
 
@@ -608,37 +654,81 @@ inline bool boot_lle_kernel(XboxSystem& sys, const BootConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// run_step — run the executor for a batch of steps.  Returns true if still
-// running (not halted).  Dispatches pending HLE threads non-blockingly:
-// if a thread is pending after the main code halts, it gets set up for the
-// *next* frame's run_step call (never blocks the UI thread).
+// run_step — run the executor for a batch of steps with cooperative
+// round-robin thread scheduling.
 //
-// Wait/delay HLE stubs set halted=true as a "yield" — the guest is still
-// alive but wants to give up its timeslice.  Only a halt at the sentinel
-// EIP (0xFFFFFFFF) or the HalReturnToFirmware stub is a real stop.
+// Each call runs the current thread until it yields (spin/wait), hits
+// max_steps, or terminates.  On yield, the context is saved and the next
+// alive thread is resumed.  Pending threads from PsCreateSystemThread are
+// promoted to live thread slots.
 // ---------------------------------------------------------------------------
 inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
     if (!sys.running) return false;
 
-    // Compute resume EIP before DPC dispatch (DPCs modify ctx.eip).
-    uint32_t resume_eip = sys.started ? sys.exec->ctx.eip : sys.entry_eip;
+    // --- Helper: promote pending threads to live thread slots ---
+    auto promote_pending = [&]() {
+        while (!sys.hle_heap.pending_threads.empty()) {
+            xbe::PendingThread t = sys.hle_heap.pending_threads.front();
+            sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
+
+            constexpr uint32_t THREAD_STACK_SIZE = 0x10000u;
+            uint32_t stack_base = sys.hle_heap.alloc(THREAD_STACK_SIZE);
+            uint32_t esp = stack_base ? (stack_base + THREAD_STACK_SIZE) : 0x00C0'0000u;
+
+            uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE)
+                memcpy(sys.exec->ram + esp, &t.start_context, 4);
+            esp -= 4;
+            if (esp + 4 <= GUEST_RAM_SIZE)
+                memcpy(sys.exec->ram + esp, &halt_ret, 4);
+
+            uint32_t fs = 0x00D0'0000u + (uint32_t)(sys.threads.size() + 1) * 0x4000u;
+            if (fs + 0x2000 <= GUEST_RAM_SIZE)
+                setup_kpcr(*sys.exec, fs, esp + 8);
+
+            ThreadSlot slot;
+            memset(slot.gp, 0, sizeof(slot.gp));
+            slot.gp[GP_ESP] = esp;
+            slot.eip     = t.start_routine;
+            slot.eflags  = 0x0000'0202u;
+            slot.fs_base = fs;
+            slot.alive   = true;
+            sys.threads.push_back(slot);
+
+            fprintf(stderr, "[sched] Thread %d created: routine=%08X ctx=%08X esp=%08X\n",
+                    (int)sys.threads.size() - 1, t.start_routine, t.start_context, esp);
+        }
+    };
+
+    // --- Promote any pending threads queued before this call ---
+    promote_pending();
+
+    // --- Initialize thread 0 from current CPU state if needed ---
+    if (sys.threads.empty()) {
+        // First call: the main thread becomes thread 0.
+        ThreadSlot main_t;
+        memcpy(main_t.gp, sys.exec->ctx.gp, sizeof(main_t.gp));
+        main_t.eip     = sys.started ? sys.exec->ctx.eip : sys.entry_eip;
+        main_t.eflags  = sys.exec->ctx.eflags;
+        main_t.fs_base = sys.exec->ctx.fs_base;
+        main_t.alive   = true;
+        sys.threads.push_back(main_t);
+        sys.current_thread = 0;
+    }
     sys.started = true;
 
-    // Fire any pending DPCs before running guest code.
-    // DPC routines are called at DISPATCH_LEVEL between timeslices.
+    // --- Fire pending DPCs (run on current thread's stack) ---
     while (!sys.hle_heap.pending_dpcs.empty()) {
         xbe::PendingDpc dpc = sys.hle_heap.pending_dpcs.front();
         sys.hle_heap.pending_dpcs.erase(sys.hle_heap.pending_dpcs.begin());
 
-        // DPC routine: void (PKDPC, PVOID Context, PVOID SysArg1, PVOID SysArg2)
         uint32_t esp = sys.exec->ctx.gp[GP_ESP];
         uint32_t zero = 0;
-        // Push args right-to-left: SysArg2, SysArg1(timer), Context, Dpc
         esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &zero, 4);
         esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.timer_va, 4);
         esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.context, 4);
         esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &dpc.dpc_va, 4);
-        // Push sentinel return address
         uint32_t sentinel = 0xFFFFFFFFu;
         esp -= 4; if (esp + 4 <= GUEST_RAM_SIZE) memcpy(sys.exec->ram + esp, &sentinel, 4);
         sys.exec->ctx.gp[GP_ESP] = esp;
@@ -646,79 +736,79 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
         sys.exec->ctx.halted = false;
         sys.exec->ctx.stop_reason = STOP_NONE;
         sys.exec->run(dpc.routine, max_steps);
-        // DPC routine has finished (or hit max_steps) — continue
     }
 
-    // If MmClaimGpuInstanceMemory was called, wire up PRAMIN to guest RAM.
+    // --- Wire PRAMIN if needed ---
     if (sys.hle_heap.gpu_instance_base && !sys.hw->nv2a.pramin_ram) {
         sys.hw->nv2a.pramin_ram      = sys.exec->ram;
         sys.hw->nv2a.pramin_ram_base = sys.hle_heap.gpu_instance_base;
         sys.hw->nv2a.pramin_ram_size = sys.hle_heap.gpu_instance_size;
     }
 
+    // --- Run the current thread ---
+    int cur = sys.current_thread;
+    if (cur < 0 || cur >= (int)sys.threads.size() || !sys.threads[cur].alive) {
+        cur = sys.next_alive_thread(cur >= 0 ? cur : 0);
+        if (cur < 0) { sys.running = false; return false; }
+        sys.current_thread = cur;
+    }
+
+    sys.restore_thread(cur);
     sys.exec->ctx.halted = false;
     sys.exec->ctx.stop_reason = STOP_NONE;
+    sys.exec->run(sys.exec->ctx.eip, max_steps);
 
-    // On the first call, start at entry_eip.  On subsequent calls (after a
-    // spin-yield or DPC), resume from where the executor left off so we
-    // don't restart the program from the beginning every time.
-    sys.exec->run(resume_eip, max_steps);
+    // Save back
+    sys.save_thread(cur);
 
-    // Check for error stops — these are always permanent
+    // --- Check for error stops ---
     uint32_t sr = sys.exec->ctx.stop_reason;
     if (sr == STOP_INVALID_OPCODE || sr == STOP_DIVIDE_ERROR) {
         sys.running = false;
         return false;
     }
 
-    // Check if this is a permanent halt (sentinel or HalReturnToFirmware)
+    // --- Check for permanent halt (thread exit) ---
     uint32_t eip = sys.exec->ctx.eip;
     bool real_halt = sys.exec->ctx.halted &&
         (eip == 0xFFFFFFFF ||
          eip == xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware));
 
-    // If permanently halted and there are pending threads, dispatch one
-    // for the *next* frame (never block the UI thread).
-    if (real_halt && !sys.hle_heap.pending_threads.empty()) {
-        xbe::PendingThread t = sys.hle_heap.pending_threads.front();
-        sys.hle_heap.pending_threads.erase(sys.hle_heap.pending_threads.begin());
-
-        // Allocate a fresh stack for the new thread (64 KB, page-aligned).
-        constexpr uint32_t THREAD_STACK_SIZE = 0x10000u;
-        uint32_t stack_base = sys.hle_heap.alloc(THREAD_STACK_SIZE);
-        uint32_t esp = stack_base ? (stack_base + THREAD_STACK_SIZE) : sys.exec->ctx.gp[GP_ESP];
-
-        // Push start_context as argument
-        esp -= 4;
-        if (esp + 4 <= GUEST_RAM_SIZE)
-            memcpy(sys.exec->ram + esp, &t.start_context, 4);
-        // Push halt return address (will stop execution when thread returns)
-        uint32_t halt_ret = xbe::hle_stub_addr(xbe::ORD_HalReturnToFirmware);
-        esp -= 4;
-        if (esp + 4 <= GUEST_RAM_SIZE)
-            memcpy(sys.exec->ram + esp, &halt_ret, 4);
-        sys.exec->ctx.gp[GP_ESP] = esp;
-
-        // Set entry EIP for next frame — don't run it now
-        sys.entry_eip = t.start_routine;
-        sys.exec->ctx.eip = t.start_routine;  // so resume picks it up
-        return true;  // still running — will dispatch thread next frame
-    }
-
-    // Permanent halt with no pending threads → done
     if (real_halt) {
-        sys.running = false;
-        return false;
+        // This thread is done
+        sys.threads[cur].alive = false;
+        fprintf(stderr, "[sched] Thread %d exited (EIP=%08X)\n", cur, eip);
+
+        // Promote any threads that were queued during this execution
+        promote_pending();
+
+        // Switch to next alive thread
+        int next = sys.next_alive_thread(cur);
+        if (next < 0) {
+            // No threads left
+            sys.running = false;
+            return false;
+        }
+        sys.current_thread = next;
+        sys.restore_thread(next);
+        return true;
     }
 
-    // Either max_steps exhausted or a yield-halt (wait/delay stub).
-    // Continue from current EIP next frame.
-    // If EIP is outside guest RAM, this is a bad jump — treat as permanent halt.
+    // --- Yield (spin-wait or max_steps exhausted): switch to next thread ---
+    if (sys.exec->ctx.halted || sys.threads.size() > 1) {
+        int next = sys.next_alive_thread(cur);
+        if (next >= 0 && next != cur) {
+            sys.current_thread = next;
+            // Context for `next` will be restored on the next run_step call
+        }
+    }
+
+    // Check for bad jump
     if (eip >= GUEST_RAM_SIZE && eip < 0xF0000000u) {
         sys.running = false;
         return false;
     }
-    sys.entry_eip = sys.exec->ctx.eip;
+
     return true;
 }
 
