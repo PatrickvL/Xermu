@@ -1058,6 +1058,12 @@ void TraceBuilder::emit_jmp_exit(Emitter& e,
                 return;
             }
         }
+        // Far JMP (JMP ptr16:32): use offset portion as target EIP.
+        // Segment changes are ignored (flat 32-bit model on Xbox).
+        if (op.type == ZYDIS_OPERAND_TYPE_POINTER) {
+            emit_epilog_static(e, (uint32_t)op.ptr.offset);
+            return;
+        }
         if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
             if (emit_ea_to_r14(e, op)) {
                 // Save guest regs (preserves all original values in ctx)
