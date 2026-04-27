@@ -38,6 +38,7 @@ struct XboxHardware {
     MiscIoState misc;
     uint8_t*    ram = nullptr;
     uint32_t    ram_size = 0;
+    uint32_t    tick_accum = 0;  // accumulator for KeTickCount timing
 };
 
 static void hw_tick_callback(void* user) {
@@ -46,7 +47,19 @@ static void hw_tick_callback(void* user) {
     hw->nv2a.tick_timer();
     hw->usb0.tick_frame();
     hw->usb1.tick_frame();
-    // PFIFO is processed by the NV2A thread (nv2a_thread.hpp), not here.
+
+    // Increment KeTickCount approximately every ~1ms.
+    // Each tick callback fires once per trace; ~1000 traces ≈ 1ms.
+    if (hw->ram && ++hw->tick_accum >= 1000) {
+        hw->tick_accum = 0;
+        // KDATA_BASE (0x81000) + offset 0 = KeTickCount
+        constexpr uint32_t KE_TICK_ADDR = 0x81000;
+        uint32_t tick = 0;
+        memcpy(&tick, hw->ram + KE_TICK_ADDR, 4);
+        ++tick;
+        memcpy(hw->ram + KE_TICK_ADDR, &tick, 4);
+    }
+
     if (hw->nv2a.vblank_irq_pending) {
         hw->nv2a.vblank_irq_pending = false;
         hw->pic.raise_irq(1);

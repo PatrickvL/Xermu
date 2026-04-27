@@ -1115,10 +1115,12 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
 
     case ORD_MmMapIoSpace: {
         // PVOID MmMapIoSpace(PHYSICAL_ADDRESS PhysAddr, SIZE_T Size, ULONG CacheType)
-        // On Xbox, MMIO is identity-mapped. Return PhysAddr as-is.
+        // PhysAddr is LARGE_INTEGER = 8 bytes on stack. Total = 8+4+4 = 16 = 4 dwords.
+        // On Xbox, MMIO is identity-mapped. Return PhysAddr.lo as-is.
         uint32_t phys = stack_arg(exec, 0);
+        fprintf(stderr, "[hle] MmMapIoSpace: phys=0x%08X → va=0x%08X\n", phys, phys);
         exec.ctx.gp[GP_EAX] = phys;
-        stdcall_cleanup(exec, 3);
+        stdcall_cleanup(exec, 4);
         return true;
     }
 
@@ -1996,11 +1998,46 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
     case ORD_HalReadWritePCISpace: {
         // void HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber,
         //     ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace)
+        uint32_t bus      = stack_arg(exec, 0);
+        uint32_t slot     = stack_arg(exec, 1);
+        uint32_t reg      = stack_arg(exec, 2);
         uint32_t buf_ptr  = stack_arg(exec, 3);
         uint32_t length   = stack_arg(exec, 4);
         uint32_t is_write = stack_arg(exec, 5);
-        if (!is_write && buf_ptr + length <= GUEST_RAM_SIZE && length > 0)
-            memset(exec.ram + buf_ptr, 0, length);
+
+        // Build PCI config address: enable bit (31) | bus | dev | fn=0 | reg
+        uint32_t cfg_addr = 0x80000000u | ((bus & 0xFF) << 16)
+                          | ((slot & 0x1F) << 11) | (reg & 0xFC);
+        exec.io_write(0x0CF8, cfg_addr, 4);
+
+        if (is_write) {
+            // Write from guest buffer to PCI config space
+            if (buf_ptr + length <= GUEST_RAM_SIZE) {
+                for (uint32_t off = 0; off < length; off += 4) {
+                    uint32_t val = 0;
+                    uint32_t chunk = (length - off >= 4) ? 4 : (length - off);
+                    memcpy(&val, exec.ram + buf_ptr + off, chunk);
+                    exec.io_write(0x0CFC + (reg & 3), val, chunk);
+                    if (off + 4 < length) {
+                        cfg_addr += 4;
+                        exec.io_write(0x0CF8, cfg_addr, 4);
+                    }
+                }
+            }
+        } else {
+            // Read from PCI config space to guest buffer
+            if (buf_ptr + length <= GUEST_RAM_SIZE) {
+                for (uint32_t off = 0; off < length; off += 4) {
+                    uint32_t chunk = (length - off >= 4) ? 4 : (length - off);
+                    uint32_t val = exec.io_read(0x0CFC + (reg & 3), chunk);
+                    memcpy(exec.ram + buf_ptr + off, &val, chunk);
+                    if (off + 4 < length) {
+                        cfg_addr += 4;
+                        exec.io_write(0x0CF8, cfg_addr, 4);
+                    }
+                }
+            }
+        }
         stdcall_cleanup(exec, 6);
         return true;
     }

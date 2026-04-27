@@ -271,7 +271,14 @@ int main(int argc, char** argv) {
         sys.exec->register_io(0xEB, nullptr, io_irq_trigger_write, &sys.hw->pic);
 
         // Run to completion (handles threads + DPCs via run_step)
-        while (xbox::run_step(sys, 10'000'000)) {}
+        int run_iters = 0;
+        constexpr int MAX_RUN_ITERS = 200;
+        while (run_iters < MAX_RUN_ITERS && xbox::run_step(sys, 1'000'000)) {
+            ++run_iters;
+        }
+        if (run_iters >= MAX_RUN_ITERS)
+            fprintf(stderr, "[test_runner] max run iterations (%d) reached at EIP=%08X\n",
+                    run_iters, sys.exec->ctx.eip);
 
         uint32_t result = sys.exec->ctx.gp[GP_EAX];
         printf("[test_runner] %s (EAX=%u, EIP=0x%08X)\n",

@@ -356,6 +356,12 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
+    static bool first_read = true;
+    if (first_read) {
+        fprintf(stderr, "[nv2a] first read: PA=%08X off=%06X\n", pa, off);
+        first_read = false;
+    }
+
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
         if (off == pmc::INTR_0) return nv->pmc_intr_0();  // computed
