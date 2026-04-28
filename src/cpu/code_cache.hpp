@@ -54,6 +54,12 @@ struct CodeCache {
         return p;
     }
 
+    // Shrink the last allocation to actual_used bytes (16-byte aligned).
+    // Must be called before any subsequent alloc().
+    void shrink_last(uint8_t* buf, size_t actual_used) {
+        used = (size_t)(buf - base) + ((actual_used + 15u) & ~15ull);
+    }
+
     // Carve out n bytes in the thunk slab, 16-byte aligned. Returns null on overflow.
     uint8_t* alloc_thunk(size_t n) {
         size_t a = (thunk_used + 15u) & ~15ull;

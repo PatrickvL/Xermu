@@ -487,7 +487,8 @@ uint32_t string_movs_helper(GuestContext* ctx, uint32_t eflags,
     auto do_one = [&]() {
         uint32_t val = guest_read(ctx, esi, elem_size);
         guest_write(ctx, edi, val, elem_size);
-        esi += dir; edi += dir;
+        esi += dir;
+        edi += dir;
     };
     if (rep_mode == 0) do_one();
     else while (ecx > 0) { do_one(); ecx--; }

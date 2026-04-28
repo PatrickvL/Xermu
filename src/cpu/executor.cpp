@@ -137,8 +137,21 @@ bool Executor::init(MmioMap* mmio) {
     if (fastmem_window.base) {
         ram = static_cast<uint8_t*>(fastmem_window.base);
     } else {
-        // Fallback: plain allocation (mirror goes through MMIO slow path).
-        ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
+        // Allocate RAM + 4GB guard: reserve a large region so the code
+        // cache cannot land adjacent to RAM (which would let [R12+R14]
+        // writes with out-of-range R14 corrupt JIT code).
+        static constexpr size_t GUARD_SIZE = 0x100000000ULL; // 4 GB
+        void* guard = VirtualAlloc(nullptr, GUEST_RAM_SIZE + GUARD_SIZE,
+                                   MEM_RESERVE, PAGE_NOACCESS);
+        if (guard) {
+            // Commit only the first GUEST_RAM_SIZE bytes as RW.
+            ram = static_cast<uint8_t*>(VirtualAlloc(guard, GUEST_RAM_SIZE,
+                                                     MEM_COMMIT, PAGE_READWRITE));
+        }
+        if (!ram) {
+            // Last resort: plain allocation without guard.
+            ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
+        }
     }
     if (!ram) return false;
     memset(ram, 0, GUEST_RAM_SIZE); // zero-fill (matches Xbox kernel boot)
@@ -974,11 +987,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Execute the trace.
         ctx.eip         = eip;
         ctx.stop_reason = STOP_NONE;
-        if (steps < 3) fprintf(stderr, "[run] dispatch step=%llu EIP=%08X host=%p\n",
-            (unsigned long long)steps, eip, (void*)t->host_code);
         dispatch_trace(&ctx, t->host_code);
+
         if (steps < 3) fprintf(stderr, "[run] returned step=%llu next=%08X stop=%u\n",
             (unsigned long long)steps, ctx.next_eip, ctx.stop_reason);
+
 
         // Advance EIP to what the trace exit stub wrote.
         ctx.eip = ctx.next_eip;
@@ -1152,6 +1165,20 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
             prev_trace = nullptr; // chain broken
+            // Stack dump for crash analysis (using safe read_guest_block).
+            {
+                uint32_t sp = ctx.gp[4]; // ESP
+                uint32_t stk[32] = {};
+                read_guest_block(sp, sizeof(stk), stk);
+                fprintf(stderr, "[exec] stack @%08X:", sp);
+                for (int si = 0; si < 32; ++si) {
+                    if (si % 8 == 0 && si > 0)
+                        fprintf(stderr, "\n[exec]   +%02X:", si*4);
+                    fprintf(stderr, " %08X", stk[si]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
             static int pf_log_count = 0;
             if (pf_log_count < 50) {
                 ++pf_log_count;

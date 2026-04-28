@@ -1191,7 +1191,7 @@ void TraceBuilder::emit_ret_exit(Emitter& e, GuestContext* /*ctx*/,
 // Build entry point
 // ---------------------------------------------------------------------------
 
-static constexpr size_t MAX_TRACE_BYTES = 8192;
+static constexpr size_t MAX_TRACE_BYTES = 65536;
 static constexpr size_t MAX_INSN_COUNT  = 512;
 
 // Arithmetic flags clobbered by the inline SUB/ADD ctx->gp[ESP] in
@@ -1207,9 +1207,6 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             CodeCache&          cc,
                             TraceArena&         arena,
                             GuestContext*       ctx) {
-    fprintf(stderr, "[build] enter eip=%08X code=%p len=%u ctx=%p\n",
-            guest_eip, (void*)code, code_len, (void*)ctx);
-    fflush(stderr);
     if (code_len == 0) {
         fprintf(stderr, "[trace] EIP %08X â€” no code bytes available\n", guest_eip);
         return nullptr;
@@ -1298,7 +1295,6 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     if (!emit_buf) { fprintf(stderr, "[trace] code cache full\n"); return nullptr; }
 
     Emitter  e(emit_buf, MAX_TRACE_BYTES);
-    fprintf(stderr, "[build] ctx->cr0=%08X\n", ctx->cr0);
     e.paging = (ctx->cr0 & 0x80000000u) != 0;  // CR0.PG at build time
     const uint8_t* pc        = code;
     uint32_t       emit_off  = 0;  // offset into code buffer
@@ -1308,6 +1304,14 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     size_t         insn_idx  = 0;
 
     for (size_t n = 0; n < MAX_INSN_COUNT && !done_flag; ++n) {
+        // Safety: stop trace if buffer is nearly full.  Worst-case
+        // per-instruction expansion with paging is ~300 bytes
+        // (emit_translate_r14 + rewrite + epilog).
+        if (e.pos + 512 > e.cap) {
+            emit_epilog_static(e, guest_pc);
+            break;
+        }
+
         if (emit_off >= code_len) {
             emit_epilog_static(e, guest_pc);
             break;
@@ -1591,7 +1595,9 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     t->code_pa   = guest_eip;
     t->host_code = emit_buf;
     t->host_size = (uint32_t)e.pos;
+    cc.shrink_last(emit_buf, e.pos);
     t->valid     = true;
+
 
     // Transfer pending link slots from the emitter to the trace.
     t->num_links = 0;

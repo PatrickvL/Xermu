@@ -695,12 +695,32 @@ private:
         auto it = handle_map[dev].find(req->handle);
         if (it == handle_map[dev].end()) {
             // Raw device handles (< FIRST_FREE_HANDLE) have no opened file.
-            // Return zero-filled data for reads (e.g. partition table read).
-            if (req->handle < FIRST_FREE_HANDLE && io_type == REQ_READ) {
-                memset(req->buffer.get(), 0, req->size);
-                req->info.header.status = STATUS_SUCCESS;
-                req->info.header.info   = req->size;
-                return;
+            if (req->handle < FIRST_FREE_HANDLE) {
+                if (io_type == REQ_READ) {
+                    memset(req->buffer.get(), 0, req->size);
+                    // Synthesize FATX superblock for partitions 1-5 at offset 0.
+                    if (dev >= DEV_PARTITION1 && dev <= DEV_PARTITION5 &&
+                        req->offset == 0 && req->size >= 16) {
+                        auto* sb = reinterpret_cast<uint32_t*>(req->buffer.get());
+                        sb[0] = 0x58544146;  // 'XTAF' (FATX signature, LE)
+                        sb[1] = 0x12345678 + dev;  // VolumeID
+                        sb[2] = 32;          // ClusterSize (32 sectors = 16KB)
+                        sb[3] = 1;           // RootDirCluster
+                    }
+                    req->info.header.status = STATUS_SUCCESS;
+                    req->info.header.info   = req->size;
+                    return;
+                }
+                if (io_type == REQ_WRITE) {
+                    // Discard writes to raw partition handles.
+                    req->info.header.status = STATUS_SUCCESS;
+                    req->info.header.info   = req->size;
+                    return;
+                }
+                if (io_type == REQ_CLOSE) {
+                    req->info.header.status = STATUS_SUCCESS;
+                    return;
+                }
             }
             fprintf(stderr, "[io] handle 0x%08X not found (dev=%u type=0x%08X)\n",
                     req->handle, dev, io_type);
