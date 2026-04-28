@@ -14,6 +14,7 @@
 #include <Zydis/Zydis.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #ifdef _WIN32
 LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
@@ -138,17 +139,29 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     // Step 1: Is the fault within the fastmem window?
     auto base = (uintptr_t)exec->ctx.fastmem_base;
     if (fault_addr < base || fault_addr >= base + 0x100000000ULL) {
-        fprintf(stderr, "[veh] AV outside fastmem: fault=0x%llX base=0x%llX RIP=%p access=%lld\n",
-                (unsigned long long)fault_addr, (unsigned long long)base,
-                (void*)(uintptr_t)ctx_regs->Rip,
-                (long long)ep->ExceptionRecord->ExceptionInformation[0]);
-        if (ctx_regs->R13) {
+        auto rip_outside = (uint8_t*)(uintptr_t)ctx_regs->Rip;
+        bool in_cc = exec->cc.contains(rip_outside);
+        HMODULE hmod = GetModuleHandleA(NULL);
+        fprintf(stderr, "[veh] AV outside fastmem: fault=0x%llX RIP=%p in_cc=%d RVA=0x%llX\n",
+                (unsigned long long)fault_addr,
+                (void*)(uintptr_t)ctx_regs->Rip, (int)in_cc,
+                (unsigned long long)(ctx_regs->Rip - (DWORD64)(uintptr_t)hmod));
+        if (in_cc && ctx_regs->R13) {
+            // Fault in JIT code - redirect to exception_exit
             auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
-            fprintf(stderr, "[veh]   guest EIP=0x%08X ESP=0x%08X EAX=0x%08X ECX=0x%08X\n",
-                    gctx->eip, gctx->gp[4/*ESP*/], gctx->gp[0/*EAX*/], gctx->gp[1/*ECX*/]);
+            fprintf(stderr, "[veh]   guest EIP=0x%08X ESP=0x%08X\n",
+                    gctx->eip, gctx->gp[4/*ESP*/]);
+            fflush(stderr);
+            gctx->halted = true;
+            gctx->stop_reason = STOP_INVALID_OPCODE;
+            ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Fault in C helper or unknown code - abort to prevent cascade
+        fprintf(stderr, "[veh]   R12=%p R13=%p - aborting\n",
+                (void*)(uintptr_t)ctx_regs->R12, (void*)(uintptr_t)ctx_regs->R13);
         fflush(stderr);
-        return EXCEPTION_CONTINUE_SEARCH;
+        _exit(99);
     }
 
     // Step 1b: SMC detection — write to a protected code page in RAM.

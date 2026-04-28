@@ -73,8 +73,6 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     uint32_t cr3 = ctx->cr3;
     SoftTlb* tlb = ctx->soft_tlb;
 
-
-
     // Software TLB lookup.
     uint32_t vpn = va >> 12;
     uint32_t tlb_idx = vpn & SoftTlb::MASK;
@@ -88,15 +86,15 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
 
     // Read PDE
     uint32_t pde_pa = pdir_pa + pdi * 4;
-    if (pde_pa + 4 > ram_size) goto fault;
+    if (pde_pa + 4 > ram_size) goto fault_np;
     uint32_t pde;
     memcpy(&pde, ram + pde_pa, 4);
-    if (!(pde & PTE_PRESENT)) goto fault;
+    if (!(pde & PTE_PRESENT)) goto fault_np;
 
     // 4 MB page (PS=1)?
     if (pde & PDE_PS) {
         uint32_t pa = alias_pa((pde & PDE_4MB_BASE) | (va & PDE_4MB_OFF));
-        if (is_write && !(pde & PTE_RW)) goto fault;
+        if (is_write && !(pde & PTE_RW)) goto fault_prot;
         if (!(pde & PTE_ACCESSED) || (is_write && !(pde & PTE_DIRTY))) {
             pde |= PTE_ACCESSED;
             if (is_write) pde |= PTE_DIRTY;
@@ -111,11 +109,11 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
     // 4 KB page table
     {
         uint32_t pt_pa = alias_pa(pde & GUEST_PAGE_MASK) + pti * 4;
-        if (pt_pa + 4 > ram_size) goto fault;
+        if (pt_pa + 4 > ram_size) goto fault_np;
         uint32_t pte;
         memcpy(&pte, ram + pt_pa, 4);
-        if (!(pte & PTE_PRESENT)) goto fault;
-        if (is_write && !(pte & PTE_RW)) goto fault;
+        if (!(pte & PTE_PRESENT)) goto fault_np;
+        if (is_write && !(pte & PTE_RW)) goto fault_prot;
         uint32_t pa = alias_pa((pte & GUEST_PAGE_MASK) | (va & 0xFFF));
         bool need_pde_update = !(pde & PTE_ACCESSED);
         bool need_pte_update = !(pte & PTE_ACCESSED) || (is_write && !(pte & PTE_DIRTY));
@@ -131,8 +129,17 @@ uint32_t translate_va_jit(GuestContext* ctx, uint32_t va, uint32_t is_write) {
         return pa;
     }
 
-fault:
+fault_prot:
+    // Page present but protection violation (e.g. write to read-only page).
     ctx->cr2 = va;
+    ctx->pf_error_code = 1u | (is_write ? 2u : 0u);  // P=1, W/R, U/S=0
+    ctx->stop_reason = STOP_PAGE_FAULT;
+    return ~0u;
+
+fault_np:
+    // Page not present.
+    ctx->cr2 = va;
+    ctx->pf_error_code = (is_write ? 2u : 0u);  // P=0, W/R, U/S=0
     ctx->stop_reason = STOP_PAGE_FAULT;
     return ~0u;
 }
@@ -227,14 +234,10 @@ void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
 // CALL [mem] / PUSH ESP / POP ESP helpers.
 // ---------------------------------------------------------------------------
 
-uint32_t call_mem_helper(GuestContext* ctx, uint32_t pa, uint32_t retaddr) {
-    // pa is pre-translated; read target directly from fastmem.
-    auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-    uint32_t target = 0;
-    if (pa < GUEST_RAM_SIZE)
-        memcpy(&target, base + pa, 4);
-    else if (ctx->mmio)
-        target = ctx->mmio->read(pa, 4);
+uint32_t call_mem_helper(GuestContext* ctx, uint32_t va, uint32_t retaddr) {
+    // va is the virtual address of the call target pointer.
+    // Translate VA->PA internally (same as read_guest_mem32).
+    uint32_t target = read_guest_mem32(ctx, va);
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     write_guest_mem32(ctx, esp, retaddr);

@@ -161,8 +161,9 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.register_io(0xCF8, pci_io_read_cf8, pci_io_write_cf8, &hw->pci);
     exec.register_io(0xCFC, pci_io_read_cfc, pci_io_write_cfc, &hw->pci);
 
-    for (uint16_t p = 0xC000; p <= 0xC00E; p += 2)
+    for (uint16_t p = 0xC000; p <= 0xC00F; p++)
         exec.register_io(p, smbus_io_read, smbus_io_write, &hw->smbus);
+    hw->smbus.pic = &hw->pic;
 
     for (uint16_t p = 0x1F0; p <= 0x1F7; p++)
         exec.register_io(p, ide_io_read, ide_io_write, &hw->ide);

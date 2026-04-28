@@ -70,6 +70,10 @@ struct alignas(16) GuestContext {
     uint32_t  fs_base;        // FS segment base (kernel KPCR)
     uint32_t  gs_base;        // GS segment base
 
+    // Page-fault error code computed by translate_va / translate_va_jit.
+    // Bits: 0=P (present), 1=W/R (write), 2=U/S (user), 4=I/D (instr fetch).
+    uint32_t  pf_error_code = 0;
+
     // FPU/SSE state in FXSAVE format (512 bytes, 16-byte aligned).
     // Saved/restored by the dispatch_trace trampoline on trace entry/exit.
     alignas(16) uint8_t guest_fpu[512];  // [128] guest x87/MMX/SSE state

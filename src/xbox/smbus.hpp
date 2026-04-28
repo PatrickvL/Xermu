@@ -4,6 +4,7 @@
 // Flat register array indexed by (port & 0xF), matching the PGRAPH/APU
 // pattern.  Named constants in the smbus:: namespace mirror Xbox SMBus
 // I/O port register layout.
+#include "pic.hpp"
 #include <cstdint>
 #include <cstring>
 
@@ -18,9 +19,21 @@ static constexpr uint32_t CONTROL = 0x02;   // transaction trigger
 static constexpr uint32_t ADDRESS = 0x04;   // target device address + R/W bit
 static constexpr uint32_t DATA    = 0x06;   // data byte
 static constexpr uint32_t COMMAND = 0x08;   // SMBus command byte
+static constexpr uint32_t FIFO    = 0x09;   // block transfer FIFO
 
 // STATUS register bits
 static constexpr uint8_t  STAT_DONE = 0x10; // transaction complete (W1C)
+
+// CONTROL register bits
+static constexpr uint8_t  GE_RW_BYTE  = 2;   // byte protocol
+static constexpr uint8_t  GE_RW_WORD  = 3;   // word protocol
+static constexpr uint8_t  GE_RW_BLOCK = 5;   // block protocol
+static constexpr uint8_t  GE_HOST_STC = 0x08; // start cycle
+static constexpr uint8_t  GE_HCYC_EN  = 0x10; // interrupt enable
+static constexpr uint8_t  PROTO_MASK  = 0x07; // low 3 bits = protocol
+
+// SMBus IRQ on the Xbox PIC
+static constexpr int      IRQ = 11;
 
 // Well-known SMBus device addresses (7-bit)
 static constexpr uint8_t  DEV_SMC       = 0x10;  // PIC16LC system management controller
@@ -68,6 +81,14 @@ struct SmbusState {
     static constexpr uint32_t REG_COUNT = 16;
     uint8_t regs[REG_COUNT] = {};
     uint8_t eeprom[256] = {};
+
+    // FIFO buffer for block reads/writes.
+    uint8_t fifo[32] = {};
+    int     fifo_pos = 0;
+    int     fifo_len = 0;
+
+    // PIC for raising IRQ 11 after SMBus transactions.
+    PicPair* pic = nullptr;
 
     // SMC state (PIC16LC at address 0x10)
     uint8_t smc_fan_mode    = 0;
@@ -131,6 +152,11 @@ struct SmbusState {
 static uint32_t smbus_io_read(uint16_t port, unsigned /*size*/, void* user) {
     auto* s = static_cast<SmbusState*>(user);
     uint32_t r = port & 0xF;
+    if (r == smbus::FIFO) {
+        if (s->fifo_pos < s->fifo_len)
+            return s->fifo[s->fifo_pos++];
+        return 0;
+    }
     if (r < SmbusState::REG_COUNT) return s->regs[r];
     return 0;
 }
@@ -143,6 +169,9 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
     switch (r) {
     case smbus::STATUS:
         s->regs[r] &= ~(uint8_t)val;   // W1C
+        // Lower IRQ when status is cleared.
+        if (!(s->regs[r] & smbus::STAT_DONE) && s->pic)
+            s->pic->lower_irq(smbus::IRQ);
         return;
     case smbus::CONTROL: {
         s->regs[r] = (uint8_t)val;
@@ -150,12 +179,28 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
         uint8_t dev_addr = s->regs[smbus::ADDRESS] >> 1;
         bool is_read = (s->regs[smbus::ADDRESS] & 1) != 0;
         uint8_t cmd = s->regs[smbus::COMMAND];
+        uint8_t proto = val & smbus::PROTO_MASK;
 
         if (dev_addr == smbus::DEV_EEPROM) {
-            if (is_read && cmd < sizeof(s->eeprom))
-                s->regs[smbus::DATA] = s->eeprom[cmd];
-            else if (!is_read && cmd < sizeof(s->eeprom))
-                s->eeprom[cmd] = s->regs[smbus::DATA];
+            if (proto == smbus::GE_RW_BLOCK) {
+                // Block read/write: DATA register holds block length.
+                int block_len = s->regs[smbus::DATA];
+                if (block_len > 32) block_len = 32;
+                if (is_read) {
+                    s->fifo_pos = 0;
+                    s->fifo_len = block_len;
+                    for (int i = 0; i < block_len; ++i)
+                        s->fifo[i] = (cmd + i < 256) ? s->eeprom[cmd + i] : 0;
+                } else {
+                    // Block write — not typically used for EEPROM reads.
+                }
+            } else {
+                // Byte/word protocol
+                if (is_read && cmd < sizeof(s->eeprom))
+                    s->regs[smbus::DATA] = s->eeprom[cmd];
+                else if (!is_read && cmd < sizeof(s->eeprom))
+                    s->eeprom[cmd] = s->regs[smbus::DATA];
+            }
         } else if (dev_addr == smbus::DEV_SMC) {
             if (is_read) {
                 switch (cmd) {
@@ -193,6 +238,8 @@ static void smbus_io_write(uint16_t port, uint32_t val, unsigned /*size*/, void*
         } else if (dev_addr == smbus::DEV_VIDENC_XC) {
             if (is_read) s->regs[smbus::DATA] = 0;
         }
+        // Raise SMBus IRQ so the nboxkrnl ISR/DPC can signal completion.
+        if (s->pic) s->pic->raise_irq(smbus::IRQ);
         return;
     }
     default:

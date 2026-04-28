@@ -1026,9 +1026,10 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
         return false;
     }
 
-    // ---- Host I/O ports ----
+    // ---- Host I/O ports + I/O system ----
     nbox.host.exec = sys.exec.get();
     nbox.host.io   = &nbox.io;
+    nbox.io.init(sys.exec.get(), nbox.io.dvd_dir, nbox.io.hdd_dir);
     nboxkrnl::register_host_ports(*sys.exec, nbox.host);
 
     // ---- Load kernel PE ----

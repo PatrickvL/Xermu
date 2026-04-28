@@ -240,6 +240,8 @@ struct IoSystem {
     // Lifecycle
     // -----------------------------------------------------------------------
 
+    ~IoSystem() { stop(); }
+
     void init(Executor* e, const std::string& dvd, const std::string& hdd) {
         exec = e;
         dvd_dir = dvd;
@@ -441,8 +443,20 @@ struct IoSystem {
                 if (io_get_type(req->type) == REQ_READ &&
                     req->info.header.status == STATUS_SUCCESS) {
                     auto* rw_req = req;
-                    exec->write_guest_block(rw_req->address, rw_req->size,
+                    // Dump first 64 bytes of host buffer before write
+                    fprintf(stderr, "[io] host buf first 64:");
+                    for (uint32_t b = 0; b < 64 && b < rw_req->size; ++b)
+                        fprintf(stderr, " %02X", rw_req->buffer[b]);
+                    fprintf(stderr, "\n");
+                    // Count non-zero bytes in host buffer
+                    uint32_t nz = 0;
+                    for (uint32_t b = 0; b < rw_req->size; ++b)
+                        if (rw_req->buffer[b]) ++nz;
+                    fprintf(stderr, "[io] host buf non-zero: %u / %u\n", nz, rw_req->size);
+                    bool wok = exec->write_guest_block(rw_req->address, rw_req->size,
                                             rw_req->buffer.get());
+                    fprintf(stderr, "[io] write_guest_block(VA=0x%08X, size=%u) = %s\n",
+                            rw_req->address, rw_req->size, wok ? "OK" : "FAIL");
                 }
 
                 // Write result back to guest.
@@ -680,6 +694,14 @@ private:
 
         auto it = handle_map[dev].find(req->handle);
         if (it == handle_map[dev].end()) {
+            // Raw device handles (< FIRST_FREE_HANDLE) have no opened file.
+            // Return zero-filled data for reads (e.g. partition table read).
+            if (req->handle < FIRST_FREE_HANDLE && io_type == REQ_READ) {
+                memset(req->buffer.get(), 0, req->size);
+                req->info.header.status = STATUS_SUCCESS;
+                req->info.header.info   = req->size;
+                return;
+            }
             fprintf(stderr, "[io] handle 0x%08X not found (dev=%u type=0x%08X)\n",
                     req->handle, dev, io_type);
             return;
@@ -708,6 +730,9 @@ private:
             if (fs->good() || fs->eof()) {
                 req->info.header.status = STATUS_SUCCESS;
                 req->info.header.info   = static_cast<uint32_t>(fs->gcount());
+                fprintf(stderr, "[io] read handle=0x%08X off=%lld req_size=%u got=%u addr=0x%08X\n",
+                        req->handle, (long long)req->offset, req->size,
+                        (unsigned)fs->gcount(), req->address);
                 // Actual size to transfer back may be less than requested.
                 req->size = static_cast<uint32_t>(fs->gcount());
             } else {

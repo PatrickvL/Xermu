@@ -644,6 +644,7 @@ bool emit_handler_push(Emitter& e, const ZydisDecodedInstruction& insn,
     // PUSH [mem] â€” read from memory, push onto guest stack
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!emit_ea_to_r14(e, ops[0])) return false;
+        emit_paging_translate(e, /*is_write=*/false);  // VA→PA for source read
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -696,6 +697,7 @@ bool emit_handler_pop(Emitter& e, const ZydisDecodedInstruction& /*insn*/,
     // POP [mem] â€” pop from guest stack, write to memory address
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!emit_ea_to_r14(e, ops[0])) return false;
+        emit_paging_translate(e, /*is_write=*/true);  // VA→PA for dest write
         if (save_flags) emit_save_flags(e);
         emit_save_all_gp(e);
         emit_ccall_arg0_ctx(e);
@@ -1205,6 +1207,9 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
                             CodeCache&          cc,
                             TraceArena&         arena,
                             GuestContext*       ctx) {
+    fprintf(stderr, "[build] enter eip=%08X code=%p len=%u ctx=%p\n",
+            guest_eip, (void*)code, code_len, (void*)ctx);
+    fflush(stderr);
     if (code_len == 0) {
         fprintf(stderr, "[trace] EIP %08X â€” no code bytes available\n", guest_eip);
         return nullptr;
@@ -1293,6 +1298,7 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
     if (!emit_buf) { fprintf(stderr, "[trace] code cache full\n"); return nullptr; }
 
     Emitter  e(emit_buf, MAX_TRACE_BYTES);
+    fprintf(stderr, "[build] ctx->cr0=%08X\n", ctx->cr0);
     e.paging = (ctx->cr0 & 0x80000000u) != 0;  // CR0.PG at build time
     const uint8_t* pc        = code;
     uint32_t       emit_off  = 0;  // offset into code buffer

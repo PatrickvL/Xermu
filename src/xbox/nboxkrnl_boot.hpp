@@ -86,6 +86,10 @@ inline void setup_cpu_state(Executor& exec) {
 
     // Flags.
     ctx.eflags = 0x00000002u;  // Reserved bit set, IF=0 (interrupts disabled)
+
+    // Disable virtual interrupt flag — the kernel will execute STI
+    // when it is ready to accept interrupts.
+    ctx.virtual_if = false;
 }
 
 // ---------------------------------------------------------------------------
