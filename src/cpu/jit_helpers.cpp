@@ -149,12 +149,15 @@ fault_np:
 // ---------------------------------------------------------------------------
 
 // Translate a guest address to PA if paging is enabled, otherwise pass through.
+// Returns ~0u on fault (caller must check).
+// Always clears stop_reason so it doesn't leak into subsequent
+// emit_translate_r14 checks in JIT code.
 static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is_write) {
     if (ctx->cr0 & 0x80000000u) {
         uint32_t pa = translate_va_jit(ctx, addr, is_write ? 1 : 0);
-        // C helpers handle faults via the ~0u return value.
-        // Clear stop_reason so it doesn't leak into the next
-        // emit_translate_r14 check and cause a spurious #PF.
+        // Always clear stop_reason — C helpers handle faults via ~0u.
+        // If we leave STOP_PAGE_FAULT set, the next emit_translate_r14
+        // check in JIT code will see a stale fault and mis-fire.
         ctx->stop_reason = 0;
         return pa;
     }
@@ -163,6 +166,7 @@ static inline uint32_t guest_translate(GuestContext* ctx, uint32_t addr, bool is
 
 static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, false);
+    if (pa == ~0u) return 0;  // fault — stop_reason already set
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         uint32_t v = 0;
@@ -174,6 +178,7 @@ static inline uint32_t guest_read(GuestContext* ctx, uint32_t addr, uint32_t siz
 
 static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, uint32_t size) {
     uint32_t pa = guest_translate(ctx, addr, true);
+    if (pa == ~0u) return;  // fault — stop_reason already set
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         memcpy(base + pa, &val, size);
@@ -190,6 +195,7 @@ void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     uint32_t pa = guest_translate(ctx, esp, true);
+    if (pa == ~0u) return;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         memcpy(base + pa, &eflags_val, 4);
@@ -200,6 +206,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
     uint32_t esp = ctx->gp[GP_ESP];
     ctx->gp[GP_ESP] = esp + 4;
     uint32_t pa = guest_translate(ctx, esp, false);
+    if (pa == ~0u) return 0;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         uint32_t v; memcpy(&v, base + pa, 4); return v;
@@ -213,6 +220,7 @@ uint32_t popfd_helper(GuestContext* ctx) {
 
 uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
     uint32_t pa = guest_translate(ctx, addr, false);
+    if (pa == ~0u) return 0;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         uint32_t v; memcpy(&v, base + pa, 4); return v;
@@ -222,6 +230,7 @@ uint32_t read_guest_mem32(GuestContext* ctx, uint32_t addr) {
 
 void write_guest_mem32(GuestContext* ctx, uint32_t addr, uint32_t val) {
     uint32_t pa = guest_translate(ctx, addr, true);
+    if (pa == ~0u) return;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         memcpy(base + pa, &val, 4);
@@ -403,6 +412,7 @@ void enter_helper(GuestContext* ctx, uint32_t alloc_size, uint32_t nesting) {
 uint32_t xlatb_helper(GuestContext* ctx) {
     uint32_t ea = ctx->gp[GP_EBX] + (ctx->gp[GP_EAX] & 0xFF);
     uint32_t pa = guest_translate(ctx, ea, false);
+    if (pa == ~0u) return 0;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
         return base[pa];

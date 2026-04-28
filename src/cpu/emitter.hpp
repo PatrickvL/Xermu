@@ -903,6 +903,9 @@ inline bool emit_clean_insn(Emitter& e,
                               const ZydisDecodedOperand* ops,
                               const uint8_t* raw_bytes) {
     // INC r32 (short form: 0x40..0x47 in 32-bit)
+    // INC r16 (short form with 0x66 prefix: 0x66 0x40..0x47)
+    // In 64-bit mode 0x40..0x4F are REX prefixes, so we must re-encode as
+    // FF /0 (INC) or FF /1 (DEC) with ModRM mod=11.
     if (insn.mnemonic == ZYDIS_MNEMONIC_INC &&
         insn.operand_count >= 1 &&
         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -913,14 +916,33 @@ inline bool emit_clean_insn(Emitter& e,
             e.emit8(uint8_t(0xC0u | enc));
             return true;
         }
+        // 16-bit form: 0x66 prefix + same encoding
+        ZydisRegister r16 = ops[0].reg.value;
+        if (r16 >= ZYDIS_REGISTER_AX && r16 <= ZYDIS_REGISTER_DI) {
+            enc = (uint8_t)(r16 - ZYDIS_REGISTER_AX);
+            e.emit8(0x66); // operand-size prefix
+            e.emit8(0xFF);
+            e.emit8(uint8_t(0xC0u | enc));
+            return true;
+        }
     }
     // DEC r32 (short form: 0x48..0x4F in 32-bit)
+    // DEC r16 (short form with 0x66 prefix: 0x66 0x48..0x4F)
     if (insn.mnemonic == ZYDIS_MNEMONIC_DEC &&
         insn.operand_count >= 1 &&
         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         uint8_t enc = 0;
         if (reg32_enc(ops[0].reg.value, enc)) {
             // FF /1  ModRM = 11_001_enc
+            e.emit8(0xFF);
+            e.emit8(uint8_t(0xC8u | enc));
+            return true;
+        }
+        // 16-bit form: 0x66 prefix + same encoding
+        ZydisRegister r16 = ops[0].reg.value;
+        if (r16 >= ZYDIS_REGISTER_AX && r16 <= ZYDIS_REGISTER_DI) {
+            enc = (uint8_t)(r16 - ZYDIS_REGISTER_AX);
+            e.emit8(0x66); // operand-size prefix
             e.emit8(0xFF);
             e.emit8(uint8_t(0xC8u | enc));
             return true;
