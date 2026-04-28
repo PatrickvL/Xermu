@@ -47,7 +47,7 @@ struct BootConfig {
 };
 
 // ---------------------------------------------------------------------------
-// probe_file -- returns true if a file exists and can be opened for reading.
+// probe_file — returns true if a file exists and can be opened for reading.
 // ---------------------------------------------------------------------------
 inline bool probe_file(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -56,7 +56,7 @@ inline bool probe_file(const char* path) {
 }
 
 // ---------------------------------------------------------------------------
-// probe_path -- returns the first existing file from a list of candidates.
+// probe_path — returns the first existing file from a list of candidates.
 // ---------------------------------------------------------------------------
 inline std::string probe_path(const std::string& base,
                               const char* const* candidates, int count) {
@@ -68,10 +68,12 @@ inline std::string probe_path(const std::string& base,
 }
 
 // ---------------------------------------------------------------------------
-// scan_boot_files -- populate a BootConfig with auto-detected paths.
+// scan_boot_files — populate a BootConfig with auto-detected paths.
+// Looks for nboxkrnl.exe, xboxkrnl.exe, BIOS, MCPX, dashboard XBE, and keys.
+// data_root is the path to the data/ directory.
 // ---------------------------------------------------------------------------
 inline void scan_boot_files(BootConfig& cfg, const std::string& data_root) {
-    // nboxkrnl.exe
+    // nboxkrnl.exe — nboxkrnl replacement kernel
     {
         static const char* paths[] = {
             "nboxkrnl.exe",
@@ -79,7 +81,7 @@ inline void scan_boot_files(BootConfig& cfg, const std::string& data_root) {
         };
         cfg.nboxkrnl_path = probe_path(data_root, paths, 2);
     }
-    // xboxkrnl.exe
+    // xboxkrnl.exe — extracted original kernel PE
     {
         static const char* paths[] = {
             "xboxkrnl.exe",
@@ -132,7 +134,7 @@ inline void scan_boot_files(BootConfig& cfg, const std::string& data_root) {
 }
 
 // ---------------------------------------------------------------------------
-// BootMode -- result of auto_boot indicating which mode was used.
+// BootMode — result of auto_boot indicating which mode was used.
 // ---------------------------------------------------------------------------
 enum class BootMode { None, Nboxkrnl, Lle, LleKernel, Hle };
 
@@ -998,6 +1000,7 @@ inline bool run_step(XboxSystem& sys, uint32_t max_steps = 500'000) {
 // disk partitions, EEPROM keys, loads the kernel PE, configures page tables
 // and CPU state, and returns with sys.entry_eip set to KernelEntry.
 // ---------------------------------------------------------------------------
+
 struct NboxkrnlState {
     nboxkrnl::HostState    host;
     nboxkrnl::IoSystem     io;
@@ -1026,10 +1029,9 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
         return false;
     }
 
-    // ---- Host I/O ports + I/O system ----
+    // ---- Host I/O ports ----
     nbox.host.exec = sys.exec.get();
     nbox.host.io   = &nbox.io;
-    nbox.io.init(sys.exec.get(), nbox.io.dvd_dir, nbox.io.hdd_dir);
     nboxkrnl::register_host_ports(*sys.exec, nbox.host);
 
     // ---- Load kernel PE ----
@@ -1054,9 +1056,8 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
     return true;
 }
 
-
 // ---------------------------------------------------------------------------
-// auto_boot -- try boot methods in priority order:
+// auto_boot — try boot methods in priority order:
 //   1. nboxkrnl (if nboxkrnl_path + xbe_path present)
 //   2. BIOS LLE (if bios_path present)
 //   3. HLE      (if xbe_path present)
@@ -1069,9 +1070,10 @@ inline BootMode auto_boot(XboxSystem& sys, BootConfig& cfg,
 {
     auto say = [&](const char* msg) { if (log) log(msg); else fprintf(stderr, "%s\n", msg); };
 
-    // 1. nboxkrnl
+    // 1. nboxkrnl — preferred
     if (!cfg.nboxkrnl_path.empty() && !cfg.xbe_path.empty()) {
         say("[auto] trying nboxkrnl boot...");
+        // boot_nboxkrnl_system uses cfg.kernel_path for the PE path
         std::string saved_kernel = cfg.kernel_path;
         cfg.kernel_path = cfg.nboxkrnl_path;
         if (boot_nboxkrnl_system(sys, cfg, nbox, log)) {

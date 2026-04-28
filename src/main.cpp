@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include "xbox/hle/bootstrap.hpp"
+#include "gpu/nv2a_vk_renderer.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -145,8 +146,20 @@ static bool init_vulkan(VulkanContext& vk, SDL_Window* window) {
     queue_info.pQueuePriorities = &priority;
 
     const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+    // Enable Vulkan 1.2 features needed by the NV2A renderer.
+    VkPhysicalDeviceVulkan12Features vk12_features = {};
+    vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vk12_features.bufferDeviceAddress = VK_TRUE;
+    vk12_features.drawIndirectCount   = VK_TRUE;
+
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &vk12_features;
+
     VkDeviceCreateInfo dev_info = {};
     dev_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dev_info.pNext = &features2;
     dev_info.queueCreateInfoCount = 1;
     dev_info.pQueueCreateInfos = &queue_info;
     dev_info.enabledExtensionCount = 1;
@@ -341,6 +354,7 @@ struct AppContext {
     xbox::BootMode         boot_mode = xbox::BootMode::None;
     std::string            status_msg  = "Ready";
     std::vector<std::string> log_lines;
+    xbox::Nv2aVkRenderer   nv2a_renderer;  // GPU-driven NV2A renderer
 
     // Paths found on disk (legacy — now also mirrored in cfg)
     std::string            dashboard_xbe;  // auto-detected dashboard
@@ -650,6 +664,14 @@ int main(int argc, char** argv) {
     AppContext app;
     scan_data_dir(app, data_root);
 
+    // Init NV2A Vulkan renderer (after AppContext so app.nv2a_renderer exists).
+    if (!app.nv2a_renderer.init(vk.device, vk.physical,
+                                vk.queue, vk.queue_family,
+                                vk.queue, vk.queue_family,
+                                vk.render_pass, vk.swapchain_format)) {
+        fprintf(stderr, "[nv2a_vk] Renderer init failed (non-fatal)\n");
+    }
+
     // Handle command-line args:
     //   xermu                                        — auto-detect: nboxkrnl → BIOS → HLE
     //   xermu <game.xbe>                             — auto-detect with specific XBE
@@ -852,6 +874,12 @@ int main(int argc, char** argv) {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(vk.cmd_buffers[fi], &begin);
 
+        // NV2A: dispatch push buffer compute shader + 3D draw pass (before swapchain pass).
+        if (app.state == AppState::Running) {
+            app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
+            app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
+        }
+
         VkClearValue clear = {{{0.1f, 0.1f, 0.12f, 1.0f}}};
         VkRenderPassBeginInfo rp_begin = {};
         rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -862,6 +890,14 @@ int main(int argc, char** argv) {
         rp_begin.pClearValues = &clear;
         vkCmdBeginRenderPass(vk.cmd_buffers[fi], &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
+        // NV2A: scanout Xbox framebuffer to swapchain (inside render pass).
+        if (app.state == AppState::Running) {
+            app.nv2a_renderer.scanout(vk.cmd_buffers[fi],
+                                       vk.framebuffers[img_idx],
+                                       vk.swapchain_extent);
+        }
+
+        // ImGui overlay on top of scanout.
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), vk.cmd_buffers[fi]);
 
         vkCmdEndRenderPass(vk.cmd_buffers[fi]);
@@ -893,6 +929,7 @@ int main(int argc, char** argv) {
 
     // Cleanup
     vkDeviceWaitIdle(vk.device);
+    app.nv2a_renderer.destroy();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

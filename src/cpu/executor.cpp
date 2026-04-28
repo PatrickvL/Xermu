@@ -9,17 +9,17 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// dispatch_trace â€” naked asm trampoline (GCC / Clang, x86-64)
+// dispatch_trace — naked asm trampoline (GCC / Clang, x86-64)
 //
 // System V AMD64 ABI entry:
 //   RDI = GuestContext*
 //   RSI = void* host_code
 //
 // Pinned registers inside a trace:
-//   R12 = fastmem_base   (callee-saved â€” preserved across the call)
+//   R12 = fastmem_base   (callee-saved — preserved across the call)
 //   R13 = GuestContext*  (callee-saved)
-//   R14 = EA scratch     (callee-saved â€” we push/pop it ourselves)
-//   R15 = unused         (callee-saved â€” push/pop for ABI compliance)
+//   R14 = EA scratch     (callee-saved — we push/pop it ourselves)
+//   R15 = unused         (callee-saved — push/pop for ABI compliance)
 //
 // Guest GP registers live in host EAXâ€“EDI while a trace runs.
 // ESP is NOT mapped to host RSP; it stays in ctx->gp[GP_ESP] and is
@@ -64,7 +64,7 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         "fxrstor (%%rax)\n\t"
 
         // ---- Load guest GP registers into host registers -----------------
-        // (ESP intentionally skipped â€” stays in ctx->gp[4])
+        // (ESP intentionally skipped — stays in ctx->gp[4])
         "movl " CTX_STR_(CTX_ASM_GP_EAX) "(%%r13), %%eax\n\t"
         "movl " CTX_STR_(CTX_ASM_GP_ECX) "(%%r13), %%ecx\n\t"
         "movl " CTX_STR_(CTX_ASM_GP_EDX) "(%%r13), %%edx\n\t"
@@ -120,7 +120,7 @@ void dispatch_trace([[maybe_unused]] GuestContext* ctx,
         ::: // no C-level inputs/outputs; all state is through memory (ctx)
     );
 }
-#endif // GCC/Clang â€” MSVC uses dispatch_trace.asm
+#endif // GCC/Clang — MSVC uses dispatch_trace.asm
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -137,21 +137,8 @@ bool Executor::init(MmioMap* mmio) {
     if (fastmem_window.base) {
         ram = static_cast<uint8_t*>(fastmem_window.base);
     } else {
-        // Allocate RAM + 4GB guard: reserve a large region so the code
-        // cache cannot land adjacent to RAM (which would let [R12+R14]
-        // writes with out-of-range R14 corrupt JIT code).
-        static constexpr size_t GUARD_SIZE = 0x100000000ULL; // 4 GB
-        void* guard = VirtualAlloc(nullptr, GUEST_RAM_SIZE + GUARD_SIZE,
-                                   MEM_RESERVE, PAGE_NOACCESS);
-        if (guard) {
-            // Commit only the first GUEST_RAM_SIZE bytes as RW.
-            ram = static_cast<uint8_t*>(VirtualAlloc(guard, GUEST_RAM_SIZE,
-                                                     MEM_COMMIT, PAGE_READWRITE));
-        }
-        if (!ram) {
-            // Last resort: plain allocation without guard.
-            ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
-        }
+        // Fallback: plain allocation (mirror goes through MMIO slow path).
+        ram = static_cast<uint8_t*>(platform::alloc_ram(GUEST_RAM_SIZE));
     }
     if (!ram) return false;
     memset(ram, 0, GUEST_RAM_SIZE); // zero-fill (matches Xbox kernel boot)
@@ -220,7 +207,7 @@ void Executor::load_guest(uint32_t pa, const void* src, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
-// SMC page protection â€” mark code pages read-only, invalidate on write.
+// SMC page protection — mark code pages read-only, invalidate on write.
 // ---------------------------------------------------------------------------
 
 void Executor::protect_code_page(uint32_t pa) {
@@ -254,7 +241,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
             Trace* t = pt->slots[s];
             if (t && t->valid && (t->code_pa & ~0xFFFu) == page) {
                 unlink_trace(t);
-                // Also reset this trace's OWN outbound links â€” the currently
+                // Also reset this trace's OWN outbound links — the currently
                 // executing trace may have a block-linked JMP to another trace
                 // on the same page that is about to be invalidated.
                 for (int j = 0; j < t->num_links; ++j) {
@@ -270,7 +257,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
         }
     }
 
-    // No fault bitmap to clear â€” NOP sleds in invalidated traces are dead code.
+    // No fault bitmap to clear — NOP sleds in invalidated traces are dead code.
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +266,7 @@ void Executor::invalidate_code_page(uint32_t pa) {
 
 // Try to patch each unlinked exit of `t` to its target trace if present
 // in the trace cache.  Also validates the target's page version.
-// Backward edges (target_eip <= t->guest_eip) are NOT linked â€” this ensures
+// Backward edges (target_eip <= t->guest_eip) are NOT linked — this ensures
 // tight loops return to the run loop for IRQ delivery and device ticks.
 void Executor::try_link_trace(Trace* t) {
     for (int i = 0; i < t->num_links; ++i) {
@@ -299,7 +286,7 @@ void Executor::try_link_trace(Trace* t) {
 }
 
 // Before invalidating a trace, unlink every trace that has a JMP patched
-// into this trace's host_code.  We scan all traces in the arena â€” this is
+// into this trace's host_code.  We scan all traces in the arena — this is
 // rare (only on SMC) so the O(N) scan is acceptable.
 void Executor::unlink_trace(Trace* t) {
     for (size_t i = 0; i < arena.used; ++i) {
@@ -596,29 +583,18 @@ bool Executor::read_guest_block(uint32_t va, uint32_t size, void* buf) {
 
 bool Executor::write_guest_block(uint32_t va, uint32_t size, const void* buf) {
     auto* src = static_cast<const uint8_t*>(buf);
-    uint32_t orig_va = va, orig_size = size;
     while (size > 0) {
         uint32_t pa;
         if (paging_enabled()) {
             pa = translate_va(va, /*is_write=*/true);
-            if (pa == ~0u) {
-                fprintf(stderr, "[wgb] translate_va(0x%08X) FAILED, wrote %u of %u\n",
-                        va, orig_size - size, orig_size);
-                return false;
-            }
+            if (pa == ~0u) return false;
         } else {
             pa = va;
         }
-        if (pa >= GUEST_RAM_SIZE) {
-            fprintf(stderr, "[wgb] PA 0x%08X >= RAM_SIZE for VA 0x%08X, wrote %u of %u\n",
-                    pa, va, orig_size - size, orig_size);
-            return false;
-        }
+        if (pa >= GUEST_RAM_SIZE) return false;
 
         uint32_t page_remain = GUEST_PAGE_SIZE - (pa & (GUEST_PAGE_SIZE - 1));
         uint32_t chunk = (size < page_remain) ? size : page_remain;
-        if (orig_size >= 4096 && size == orig_size)
-            fprintf(stderr, "[wgb] VA=0x%08X -> PA=0x%08X chunk=%u\n", va, pa, chunk);
         memcpy(ram + pa, src, chunk);
         src  += chunk;
         va   += chunk;
@@ -672,7 +648,7 @@ bool Executor::interpret_real_mode_boot() {
             if (b0 == 0x66) has_66 = true;
             else if (b0 == 0x2E) { has_seg = true; seg_base = cs_base; }
             else if (b0 == 0x90) { eip++; pa = cs_base + eip; b0 = fetch_byte(pa); continue; } // NOP
-            else if (b0 == 0xFC) { /* CLD â€” ignored, DF already 0 */ }
+            else if (b0 == 0xFC) { /* CLD — ignored, DF already 0 */ }
             else if (b0 == 0xFA) { ctx.virtual_if = false; } // CLI
             prefix_len++;
             b0 = fetch_byte(pa + prefix_len);
@@ -764,11 +740,11 @@ bool Executor::interpret_real_mode_boot() {
             // Switch to protected mode: set EIP, we're done with real mode.
             ctx.eip = target;
             ctx.cr0 |= 1; // ensure PE=1
-            printf("[boot16] Far JMP to %04X:%08X â€” entering protected mode\n", sel, target);
+            printf("[boot16] Far JMP to %04X:%08X — entering protected mode\n", sel, target);
             return true;
         }
 
-        // XOR EAX, EAX (33 C0) â€” might appear in some boot stubs
+        // XOR EAX, EAX (33 C0) — might appear in some boot stubs
         if (b0 == 0x33) {
             uint8_t modrm = fetch_byte(pa + 1);
             if (modrm == 0xC0) {
@@ -792,8 +768,6 @@ bool Executor::interpret_real_mode_boot() {
 // ---------------------------------------------------------------------------
 
 void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
-    fprintf(stderr, "[run] entering EIP=%08X fastmem=%p mmio=%p\n",
-            entry_eip, (void*)(uintptr_t)ctx.fastmem_base, (void*)ctx.mmio);
     ctx.eip    = entry_eip;
     ctx.halted = false;
 
@@ -825,8 +799,6 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             fprintf(stderr, "[exec] step %llu EIP=%08X ESP=%08X\n",
                     (unsigned long long)steps, ctx.eip, ctx.gp[GP_ESP]);
         }
-        if (steps < 5) fprintf(stderr, "[run] iter start step=%llu EIP=%08X vif=%d\n",
-            (unsigned long long)steps, ctx.eip, (int)ctx.virtual_if);
         // Deliver pending hardware IRQs at trace boundaries.
         bool has_irq = irq_check ? irq_check(irq_user) : (pending_irq != 0);
         if (has_irq && ctx.virtual_if) {
@@ -863,7 +835,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         trace_ring_idx = (trace_ring_idx + 1) % TRACE_RING_SIZE;
 
         // In HLE mode, if EIP is outside guest RAM and not in the MMIO
-        // device region (0xF0000000+), it's a bad jump â€” halt with diagnostic.
+        // device region (0xF0000000+), it's a bad jump — halt with diagnostic.
         if (hle_handler && eip >= GUEST_RAM_SIZE && eip < 0xF0000000u) {
             fprintf(stderr, "[exec] bad jump to EIP=0x%08X (outside guest RAM) ESP=0x%08X\n", eip, ctx.gp[GP_ESP]);
             // Dump recent trace history
@@ -888,13 +860,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             break;
         }
 
-        if (steps < 5) fprintf(stderr, "[run] pre-xlate step=%llu EIP=%08X\n", (unsigned long long)steps, eip);
         // When paging is enabled, translate EIP (VA) to PA for code fetch.
         // The trace cache keys on the guest VA (ctx.eip).
         uint32_t code_pa = eip;
         if (paging_enabled()) {
             code_pa = translate_va(eip, /*is_write=*/false);
-            if (steps < 5) fprintf(stderr, "[run] xlated step=%llu PA=%08X\n", (unsigned long long)steps, code_pa);
             if (code_pa == ~0u) {
                 // #PF on instruction fetch: deliver page fault (vector 14).
                 // Error code: P and W/R bits set by translate_va, plus
@@ -919,21 +889,15 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             uint8_t rom_buf[4096];  // temp buffer for non-RAM code fetch
 
             if (code_pa < GUEST_RAM_SIZE) {
-                // Code is in RAM â€” read directly.
+                // Code is in RAM — read directly.
                 code_ptr = ram + code_pa;
                 if (!paging_enabled()) {
                     code_len = GUEST_RAM_SIZE - code_pa;
                 } else {
-                    // With paging, VA-to-PA mapping can differ per page.
-                    // Limit to current physical page, but when near the
-                    // boundary (< 15 bytes), also fetch the next page so
-                    // cross-page instructions can be decoded.
                     uint32_t page_remain = 0x1000 - (code_pa & 0xFFF);
                     if (page_remain >= 15) {
                         code_len = page_remain;
                     } else {
-                        // Instruction may span the page boundary.
-                        // Copy current page tail + next page head into rom_buf.
                         memcpy(rom_buf, ram + code_pa, page_remain);
                         uint32_t next_va = (eip | 0xFFF) + 1;
                         uint32_t next_pa = translate_va(next_va, false);
@@ -943,13 +907,12 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                             code_ptr = rom_buf;
                             code_len = page_remain + extra;
                         } else {
-                            // Next page not mapped â€” only give what we have.
                             code_len = page_remain;
                         }
                     }
                 }
             } else if (ctx.mmio) {
-                // Code is in MMIO space (e.g. flash ROM) â€” fetch via MMIO
+                // Code is in MMIO space (e.g. flash ROM) — fetch via MMIO
                 // reads into a temp buffer (one page max).
                 uint32_t page_off = code_pa & 0xFFF;
                 uint32_t fetch_len = 4096 - page_off;
@@ -964,11 +927,10 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 code_len = fetch_len;
             }
 
-            if (steps < 5) fprintf(stderr, "[run] building step=%llu EIP=%08X PA=%08X\n", (unsigned long long)steps, eip, code_pa);
             t = builder.build(eip, code_ptr, code_len, ram,
                               cc, arena, &ctx);
             if (!t) {
-                fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) â€” halting\n", eip, code_pa);
+                fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
                 break;
             }
             tcache.insert(t);
@@ -988,10 +950,6 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         ctx.eip         = eip;
         ctx.stop_reason = STOP_NONE;
         dispatch_trace(&ctx, t->host_code);
-
-        if (steps < 3) fprintf(stderr, "[run] returned step=%llu next=%08X stop=%u\n",
-            (unsigned long long)steps, ctx.next_eip, ctx.stop_reason);
-
 
         // Advance EIP to what the trace exit stub wrote.
         ctx.eip = ctx.next_eip;
@@ -1044,8 +1002,6 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                                 // 83 E8..EF = SUB r32, imm8 (countdown loop)
                                 else if ((modrm & 0xF8) == 0xE8) {
                                     unsigned reg = modrm & 7;
-                                    // Only fast-forward small counters (delay loops).
-                                    // Large counters are data loops (memcpy etc.).
                                     if (ctx.gp[reg] > SPIN_THRESHOLD * 2) break;
                                     ctx.gp[reg] = 1; // after SUB 1: 0→ZF=1, JNZ falls through
                                     handled = true;
@@ -1149,9 +1105,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Periodic device tick (e.g. PIT timer).
         if (tick_period && ++tick_counter >= tick_period) {
             tick_counter = 0;
-            if (steps < 5) fprintf(stderr, "[run] pre-tick step=%llu\n", (unsigned long long)steps);
             tick_fn(tick_user);
-            if (steps < 5) fprintf(stderr, "[run] post-tick step=%llu\n", (unsigned long long)steps);
         }
 
         // Privileged instruction stop: decode and handle in the run loop.
@@ -1165,20 +1119,10 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
             prev_trace = nullptr; // chain broken
-            // Stack dump for crash analysis (using safe read_guest_block).
-            {
-                uint32_t sp = ctx.gp[4]; // ESP
-                uint32_t stk[32] = {};
-                read_guest_block(sp, sizeof(stk), stk);
-                fprintf(stderr, "[exec] stack @%08X:", sp);
-                for (int si = 0; si < 32; ++si) {
-                    if (si % 8 == 0 && si > 0)
-                        fprintf(stderr, "\n[exec]   +%02X:", si*4);
-                    fprintf(stderr, " %08X", stk[si]);
-                }
-                fprintf(stderr, "\n");
-                fflush(stderr);
-            }
+            // Diagnostic: print the trace that was just dispatched.
+            fprintf(stderr, "[exec] XYZPF trace_eip=%08X next_eip=%08X\n",
+                    t ? t->guest_eip : 0, ctx.next_eip);
+            fflush(stderr);
             static int pf_log_count = 0;
             if (pf_log_count < 50) {
                 ++pf_log_count;
@@ -1195,7 +1139,6 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         ctx.gp[0], ctx.gp[3], ctx.gp[1], ctx.gp[2]);
                 fprintf(stderr, "[exec]   ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
                         ctx.gp[4], ctx.gp[5], ctx.gp[6], ctx.gp[7]);
-
                 // Also dump the IDT entry for vector 14
                 uint32_t idt_desc = ctx.idtr_base + 14 * 8;
                 uint32_t idt_pa = idt_desc;
@@ -1235,7 +1178,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Invalid opcode (#UD, vector 6): trace builder couldn't translate.
         if (ctx.stop_reason == STOP_INVALID_OPCODE) {
             prev_trace = nullptr;
-            // In HLE mode with no IDT, halt â€” don't try to deliver through IDT.
+            // In HLE mode with no IDT, halt — don't try to deliver through IDT.
             if (hle_handler && ctx.idtr_limit == 0) {
                 uint32_t eip = ctx.eip;
                 uint32_t esp = ctx.gp[GP_ESP];
@@ -1274,33 +1217,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 fprintf(stderr, "  EIP=%08X ESP=%08X EBP=%08X\n",
                         trace_ring[idx].eip, trace_ring[idx].esp, trace_ring[idx].ebp);
             }
-                        // Dump guest stack around ESP
-            {
-                uint32_t esp_val = ctx.gp[4]; // GP_ESP
-                fprintf(stderr, "[exec] EIP=FFFFFFFF dump: ESP=%08X EBP=%08X\n", esp_val, ctx.gp[5]);
-                // Dump 16 dwords from ESP
-                for (int si = -4; si < 16; ++si) {
-                    uint32_t addr = esp_val + (uint32_t)(si * 4);
-                    uint32_t pa = addr;
-                    if (ctx.cr0 & 0x80000000u) pa = translate_va(addr, false);
-                    uint32_t val = 0;
-                    if (pa != ~0u && pa + 4 <= GUEST_RAM_SIZE)
-                        memcpy(&val, ram + pa, 4);
-                    fprintf(stderr, "  [ESP%+d] = [%08X] = %08X\n", si*4, addr, val);
-                }
-                // Also dump the caller frame: EBP+8 = callback
-                uint32_t ebp_val = ctx.gp[5];
-                for (int bi = 0; bi < 8; ++bi) {
-                    uint32_t addr = ebp_val + (uint32_t)(bi * 4);
-                    uint32_t pa = addr;
-                    if (ctx.cr0 & 0x80000000u) pa = translate_va(addr, false);
-                    uint32_t val = 0;
-                    if (pa != ~0u && pa + 4 <= GUEST_RAM_SIZE)
-                        memcpy(&val, ram + pa, 4);
-                    fprintf(stderr, "  [EBP+%d] = [%08X] = %08X\n", bi*4, addr, val);
-                }
-            }
-ctx.halted = true;
+            ctx.halted = true;
             break;
         }
     }

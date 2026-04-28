@@ -69,6 +69,38 @@ set(VOLK_INSTALL      OFF CACHE BOOL "" FORCE)
 set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH "" FORCE)
 FetchContent_MakeAvailable(volk)
 
+# ---------------------------------------------------------------------------
+# glslang — GLSL to SPIR-V compiler (runtime shader compilation)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG        15.2.0
+    GIT_SHALLOW    TRUE
+)
+set(ENABLE_SPVREMAPPER     OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL            OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING          OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT             OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(glslang)
+
+# Generate .inc files from GLSL shaders (raw string literal wrappers).
+set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders)
+file(GLOB GLSL_SOURCES ${SHADER_DIR}/*.glsl)
+set(GLSL_INC_FILES)
+foreach(glsl ${GLSL_SOURCES})
+    set(inc_file "${glsl}.inc")
+    list(APPEND GLSL_INC_FILES ${inc_file})
+    add_custom_command(
+        OUTPUT  ${inc_file}
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating ${inc_file}"
+        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.py
+        DEPENDS ${glsl} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.py
+        COMMENT "GLSL -> .inc: ${glsl}"
+    )
+endforeach()
+add_custom_target(shader_inc_files DEPENDS ${GLSL_INC_FILES})
+
 # Build ImGui as a static library with SDL3 + Vulkan backends
 set(IMGUI_DIR ${imgui_SOURCE_DIR})
 add_library(imgui_lib STATIC
@@ -217,9 +249,13 @@ endif()
 # ---------------------------------------------------------------------------
 # Main executable — Xermu emulator with SDL3/ImGui/Vulkan UI
 # ---------------------------------------------------------------------------
-add_executable(xermu ${COMMON_SOURCES} src/main.cpp)
+add_executable(xermu ${COMMON_SOURCES}
+    src/main.cpp
+    src/gpu/nv2a_vk_renderer.cpp
+)
+add_dependencies(xermu shader_inc_files)
 target_include_directories(xermu PRIVATE src src/cpu)
-target_link_libraries(xermu PRIVATE Zydis imgui_lib SDL3::SDL3-static volk)
+target_link_libraries(xermu PRIVATE Zydis imgui_lib SDL3::SDL3-static volk glslang::glslang glslang::glslang-default-resource-limits glslang::SPIRV)
 
 if(MSVC)
     target_compile_options(xermu PRIVATE /W3)
