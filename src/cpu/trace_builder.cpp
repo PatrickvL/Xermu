@@ -1320,7 +1320,15 @@ Trace* TraceBuilder::build(uint32_t            guest_eip,
 
         ZyanStatus st = ZydisDecoderDecodeFull(&decoder_, pc, avail, &insn, ops);
         if (!ZYAN_SUCCESS(st)) {
-            // Undecodable instruction â†’ #UD.
+            // Decode failed. If we are near the end of the available code
+            // (page boundary), just end the trace â†’ the instruction may
+            // span into the next page. The run loop will re-enter on the
+            // next iteration with the correct page mapping.
+            if (avail < 15) {
+                emit_epilog_static(e, guest_pc);
+                break;
+            }
+            // Truly undecodable instruction â†’ #UD.
             emit_save_all_gp(e);
             emit_save_eflags(e);
             emit_write_next_eip_imm(e, guest_pc);

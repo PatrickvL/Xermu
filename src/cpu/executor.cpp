@@ -908,7 +908,33 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             if (code_pa < GUEST_RAM_SIZE) {
                 // Code is in RAM â€” read directly.
                 code_ptr = ram + code_pa;
-                code_len = GUEST_RAM_SIZE - code_pa;
+                if (!paging_enabled()) {
+                    code_len = GUEST_RAM_SIZE - code_pa;
+                } else {
+                    // With paging, VA-to-PA mapping can differ per page.
+                    // Limit to current physical page, but when near the
+                    // boundary (< 15 bytes), also fetch the next page so
+                    // cross-page instructions can be decoded.
+                    uint32_t page_remain = 0x1000 - (code_pa & 0xFFF);
+                    if (page_remain >= 15) {
+                        code_len = page_remain;
+                    } else {
+                        // Instruction may span the page boundary.
+                        // Copy current page tail + next page head into rom_buf.
+                        memcpy(rom_buf, ram + code_pa, page_remain);
+                        uint32_t next_va = (eip | 0xFFF) + 1;
+                        uint32_t next_pa = translate_va(next_va, false);
+                        if (next_pa != ~0u && next_pa < GUEST_RAM_SIZE) {
+                            uint32_t extra = 15 - page_remain;
+                            memcpy(rom_buf + page_remain, ram + next_pa, extra);
+                            code_ptr = rom_buf;
+                            code_len = page_remain + extra;
+                        } else {
+                            // Next page not mapped â€” only give what we have.
+                            code_len = page_remain;
+                        }
+                    }
+                }
             } else if (ctx.mmio) {
                 // Code is in MMIO space (e.g. flash ROM) â€” fetch via MMIO
                 // reads into a temp buffer (one page max).
