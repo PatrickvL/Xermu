@@ -241,6 +241,13 @@ struct Nv2aVkRenderer {
         ctl->dma_base = dma_base;
     }
 
+    // Sync CPU-side PGRAPH register state into the GPU buffer so shaders can read it.
+    void sync_pgraph(const uint32_t* regs, uint32_t count) {
+        uint32_t copy_count = (count < 2048) ? count : 2048;
+        memcpy(mapped<uint32_t>(GpuBufferLayout::PGRAPH_STATE_OFFSET),
+               regs, copy_count * sizeof(uint32_t));
+    }
+
     // Called by the CPU when the guest writes CACHE1_DMA_PUT.
     // Updates the PFIFO control block in mapped GPU memory.
     void set_dma_put(uint32_t put_addr);

@@ -217,7 +217,7 @@ struct Nv2aState {
 
     // PCRTC vblank
     uint32_t vblank_counter = 0;
-    static constexpr uint32_t VBLANK_PERIOD = 16667;
+    static constexpr uint32_t VBLANK_PERIOD = 130;  // ticks between vblanks (~60Hz at tick_period=128)
 
     // GPU method handler — called for each (subchannel, method, data) tuple.
     using MethodHandler = void(*)(void* user, uint32_t subchannel,
@@ -572,13 +572,6 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     if (off >= 0x800000) {
         uint32_t chan_off = off & 0xFFFF;
         if (chan_off == 0x44) {
-            static int get_log = 0;
-            if (get_log < 5) {
-                ++get_log;
-                fprintf(stderr, "[nv2a] USER DMA_GET read: returning %08X (PUT=%08X)\n",
-                        nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4],
-                        nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4]);
-            }
             return nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
         }
         if (chan_off == 0x40)
@@ -593,12 +586,7 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     auto* nv = static_cast<Nv2aState*>(user);
     uint32_t off = pa - NV2A_BASE;
 
-    // Log all NV2A writes (limited to first 500 for debugging)
-    static int nv2a_wlog = 0;
-    if (nv2a_wlog < 500) {
-        ++nv2a_wlog;
-        fprintf(stderr, "[nv2a] W off=%06X val=%08X\n", off, val);
-    }
+
 
     // --- PMC (0x000000) ---
     if (off < 0x001000) {
@@ -636,13 +624,6 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         // Store register first
         if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
         if (r == pfifo::INTR_EN) nv->update_irq();
-        // Log DMA_PUT writes for debugging
-        if (r == pfifo::CACHE1_DMA_PUT) {
-            fprintf(stderr, "[nv2a] PFIFO DMA_PUT write: val=%08X GET=%08X PUSH=%08X PUSH0=%08X\n",
-                    val, nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4],
-                    nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4],
-                    nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4]);
-        }
 
         // When CACHE1_PUSH1 is written (channel select) or PUSH0 is enabled,
         // load DMA_PUT/DMA_GET from RAMFC context in PRAMIN.
@@ -661,15 +642,6 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
                 uint32_t put, get;
                 memcpy(&put, nv->pramin_ram + ram_addr + 0, 4);
                 memcpy(&get, nv->pramin_ram + ram_addr + 4, 4);
-                fprintf(stderr, "[nv2a] RAMFC ch%u @%05X: put=%08X get=%08X (RAMFC reg=%08X)\n",
-                        channel, ctx_off, put, get, ramfc_reg);
-                // Dump first 16 dwords of context
-                fprintf(stderr, "[nv2a] RAMFC ctx:");
-                for (uint32_t i = 0; i < 64; i += 4) {
-                    uint32_t v; memcpy(&v, nv->pramin_ram + ram_addr + i, 4);
-                    fprintf(stderr, " %08X", v);
-                }
-                fprintf(stderr, "\n");
                 if (put != 0 || get != 0) {
                     nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = put;
                     nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
@@ -747,8 +719,6 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
             // DMA_PUT: update PFIFO registers and ensure push is enabled.
             // The USER interface implies the channel is active — enable
             // DMA push and PUSH0 so tick_fifo processes commands.
-            fprintf(stderr, "[nv2a] USER DMA_PUT write: val=%08X (current GET=%08X)\n",
-                    val, nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4]);
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = val;
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
             nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;

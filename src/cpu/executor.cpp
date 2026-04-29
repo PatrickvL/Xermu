@@ -790,14 +790,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
 
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) {
-            fprintf(stderr, "[exec] max_steps (%llu) reached at EIP=%08X\n",
-                    (unsigned long long)max_steps, ctx.eip);
             break;
-        }
-        // Periodic progress report (every 1M steps).
-        if ((steps & 0xFFFFF) == 0 && steps > 0) {
-            fprintf(stderr, "[exec] step %llu EIP=%08X ESP=%08X\n",
-                    (unsigned long long)steps, ctx.eip, ctx.gp[GP_ESP]);
         }
         // Deliver pending hardware IRQs at trace boundaries.
         bool has_irq = irq_check ? irq_check(irq_user) : (pending_irq != 0);

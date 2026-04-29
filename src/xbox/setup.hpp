@@ -153,7 +153,7 @@ inline XboxHardware* xbox_setup(Executor& exec) {
 
     exec.tick_fn     = hw_tick_callback;
     exec.tick_user   = hw;
-    exec.tick_period = 1;
+    exec.tick_period = 128;
 
     exec.register_io(0x61, sysctl_read, sysctl_write, &hw->misc);
     exec.register_io(0x80, post_code_read, post_code_write, &hw->misc);

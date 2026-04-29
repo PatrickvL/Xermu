@@ -845,7 +845,7 @@ int main(int argc, char** argv) {
             if (app.boot_mode == xbox::BootMode::Nboxkrnl) {
                 // nboxkrnl mode: run the kernel directly (no HLE scheduler)
                 app.sys.exec->ctx.halted = false;
-                app.sys.exec->run(app.sys.exec->ctx.eip, 500'000);
+                app.sys.exec->run(app.sys.exec->ctx.eip, 1'000'000);
                 if (app.sys.exec->ctx.halted) {
                     app.state = AppState::Halted;
                     char msg[128];
@@ -913,6 +913,9 @@ int main(int argc, char** argv) {
                     (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
                     nv.pcrtc_regs[xbox::pcrtc::START / 4],
                     nv.resolve_dma_base());
+                // Sync CPU-side PGRAPH state so scanout shader can read surface format/pitch.
+                app.nv2a_renderer.sync_pgraph(app.sys.hw->pgraph.regs,
+                                              xbox::PgraphState::REG_COUNT);
             }
             app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
             app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
