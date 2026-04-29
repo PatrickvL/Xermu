@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include "xbox/hle/bootstrap.hpp"
+#include "xbox/emu_thread.hpp"
 #include "gpu/nv2a_vk_renderer.hpp"
 
 #include <SDL3/SDL.h>
@@ -352,6 +353,7 @@ struct AppContext {
     xbox::BootConfig       cfg;
     xbox::NboxkrnlState    nbox;       // kept alive for nboxkrnl boot mode
     xbox::BootMode         boot_mode = xbox::BootMode::None;
+    xbox::EmuThread        emu_thread;  // dedicated emulation thread
     std::string            status_msg  = "Ready";
     std::vector<std::string> log_lines;
     xbox::Nv2aVkRenderer   nv2a_renderer;  // GPU-driven NV2A renderer
@@ -367,6 +369,17 @@ struct AppContext {
         log_lines.emplace_back(msg);
         if (log_lines.size() > 500) log_lines.erase(log_lines.begin());
         status_msg = msg;
+    }
+
+    /// Start emulation on the dedicated thread after a successful boot.
+    void start_emu() {
+        state = AppState::Running;
+        emu_thread.start(&sys, &nbox, boot_mode);
+    }
+
+    /// Stop emulation thread and reset to menu.
+    void stop_emu() {
+        emu_thread.stop();
     }
 };
 
@@ -509,7 +522,7 @@ static void draw_menu(AppContext& app) {
 
             auto log_fn = [&](const char* msg) { app.log(msg); };
             if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
-                app.state = AppState::Running;
+                app.start_emu();
             } else {
                 app.log("[ui] Boot failed!");
                 app.state = AppState::Halted;
@@ -541,7 +554,7 @@ static void draw_menu(AppContext& app) {
 
             auto log_fn = [&](const char* msg) { app.log(msg); };
             if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
-                app.state = AppState::Running;
+                app.start_emu();
             } else {
                 app.log("[ui] LLE boot failed!");
                 app.state = AppState::Halted;
@@ -560,7 +573,7 @@ static void draw_menu(AppContext& app) {
 
             auto log_fn = [&](const char* msg) { app.log(msg); };
             if (xbox::boot_lle_kernel(app.sys, app.cfg, log_fn)) {
-                app.state = AppState::Running;
+                app.start_emu();
             } else {
                 app.log("[ui] LLE-kernel boot failed!");
                 app.state = AppState::Halted;
@@ -592,11 +605,12 @@ static void draw_running(AppContext& app) {
     auto& ctx = app.sys.exec->ctx;
     ImGui::Text("EIP: 0x%08X  EAX: 0x%08X", ctx.eip, ctx.gp[GP_EAX]);
     ImGui::Text("ESP: 0x%08X  EBP: 0x%08X", ctx.gp[GP_ESP], ctx.gp[GP_EBP]);
-    ImGui::Text("State: %s", app.sys.running ? "Running" : "Halted");
+    ImGui::Text("State: %s", app.emu_thread.running() ? "Running" : (app.emu_thread.halted() ? "Halted" : "Stopped"));
 
     ImGui::Separator();
 
     if (ImGui::Button("Stop", ImVec2(100, 25))) {
+        app.stop_emu();
         app.sys.running = false;
         app.state = AppState::Halted;
         app.log("[ui] Stopped by user");
@@ -604,6 +618,7 @@ static void draw_running(AppContext& app) {
 
     ImGui::SameLine();
     if (ImGui::Button("Back to Menu", ImVec2(150, 25))) {
+        app.stop_emu();
         app.sys.shutdown();
         app.sys = xbox::XboxSystem();
         app.state = AppState::Menu;
@@ -753,7 +768,7 @@ int main(int argc, char** argv) {
                 if (!cli_mcpx.empty()) app.cfg.mcpx_path = cli_mcpx;
                 if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
                     app.boot_mode = xbox::BootMode::Lle;
-                    app.state = AppState::Running;
+                    app.start_emu();
                 } else {
                     app.log("[ui] LLE BIOS boot failed");
                 }
@@ -763,7 +778,7 @@ int main(int argc, char** argv) {
                 app.cfg.kernel_path = cli_nboxkrnl;
                 if (xbox::boot_nboxkrnl_system(app.sys, app.cfg, app.nbox, log_fn)) {
                     app.boot_mode = xbox::BootMode::Nboxkrnl;
-                    app.state = AppState::Running;
+                    app.start_emu();
                 } else {
                     app.log("[ui] nboxkrnl boot failed");
                 }
@@ -772,7 +787,7 @@ int main(int argc, char** argv) {
                 app.cfg.kernel_path = cli_kernel;
                 if (xbox::boot_lle_kernel(app.sys, app.cfg, log_fn)) {
                     app.boot_mode = xbox::BootMode::LleKernel;
-                    app.state = AppState::Running;
+                    app.start_emu();
                 } else {
                     app.log("[ui] LLE-kernel boot failed");
                 }
@@ -781,7 +796,7 @@ int main(int argc, char** argv) {
             // No explicit flags — auto-detect: nboxkrnl → BIOS → HLE
             app.boot_mode = xbox::auto_boot(app.sys, app.cfg, app.nbox, log_fn);
             if (app.boot_mode != xbox::BootMode::None) {
-                app.state = AppState::Running;
+                app.start_emu();
             }
             // If nothing found, stay in Menu state (user can pick a file)
         }
@@ -817,7 +832,7 @@ int main(int argc, char** argv) {
                 app.log(("[ui] Loading: " + path).c_str());
                 auto log_fn = [&](const char* msg) { app.log(msg); };
                 if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
-                    app.state = AppState::Running;
+                    app.start_emu();
                 } else {
                     app.log("[ui] Boot failed!");
                 }
@@ -830,7 +845,7 @@ int main(int argc, char** argv) {
                     app.log(("[ui] Mounting XISO: " + path).c_str());
                     auto log_fn = [&](const char* msg) { app.log(msg); };
                     if (xbox::boot_hle(app.sys, app.cfg, log_fn)) {
-                        app.state = AppState::Running;
+                        app.start_emu();
                     } else {
                         app.log("[ui] Boot failed!");
                     }
@@ -840,28 +855,13 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Run emulation steps if active
-        if (app.state == AppState::Running && app.sys.running) {
-            if (app.boot_mode == xbox::BootMode::Nboxkrnl) {
-                // nboxkrnl mode: run the kernel directly (no HLE scheduler)
-                app.sys.exec->ctx.halted = false;
-                app.sys.exec->run(app.sys.exec->ctx.eip, 1'000'000);
-                if (app.sys.exec->ctx.halted) {
-                    app.state = AppState::Halted;
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
-                             app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
-                    app.log(msg);
-                }
-            } else {
-                if (!xbox::run_step(app.sys, 500'000)) {
-                    app.state = AppState::Halted;
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
-                             app.sys.exec->ctx.eip, app.sys.exec->ctx.gp[GP_EAX]);
-                    app.log(msg);
-                }
-            }
+        // Check if emulation thread reported a halt
+        if (app.state == AppState::Running && app.emu_thread.halted()) {
+            app.state = AppState::Halted;
+            char msg[128];
+            snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
+                     app.emu_thread.halt_eip(), app.emu_thread.halt_eax());
+            app.log(msg);
         }
 
         // Render ImGui frame
@@ -969,6 +969,7 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    app.stop_emu();
     vkDeviceWaitIdle(vk.device);
     app.nv2a_renderer.destroy();
     ImGui_ImplVulkan_Shutdown();

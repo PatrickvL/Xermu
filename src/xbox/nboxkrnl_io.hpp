@@ -443,20 +443,8 @@ struct IoSystem {
                 if (io_get_type(req->type) == REQ_READ &&
                     req->info.header.status == STATUS_SUCCESS) {
                     auto* rw_req = req;
-                    // Dump first 64 bytes of host buffer before write
-                    fprintf(stderr, "[io] host buf first 64:");
-                    for (uint32_t b = 0; b < 64 && b < rw_req->size; ++b)
-                        fprintf(stderr, " %02X", rw_req->buffer[b]);
-                    fprintf(stderr, "\n");
-                    // Count non-zero bytes in host buffer
-                    uint32_t nz = 0;
-                    for (uint32_t b = 0; b < rw_req->size; ++b)
-                        if (rw_req->buffer[b]) ++nz;
-                    fprintf(stderr, "[io] host buf non-zero: %u / %u\n", nz, rw_req->size);
-                    bool wok = exec->write_guest_block(rw_req->address, rw_req->size,
+                    exec->write_guest_block(rw_req->address, rw_req->size,
                                             rw_req->buffer.get());
-                    fprintf(stderr, "[io] write_guest_block(VA=0x%08X, size=%u) = %s\n",
-                            rw_req->address, rw_req->size, wok ? "OK" : "FAIL");
                 }
 
                 // Write result back to guest.
