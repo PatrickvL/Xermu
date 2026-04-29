@@ -387,14 +387,37 @@ static std::string find_data_root(const char* argv0) {
         exe_dir = ".";
     }
 
-    // Walk up from exe_dir looking for a "data" subfolder
+    // Walk up from exe_dir looking for a "data" subfolder that contains
+    // at least one expected file (nboxkrnl.exe or any .xbe), to avoid
+    // picking up stale/empty data directories in build output folders.
+    auto is_valid_data_dir = [](const std::string& path) {
+        std::string probe = path + "/nboxkrnl.exe";
+        FILE* f = fopen(probe.c_str(), "rb");
+        if (f) { fclose(f); return true; }
+        // Check for any .xbe in immediate subdirectories
+        WIN32_FIND_DATAA fd;
+        std::string pattern = path + "/*";
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == '.') continue;
+            std::string sub = path + "/" + fd.cFileName + "/xboxdash.xbe";
+            FILE* fx = fopen(sub.c_str(), "rb");
+            if (fx) { fclose(fx); FindClose(h); return true; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        return false;
+    };
+
     std::string dir = exe_dir;
     for (int i = 0; i < 5; ++i) {
         std::string candidate = dir + "/data";
 #ifdef _WIN32
         DWORD attr = GetFileAttributesA(candidate.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            return candidate;
+            if (is_valid_data_dir(candidate))
+                return candidate;
         }
 #else
         struct stat st;

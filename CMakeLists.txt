@@ -86,6 +86,7 @@ FetchContent_MakeAvailable(glslang)
 
 # Generate .inc files from GLSL shaders (raw string literal wrappers).
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders)
+set(SHADER_INC_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.cmake)
 file(GLOB GLSL_SOURCES ${SHADER_DIR}/*.glsl)
 set(GLSL_INC_FILES)
 foreach(glsl ${GLSL_SOURCES})
@@ -93,9 +94,8 @@ foreach(glsl ${GLSL_SOURCES})
     list(APPEND GLSL_INC_FILES ${inc_file})
     add_custom_command(
         OUTPUT  ${inc_file}
-        COMMAND ${CMAKE_COMMAND} -E echo "Generating ${inc_file}"
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.py
-        DEPENDS ${glsl} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.py
+        COMMAND ${CMAKE_COMMAND} -DGLSL_FILE=${glsl} -P ${SHADER_INC_SCRIPT}
+        DEPENDS ${glsl} ${SHADER_INC_SCRIPT}
         COMMENT "GLSL -> .inc: ${glsl}"
     )
 endforeach()

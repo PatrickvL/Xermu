@@ -28,7 +28,7 @@ the appropriate device emulator. Clean memory accesses go through
 ## Project Structure
 
 ```
-├── CMakeLists.txt                Build config (Zydis via FetchContent, NASM tests)
+├── CMakeLists.txt                Build config (FetchContent deps, NASM tests)
 ├── README.md
 ├── doc/
 │   ├── DESIGN.md                 Architecture, roadmap, working document
@@ -85,6 +85,16 @@ the appropriate device emulator. Clean memory accesses go through
     │       ├── bootstrap.hpp     Shared boot logic, auto-detect, scan_boot_files
     │       ├── xbe_loader.hpp    XBE file parser, section loader, thunk resolver
     │       └── hle_kernel.hpp    Kernel ordinal handler (~150 stubs), XbeHeap
+    ├── gpu/                      NV2A GPU rendering (Vulkan)
+    │   ├── nv2a_vk_renderer.cpp  Vulkan renderer: swapchain, push buffer, scanout
+    │   ├── nv2a_shaders.hpp      GLSL→SPIR-V compilation, pipeline creation
+    │   ├── gen_shader_inc.cmake  CMake script: wraps .glsl as C++ raw string literals
+    │   └── shaders/              GPU shaders (compute + vertex + fragment)
+    │       ├── pushbuf_parse.comp.glsl   NV2A push buffer parser (compute)
+    │       ├── nv2a_draw.vert.glsl       NV2A vertex transform
+    │       ├── nv2a_draw.frag.glsl       NV2A fragment shader
+    │       ├── scanout.vert.glsl         Framebuffer scanout (fullscreen tri)
+    │       └── scanout.frag.glsl         Framebuffer scanout (color decode)
     └── tests/
         ├── harness.inc           NASM test macros (ASSERT_EQ, PASS, etc.)
         ├── test_runner.cpp       Test runner: loads .bin, runs in JIT, checks exit
@@ -101,8 +111,9 @@ the appropriate device emulator. Clean memory accesses go through
 
 ## Building
 
-Requires CMake ≥ 3.20 and a C++20 compiler (MSVC, GCC, or Clang). Zydis v4.1.0
-is fetched automatically. NASM is required for assembling test binaries.
+Requires CMake ≥ 3.20 and a C++20 compiler (MSVC, GCC, or Clang). All library
+dependencies are fetched automatically via FetchContent. NASM is required for
+assembling test binaries. A Vulkan-capable GPU is required at runtime.
 
 ```bash
 cmake -B build -A x64 -DNASM_EXECUTABLE="C:/tools/nasm/nasm-2.16.03/nasm.exe"
@@ -119,7 +130,7 @@ cmake --build build
 
 ### Self-test
 ```
-./build/Release/guided_executor
+./build/Release/xermu
 ```
 
 ### Test suite (52 tests)
@@ -134,12 +145,12 @@ HLE kernel stubs, fastmem, block linking, and more.
 
 ### Xbox Dashboard (XBE)
 ```
-./build/Release/guided_executor --xbe data/xbox\ dash\ orig_5960/xboxdash.xbe
+./build/Release/xermu data/xbox\ dash\ orig_5960/xboxdash.xbe
 ```
 
-Currently executes 305+ HLE kernel calls with zero unhandled ordinals. The
-dashboard performs file I/O, thread creation, interrupt setup, and critical
-section management through emulated kernel stubs.
+In nboxkrnl mode, the dashboard boots through the replacement kernel with full
+NV2A GPU emulation. In HLE mode, it executes 305+ kernel calls with zero
+unhandled ordinals.
 
 ### Boot Modes
 
@@ -235,6 +246,7 @@ automatically. nboxkrnl is preferred when present.
 
 **Xbox hardware emulation:**
 - NV2A GPU: PMC, PCRTC, PTIMER, PRAMDAC, PVIDEO, PBUS, PFIFO, PGRAPH shadow
+- NV2A Vulkan renderer: compute-shader push buffer parser, indirect draws, scanout
 - APU with voice processor registers
 - IDE/ATA with DMA support
 - USB OHCI host controller
@@ -256,13 +268,19 @@ and [doc/PROGRESS.md](doc/PROGRESS.md) for the development log.
 
 ## Dependencies
 
-| Dependency | Version | License |
-|------------|---------|---------|
-| [Zydis](https://github.com/zyantific/zydis) | v4.1.0 | MIT |
-| [NASM](https://www.nasm.us/) | ≥ 2.16 | BSD-2-Clause |
+| Dependency | Version | Source | License |
+|------------|---------|--------|---------|
+| [Zydis](https://github.com/zyantific/zydis) | v4.1.0 | FetchContent | MIT |
+| [SDL3](https://github.com/libsdl-org/SDL) | 3.2.14 | FetchContent | Zlib |
+| [ImGui](https://github.com/ocornut/imgui) | v1.91.8 | FetchContent | MIT |
+| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | 1.4.313.0 | FetchContent | Apache-2.0 |
+| [volk](https://github.com/zeux/volk) | latest | FetchContent | MIT |
+| [glslang](https://github.com/KhronosGroup/glslang) | 15.2.0 | FetchContent | BSD-3-Clause |
+| [NASM](https://www.nasm.us/) | ≥ 2.16 | External | BSD-2-Clause |
 
-NASM is only needed for assembling test binaries. The code emitter is hand-rolled
-byte sequences — no external assembler at runtime.
+All library dependencies are fetched and built automatically by CMake. NASM is
+only needed for assembling test binaries. The code emitter is hand-rolled byte
+sequences — no external assembler at runtime.
 
 ## License
 

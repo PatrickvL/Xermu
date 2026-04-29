@@ -1029,6 +1029,9 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
         return false;
     }
 
+    // Initialize the I/O system (sets exec pointer, starts worker thread).
+    nbox.io.init(sys.exec.get(), nbox.io.dvd_dir, nbox.io.hdd_dir);
+
     // ---- Host I/O ports ----
     nbox.host.exec = sys.exec.get();
     nbox.host.io   = &nbox.io;
@@ -1047,6 +1050,7 @@ inline bool boot_nboxkrnl_system(XboxSystem& sys, const BootConfig& cfg,
     }
 
     sys.entry_eip = entry;
+    sys.exec->ctx.eip = entry;   // Set EIP so the first run() call starts here.
     sys.running   = true;
 
     snprintf(kmsg, sizeof(kmsg), "[nboxkrnl] boot ready — EIP=0x%08X ESP=0x%08X CR3=0x%08X",
