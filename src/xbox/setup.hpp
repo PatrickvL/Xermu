@@ -114,6 +114,15 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     hw->nv2a.irq_callback = nv2a_irq_callback;
     hw->nv2a.irq_user     = &hw->pic;
 
+    // Wire PRAMIN to the Xbox instance memory pages in guest RAM.
+    // On Xbox, NV2A instance memory lives at physical 0x03FE0000 (16 pages).
+    // The D3D runtime writes RAMFC/DMA objects here via normal RAM access,
+    // and MmClaimGpuInstanceMemory may shrink it later.  Wire early so
+    // PRAMIN reads see the correct RAMFC context from the start.
+    hw->nv2a.pramin_ram      = exec.ram;
+    hw->nv2a.pramin_ram_base = 0x03FE0000;
+    hw->nv2a.pramin_ram_size = 16 * 4096;  // 64 KB
+
     hw->mmio.add(APU_BASE, APU_SIZE,
                  apu_read, apu_write, &hw->apu);
     hw->mmio.add(IOAPIC_BASE, IOAPIC_SIZE,
@@ -185,9 +194,11 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.register_io(0x80C0, acpi_gpe0_read, acpi_gpe0_write, &hw->acpi);
     exec.register_io(0x80C1, acpi_gpe0_read, acpi_gpe0_write, &hw->acpi);
 
-    // Start the NV2A PFIFO processing thread — must be last, after all
-    // hardware wiring is complete.
-    hw->nv2a_thread.start(&hw->nv2a, hw->ram, hw->ram_size);
+    // NV2A PFIFO: The GPU compute shader is the sole method dispatcher.
+    // The NV2A thread is disabled — it would race with the compute shader
+    // by advancing DMA_GET before the shader can see push buffer data.
+    // Guest-visible DMA_GET is maintained by reading back from the GPU buffer.
+    // hw->nv2a_thread.start(&hw->nv2a, hw->ram, hw->ram_size);
 
     return hw;
 }

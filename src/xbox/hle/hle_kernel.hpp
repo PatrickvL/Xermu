@@ -1966,6 +1966,7 @@ inline bool default_hle_handler(Executor& exec, uint32_t ordinal, void* user) {
         // PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes, PSIZE_T NumberOfPaddingBytes)
         uint32_t num_bytes = stack_arg(exec, 0);
         uint32_t pad_ptr   = stack_arg(exec, 1);
+        fprintf(stderr, "[hle] MmClaimGpuInstanceMemory(0x%X, 0x%X)\n", num_bytes, pad_ptr);
         uint32_t addr = heap->alloc(num_bytes > 0 ? num_bytes : 0x1000);
         if (addr && num_bytes > 0) memset(exec.ram + addr, 0, num_bytes);
         if (pad_ptr + 4 <= GUEST_RAM_SIZE) {

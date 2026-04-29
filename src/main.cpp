@@ -950,12 +950,22 @@ int main(int argc, char** argv) {
                     (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
                     nv.pcrtc_regs[xbox::pcrtc::START / 4],
                     nv.resolve_dma_base(),
-                    disp_w, disp_h, disp_pitch, disp_bpp);
+                    disp_w, disp_h, disp_pitch, disp_bpp,
+                    nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4], true);
                 // Note: PGRAPH state is maintained by the GPU compute shader.
                 // No sync_pgraph() — the shader is the sole method dispatcher.
             }
+
             app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
             app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
+
+            // Feed back GPU compute shader's DMA_GET to the NV2A register file
+            // so the guest sees FIFO progress (used for synchronization checks).
+            if (app.sys.hw) {
+                auto* ctl = app.nv2a_renderer.mapped<xbox::PfifoControlBlock>(
+                    xbox::GpuBufferLayout::PFIFO_CTL_OFFSET);
+                app.sys.hw->nv2a.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4] = ctl->dma_get;
+            }
         }
 
         VkClearValue clear = {{{0.1f, 0.1f, 0.12f, 1.0f}}};

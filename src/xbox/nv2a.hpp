@@ -217,7 +217,11 @@ struct Nv2aState {
 
     // PCRTC vblank
     uint32_t vblank_counter = 0;
-    static constexpr uint32_t VBLANK_PERIOD = 16;  // ticks between vblanks (~60Hz at tick_period=1024)
+    static constexpr uint32_t VBLANK_PERIOD = 600;  // ticks between vblanks (~60Hz, balanced for emulation speed)
+
+    // Captured initial DMA_GET at the moment DMA push is first enabled.
+    // Used by the GPU compute shader to know where to start parsing.
+
 
     // GPU method handler — called for each (subchannel, method, data) tuple.
     using MethodHandler = void(*)(void* user, uint32_t subchannel,
@@ -331,8 +335,9 @@ struct Nv2aState {
             pending &= ~pmc::INTR_PBUS;
 
         // Assert/deassert PCI INTA# (routed to PIC IRQ 3 on Xbox).
+        // PMC_INTR_EN bit 0 is a global master enable (not per-bit mask).
         if (irq_callback) {
-            bool level = (pending & pmc_regs[pmc::INTR_EN / 4]) != 0;
+            bool level = (pending != 0) && (pmc_regs[pmc::INTR_EN / 4] & 1);
             irq_callback(irq_user, level);
         }
     }
@@ -351,12 +356,18 @@ struct Nv2aState {
         uint32_t inst_addr = (inst_reg & 0xFFFF) << 4;
 
         // Read 3 dwords from PRAMIN at inst_addr.
+        // Try pramin_ram first (guest RAM backing), then internal pramin[].
+        // If the pramin_ram read yields zeros (common when DMA objects were
+        // written before MmClaimGpuInstanceMemory configured pramin_ram),
+        // fall back to the internal pramin[] array.
         uint32_t flags = 0, limit = 0, frame = 0;
         if (pramin_ram && inst_addr + 12 <= pramin_ram_size) {
             memcpy(&flags, pramin_ram + pramin_ram_base + inst_addr, 4);
             memcpy(&limit, pramin_ram + pramin_ram_base + inst_addr + 4, 4);
             memcpy(&frame, pramin_ram + pramin_ram_base + inst_addr + 8, 4);
-        } else if (inst_addr + 12 <= PRAMIN_SIZE) {
+        }
+        // Fallback: read from internal pramin[] if primary read got zeros.
+        if (flags == 0 && frame == 0 && inst_addr + 12 <= PRAMIN_SIZE) {
             memcpy(&flags, pramin + inst_addr, 4);
             memcpy(&limit, pramin + inst_addr + 4, 4);
             memcpy(&frame, pramin + inst_addr + 8, 4);
@@ -608,10 +619,10 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
         if (r == pfifo::INTR_EN) nv->update_irq();
 
+
         // When CACHE1_PUSH1 is written (channel select) or PUSH0 is enabled,
         // load DMA_PUT/DMA_GET from RAMFC context in PRAMIN.
-        if ((r == pfifo::CACHE1_PUSH1 || (r == pfifo::CACHE1_PUSH0 && (val & 1))) &&
-            nv->pramin_ram) {
+        if (r == pfifo::CACHE1_PUSH1 || (r == pfifo::CACHE1_PUSH0 && (val & 1))) {
             // Read RAMFC base from NV_PFIFO_RAMFC register.
             // bits[24:12] = PRAMIN base address >> 4 (in 16-byte units on NV2A)
             uint32_t ramfc_reg = nv->pfifo_regs[0x0214 / 4]; // PFIFO offset 0x0214
@@ -619,16 +630,23 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
             uint32_t channel = nv->pfifo_regs[pfifo::CACHE1_PUSH1 / 4] & 0x1F;
             // NV2A: 64 bytes per channel context in RAMFC
             uint32_t ctx_off = ramfc_base + channel * 64;
-            // Read DMA_PUT and DMA_GET from RAMFC context
-            uint32_t ram_addr = nv->pramin_ram_base + ctx_off;
-            if (ram_addr + 64 <= nv->pramin_ram_base + nv->pramin_ram_size) {
-                uint32_t put, get;
-                memcpy(&put, nv->pramin_ram + ram_addr + 0, 4);
-                memcpy(&get, nv->pramin_ram + ram_addr + 4, 4);
-                if (put != 0 || get != 0) {
-                    nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = put;
-                    nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
+            // Try reading from pramin_ram first, then internal pramin[].
+            uint32_t put = 0, get = 0;
+            if (nv->pramin_ram) {
+                uint32_t ram_addr = nv->pramin_ram_base + ctx_off;
+                if (ram_addr + 64 <= nv->pramin_ram_base + nv->pramin_ram_size) {
+                    memcpy(&put, nv->pramin_ram + ram_addr + 0, 4);
+                    memcpy(&get, nv->pramin_ram + ram_addr + 4, 4);
                 }
+            }
+            if (put == 0 && get == 0 && ctx_off + 64 <= Nv2aState::PRAMIN_SIZE) {
+                memcpy(&put, nv->pramin + ctx_off + 0, 4);
+                memcpy(&get, nv->pramin + ctx_off + 4, 4);
+            }
+
+            if (put != 0 || get != 0) {
+                nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = put;
+                nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
             }
         }
 
@@ -636,6 +654,8 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
                        r == pfifo::CACHE1_PUSH0     ||
                        r == pfifo::CACHE1_DMA_PUSH  ||
                        r == pfifo::CACHE1_DMA_GET);
+
+
         if (notify && nv->fifo_notify)
             nv->fifo_notify(nv->fifo_notify_user);
         return;
@@ -700,8 +720,13 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         uint32_t chan_off = off & 0xFFFF;
         if (chan_off == 0x40) {
             // DMA_PUT: update PFIFO registers and ensure push is enabled.
-            // The USER interface implies the channel is active — enable
-            // DMA push and PUSH0 so tick_fifo processes commands.
+            // On first USER PUT write, seed GET=PUT so that the pusher starts
+            // at the push buffer base rather than processing garbage from addr 0.
+            // The game will later advance PUT past any new commands.
+            uint32_t cur_get = nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+            if (cur_get == 0) {
+                nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = val;
+            }
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = val;
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
             nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;

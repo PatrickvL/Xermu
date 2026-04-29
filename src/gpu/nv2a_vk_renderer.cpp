@@ -755,13 +755,29 @@ void Nv2aVkRenderer::set_pcrtc_start(uint32_t addr) {
 }
 
 void Nv2aVkRenderer::dispatch_pushbuf_parse(VkCommandBuffer cmd) {
+    // Reset draw_count to 0 at the start of each frame so the compute shader
+    // can emit fresh draws via atomicAdd.
+    VkDeviceSize draw_count_offset = GpuBufferLayout::PFIFO_CTL_OFFSET
+                                   + offsetof(PfifoControlBlock, draw_count);
+    vkCmdFillBuffer(cmd, gpu_buffer, draw_count_offset, 4, 0);
+
+    // Barrier: transfer write → compute shader read/write
+    VkMemoryBarrier fill_barrier = {};
+    fill_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    fill_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fill_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &fill_barrier, 0, nullptr, 0, nullptr);
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pushbuf_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pushbuf_layout,
                             0, 1, &pushbuf_desc_set, 0, nullptr);
 
     // Push constants: max_dwords to process this frame
     struct { uint32_t max_dwords; uint32_t frame_id; uint32_t pad[2]; } pc;
-    pc.max_dwords = 65536;  // process up to 64K dwords per dispatch
+    pc.max_dwords = 1048576;  // process up to 1M dwords (~4 MB) per dispatch
     pc.frame_id = frame_id;
     pc.pad[0] = pc.pad[1] = 0;
     vkCmdPushConstants(cmd, pushbuf_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);

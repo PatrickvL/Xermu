@@ -212,6 +212,7 @@ struct Nv2aVkRenderer {
 
     // --- Frame state ---
     uint32_t         frame_id         = 0;
+    bool             gpu_get_initialized = false;  // true once we've seeded GPU's DMA_GET
 
     // ----- Lifecycle -----
 
@@ -234,14 +235,21 @@ struct Nv2aVkRenderer {
         memcpy(mapped_ptr, src_ram, copy_size);
     }
 
-    // Sync PFIFO control block from NV2A state (DMA_PUT/GET/push enable/pcrtc).
+    // Sync PFIFO control block from NV2A state (DMA_PUT/push enable/pcrtc).
+    // The GPU compute shader maintains its own DMA_GET independently.
+    // We seed it once using the initial GET captured at DMA_PUSH enable time.
     void sync_pfifo(uint32_t dma_put, uint32_t dma_get, uint32_t push_enabled,
                     uint32_t pcrtc_start, uint32_t dma_base = 0,
                     uint32_t disp_w = 0, uint32_t disp_h = 0,
-                    uint32_t disp_pitch = 0, uint32_t disp_bpp = 0) {
+                    uint32_t disp_pitch = 0, uint32_t disp_bpp = 0,
+                    uint32_t initial_get = 0, bool initial_get_valid = false) {
         auto* ctl = mapped<PfifoControlBlock>(GpuBufferLayout::PFIFO_CTL_OFFSET);
         ctl->dma_put = dma_put;
-        ctl->dma_get = dma_get;
+        // Seed GPU's DMA_GET once — using the value captured at DMA_PUSH enable.
+        if (!gpu_get_initialized && initial_get_valid) {
+            ctl->dma_get = initial_get;
+            gpu_get_initialized = true;
+        }
         ctl->push_enabled = push_enabled;
         ctl->pcrtc_start = pcrtc_start;
         ctl->dma_base = dma_base;

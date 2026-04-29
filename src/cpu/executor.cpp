@@ -806,17 +806,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 pending_irq &= ~(1u << irq);
                 vector = uint8_t(0x20 + irq);
             }
-            if (steps < 5000) { // Diagnostic: log first few IRQ deliveries
-                fprintf(stderr, "[exec] IRQ deliver: vector=%u EIP=%08X steps=%llu\n",
-                        vector, ctx.eip, (unsigned long long)steps);
-                // Also dump PIC state for cascade debugging
-                if (irq_user) {
-                    auto* pic = static_cast<xbox::PicPair*>(irq_user);
-                    fprintf(stderr, "[exec] PIC master: irr=%02X imr=%02X isr=%02X vec=%02X  slave: irr=%02X imr=%02X isr=%02X vec=%02X\n",
-                            pic->master.irr, pic->master.imr, pic->master.isr, pic->master.vector_base,
-                            pic->slave.irr, pic->slave.imr, pic->slave.isr, pic->slave.vector_base);
-                }
-            }
+
             deliver_interrupt(vector, ctx.eip);
             prev_trace = nullptr; // chain broken by interrupt
         }
@@ -996,6 +986,18 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                                 else if ((modrm & 0xF8) == 0xE8) {
                                     unsigned reg = modrm & 7;
                                     if (ctx.gp[reg] > SPIN_THRESHOLD * 2) break;
+                                    // Don't fast-forward loops that contain memory
+                                    // stores (0x88=MOV r/m8,r8  0x89=MOV r/m32,r32).
+                                    // Those are data-copy loops (memcpy/memmove), not
+                                    // spin-waits.
+                                    bool has_store = false;
+                                    for (uint32_t s = 0; s < off; ++s) {
+                                        uint8_t sb = ram[code_pa + s];
+                                        if (sb == 0x88 || sb == 0x89) {
+                                            has_store = true; break;
+                                        }
+                                    }
+                                    if (has_store) break;
                                     ctx.gp[reg] = 1; // after SUB 1: 0→ZF=1, JNZ falls through
                                     handled = true;
                                 }
@@ -1112,10 +1114,6 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
             prev_trace = nullptr; // chain broken
-            // Diagnostic: print the trace that was just dispatched.
-            fprintf(stderr, "[exec] XYZPF trace_eip=%08X next_eip=%08X\n",
-                    t ? t->guest_eip : 0, ctx.next_eip);
-            fflush(stderr);
             static int pf_log_count = 0;
             if (pf_log_count < 50) {
                 ++pf_log_count;
@@ -1132,6 +1130,18 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         ctx.gp[0], ctx.gp[3], ctx.gp[1], ctx.gp[2]);
                 fprintf(stderr, "[exec]   ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
                         ctx.gp[4], ctx.gp[5], ctx.gp[6], ctx.gp[7]);
+                // Dump code bytes at faulting EIP
+                {
+                    uint32_t code_eip = ctx.eip;
+                    uint32_t code_pa = code_eip;
+                    if (paging_enabled()) code_pa = translate_va(code_eip, false);
+                    if (code_pa != ~0u && code_pa + 16 <= GUEST_RAM_SIZE) {
+                        fprintf(stderr, "[exec]   code @EIP=%08X:", code_eip);
+                        for (int ci = 0; ci < 16; ++ci)
+                            fprintf(stderr, " %02X", ram[code_pa + ci]);
+                        fprintf(stderr, "\n");
+                    }
+                }
                 // Also dump the IDT entry for vector 14
                 uint32_t idt_desc = ctx.idtr_base + 14 * 8;
                 uint32_t idt_pa = idt_desc;

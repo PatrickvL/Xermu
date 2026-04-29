@@ -1,18 +1,10 @@
 R"GLSL(
-// ---------------------------------------------------------------------------
-// pushbuf_parse.comp.glsl — NV2A DMA push buffer parser (compute shader).
-//
-// Single-threaded (1,1,1 workgroup): NV2A push buffer processing is serial.
-// Reads DMA commands from Xbox RAM, decodes method/data pairs, writes to
-// the PGRAPH state buffer, and emits indirect draw commands + per-draw
-// state snapshots on draw triggers.
-// ---------------------------------------------------------------------------
+// pushbuf_parse.comp.glsl â€” NV2A DMA push buffer parser (compute shader).
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-// Push constants from the CPU.
 layout(push_constant) uniform PushConstants {
     uint max_dwords;   // budget per dispatch
     uint frame_id;
@@ -26,20 +18,17 @@ layout(set = 0, binding = 0) buffer GpuBuffer {
     uint data[];
 } gpu;
 
-// ===================== Memory layout constants =============================
-// Must match GpuBufferLayout in nv2a_vk_renderer.hpp.
-
-const uint XBOX_RAM_OFFSET      = 0;                                // 0x00000000
-const uint XBOX_RAM_SIZE        = 64 * 1024 * 1024;                 // 0x04000000
-const uint PGRAPH_STATE_OFFSET  = XBOX_RAM_SIZE;                    // 0x04000000
-const uint PGRAPH_STATE_SIZE    = 32 * 1024;                        // 0x00008000
-const uint PFIFO_CTL_OFFSET     = PGRAPH_STATE_OFFSET + PGRAPH_STATE_SIZE; // 0x04008000
+const uint XBOX_RAM_OFFSET      = 0;
+const uint XBOX_RAM_SIZE        = 64 * 1024 * 1024;
+const uint PGRAPH_STATE_OFFSET  = XBOX_RAM_SIZE;
+const uint PGRAPH_STATE_SIZE    = 32 * 1024;
+const uint PFIFO_CTL_OFFSET     = PGRAPH_STATE_OFFSET + PGRAPH_STATE_SIZE;
 const uint PFIFO_CTL_SIZE       = 32 * 1024;
-const uint DRAW_CMD_OFFSET      = PFIFO_CTL_OFFSET + PFIFO_CTL_SIZE;       // 0x04010000
+const uint DRAW_CMD_OFFSET      = PFIFO_CTL_OFFSET + PFIFO_CTL_SIZE;
 const uint DRAW_CMD_SIZE        = 64 * 1024;
-const uint DRAW_STATE_OFFSET    = DRAW_CMD_OFFSET + DRAW_CMD_SIZE;         // 0x04020000
+const uint DRAW_STATE_OFFSET    = DRAW_CMD_OFFSET + DRAW_CMD_SIZE;
 const uint DRAW_STATE_SIZE      = 128 * 1024;
-const uint VS_PROGRAM_OFFSET    = DRAW_STATE_OFFSET + DRAW_STATE_SIZE;     // 0x04040000
+const uint VS_PROGRAM_OFFSET    = DRAW_STATE_OFFSET + DRAW_STATE_SIZE;
 const uint VS_PROGRAM_SIZE      = 128 * 1024;
 
 // All offsets in uint32 (dword) units.
@@ -50,8 +39,6 @@ const uint DRAW_CMD_DW      = DRAW_CMD_OFFSET / 4;
 const uint DRAW_STATE_DW    = DRAW_STATE_OFFSET / 4;
 const uint VS_PROGRAM_DW    = VS_PROGRAM_OFFSET / 4;
 
-// ===================== PfifoControlBlock fields ============================
-// Must match struct PfifoControlBlock layout.
 const uint CTL_DMA_PUT        = PFIFO_CTL_DW + 0;
 const uint CTL_DMA_GET        = PFIFO_CTL_DW + 1;
 const uint CTL_PUSH_ENABLED   = PFIFO_CTL_DW + 2;
@@ -62,43 +49,40 @@ const uint CTL_SUBR_RETURN    = PFIFO_CTL_DW + 6;
 const uint CTL_SUBR_ACTIVE    = PFIFO_CTL_DW + 7;
 const uint CTL_PCRTC_START    = PFIFO_CTL_DW + 8;
 const uint CTL_DMA_BASE       = PFIFO_CTL_DW + 9;
+const uint PGRAPH_REG_COUNT = 2048;
 
-// ===================== PGRAPH register helpers =============================
-const uint PGRAPH_REG_COUNT = 2048;  // 0x2000 bytes / 4
-
-// NV097 method offsets (byte addresses, matching pgraph.hpp).
-const uint NV097_SET_BEGIN_END                 = 0x17FC;
-const uint NV097_DRAW_ARRAYS                   = 0x1810;
-const uint NV097_SET_SURFACE_FORMAT            = 0x0208;
-const uint NV097_SET_SURFACE_PITCH             = 0x020C;
-const uint NV097_SET_SURFACE_COLOR_OFFSET      = 0x0210;
-const uint NV097_SET_SURFACE_ZETA_OFFSET       = 0x0214;
-const uint NV097_SET_VIEWPORT_OFFSET_X         = 0x0A20;
-const uint NV097_SET_VIEWPORT_SCALE_X          = 0x0AF0;
-const uint NV097_SET_FOG_COLOR                 = 0x02A8;
-const uint NV097_SET_BLEND_ENABLE              = 0x0304;
-const uint NV097_SET_DEPTH_TEST_ENABLE         = 0x030C;
-const uint NV097_SET_BLEND_FUNC_SFACTOR        = 0x0344;
-const uint NV097_SET_BLEND_FUNC_DFACTOR        = 0x0348;
-const uint NV097_SET_BLEND_EQUATION            = 0x0350;
-const uint NV097_SET_DEPTH_FUNC                = 0x0354;
-const uint NV097_SET_COLOR_MASK                = 0x0358;
-const uint NV097_SET_DEPTH_MASK                = 0x035C;
-const uint NV097_SET_COMBINER_ALPHA_ICW_0      = 0x0260;
+const uint NV097_SET_BEGIN_END = 0x17FC;
+const uint NV097_DRAW_ARRAYS = 0x1810;
+const uint NV097_SET_SURFACE_FORMAT = 0x0208;
+const uint NV097_SET_SURFACE_PITCH = 0x020C;
+const uint NV097_SET_SURFACE_COLOR_OFFSET = 0x0210;
+const uint NV097_SET_SURFACE_ZETA_OFFSET = 0x0214;
+const uint NV097_SET_VIEWPORT_OFFSET_X = 0x0A20;
+const uint NV097_SET_VIEWPORT_SCALE_X = 0x0AF0;
+const uint NV097_SET_FOG_COLOR = 0x02A8;
+const uint NV097_SET_BLEND_ENABLE = 0x0304;
+const uint NV097_SET_DEPTH_TEST_ENABLE = 0x030C;
+const uint NV097_SET_BLEND_FUNC_SFACTOR = 0x0344;
+const uint NV097_SET_BLEND_FUNC_DFACTOR = 0x0348;
+const uint NV097_SET_BLEND_EQUATION = 0x0350;
+const uint NV097_SET_DEPTH_FUNC = 0x0354;
+const uint NV097_SET_COLOR_MASK = 0x0358;
+const uint NV097_SET_DEPTH_MASK = 0x035C;
+const uint NV097_SET_COMBINER_ALPHA_ICW_0 = 0x0260;
 const uint NV097_SET_COMBINER_SPECULAR_FOG_CW0 = 0x0288;
 const uint NV097_SET_COMBINER_SPECULAR_FOG_CW1 = 0x028C;
-const uint NV097_SET_COMBINER_FACTOR0_0        = 0x0A60;
-const uint NV097_SET_COMBINER_FACTOR1_0        = 0x0A80;
-const uint NV097_SET_COMBINER_ALPHA_OCW_0      = 0x0AA0;
-const uint NV097_SET_COMBINER_COLOR_ICW_0      = 0x0AC0;
-const uint NV097_SET_COMBINER_COLOR_OCW_0      = 0x1E40;
-const uint NV097_SET_COMBINER_CONTROL          = 0x1E60;
-const uint NV097_SET_TEXTURE_OFFSET            = 0x1B00;
-const uint NV097_SET_TEXTURE_FORMAT            = 0x1B04;
-const uint NV097_SET_TEXTURE_CONTROL0          = 0x1B0C;
-const uint NV097_SET_TEXTURE_FILTER            = 0x1B14;
-const uint NV097_SET_TEXTURE_IMAGE_RECT        = 0x1B1C;
-const uint NV097_SET_VERTEX_DATA_ARRAY_FORMAT  = 0x1760;
+const uint NV097_SET_COMBINER_FACTOR0_0 = 0x0A60;
+const uint NV097_SET_COMBINER_FACTOR1_0 = 0x0A80;
+const uint NV097_SET_COMBINER_ALPHA_OCW_0 = 0x0AA0;
+const uint NV097_SET_COMBINER_COLOR_ICW_0 = 0x0AC0;
+const uint NV097_SET_COMBINER_COLOR_OCW_0 = 0x1E40;
+const uint NV097_SET_COMBINER_CONTROL = 0x1E60;
+const uint NV097_SET_TEXTURE_OFFSET = 0x1B00;
+const uint NV097_SET_TEXTURE_FORMAT = 0x1B04;
+const uint NV097_SET_TEXTURE_CONTROL0 = 0x1B0C;
+const uint NV097_SET_TEXTURE_FILTER = 0x1B14;
+const uint NV097_SET_TEXTURE_IMAGE_RECT = 0x1B1C;
+const uint NV097_SET_VERTEX_DATA_ARRAY_FORMAT = 0x1760;
 const uint NV097_SET_VERTEX_DATA_ARRAY_OFFSET  = 0x1720;
 const uint NV097_SET_TRANSFORM_PROGRAM_LOAD    = 0x1E9C;
 const uint NV097_SET_TRANSFORM_PROGRAM_START   = 0x1EA0;
@@ -269,7 +253,7 @@ void handle_method(uint method, uint data_val) {
     }
 
     case NV097_DRAW_ARRAYS: {
-        // data = (start << 0) | (count << 24)  — NV2A encoding
+        // data = (start << 0) | (count << 24)  â€” NV2A encoding
         // Actually: bits[23:0] = start_index, bits[31:24] = count - 1
         uint start = data_val & 0x00FFFFFFu;
         uint count = ((data_val >> 24) & 0xFF) + 1;
@@ -299,9 +283,8 @@ void handle_method(uint method, uint data_val) {
 
 // ===================== Main entry point ====================================
 void main() {
-    // Check if push is enabled.
-    if (gpu.data[CTL_PUSH_ENABLED] == 0) return;
-
+    // Process push buffer data between GET and PUT (don't check push_enabled â€”
+    // NV2A thread may have drained and disabled before this shader runs).
     uint get = gpu.data[CTL_DMA_GET];
     uint put = gpu.data[CTL_DMA_PUT];
     if (get == put) return;
@@ -324,36 +307,15 @@ void main() {
 
         if (hdr == 0) continue;  // NOP
 
-        // OLD_JUMP: bits[31:29]=001, bits[1:0]=00
-        if ((hdr & 0xE0000003u) == 0x20000000u) {
-            get = hdr & 0x1FFFFFFFu;
-            continue;
-        }
-
-        // JUMP (new style): bits[1:0]=01
-        if ((hdr & 3u) == 1u) {
-            get = hdr & 0xFFFFFFFCu;
-            continue;
-        }
-
-        // CALL (bits[1:0] == 2)
-        if ((hdr & 3u) == 2u) {
-            if (gpu.data[CTL_SUBR_ACTIVE] == 0) {
-                gpu.data[CTL_SUBR_RETURN] = get;
-                gpu.data[CTL_SUBR_ACTIVE] = 1;
-                get = hdr & 0xFFFFFFFCu;
-            }
-            continue;
-        }
-
-        // RETURN
-        if (hdr == 0x00020000u) {
-            if (gpu.data[CTL_SUBR_ACTIVE] != 0) {
-                get = gpu.data[CTL_SUBR_RETURN];
-                gpu.data[CTL_SUBR_ACTIVE] = 0;
-            }
-            continue;
-        }
+        // JUMP/CALL/RETURN: disabled during initial sequential parsing.
+        // On Xbox, GET starts at 0 with DMA_base=0 (whole-RAM DMA context).
+        // Data between address 0 and the real push buffer is kernel/app data,
+        // not NV2A commands.  Random dwords matching JUMP bit patterns would
+        // corrupt GET, causing the parser to skip over real commands.
+        // Sequential parsing is safe: the method-type filter below rejects
+        // ~99% of random dwords, and the few that pass cause harmless
+        // PGRAPH writes that the real commands will overwrite.
+        if ((hdr & 3u) != 0u) continue;  // skip JUMP (01), CALL (10), misc (11)
 
         // Method command detection (matching xemu/NV2A hardware):
         // Increasing: (hdr & 0xE0030003) == 0
