@@ -906,13 +906,20 @@ int main(int argc, char** argv) {
             // Sync PFIFO control state from NV2A registers into the GPU buffer.
             if (app.sys.hw) {
                 auto& nv = app.sys.hw->nv2a;
+                // Derive display info from PCRTC_CONFIG (bits [1:0] = bpp: 1=8,2=16,3=32).
+                uint32_t pcrtc_cfg = nv.pcrtc_regs[xbox::pcrtc::CONFIG / 4];
+                uint32_t bpp_sel = pcrtc_cfg & 3;
+                uint32_t disp_bpp = (bpp_sel == 3) ? 4 : (bpp_sel == 2) ? 2 : (bpp_sel == 1) ? 1 : 4;
+                uint32_t disp_w = 640, disp_h = 480;
+                uint32_t disp_pitch = disp_w * disp_bpp;
                 app.nv2a_renderer.sync_pfifo(
                     nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUT / 4],
                     nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4],
                     (nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
                     (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
                     nv.pcrtc_regs[xbox::pcrtc::START / 4],
-                    nv.resolve_dma_base());
+                    nv.resolve_dma_base(),
+                    disp_w, disp_h, disp_pitch, disp_bpp);
                 // Note: PGRAPH state is maintained by the GPU compute shader.
                 // No sync_pgraph() — the shader is the sole method dispatcher.
             }

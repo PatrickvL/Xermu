@@ -77,7 +77,11 @@ struct PfifoControlBlock {
     uint32_t subroutine_active;
     uint32_t pcrtc_start;        // written by CPU on guest PCRTC_START MMIO write
     uint32_t dma_base;           // DMA context physical base address
-    uint32_t pad[6];             // pad to 64 bytes
+    uint32_t display_width;      // scanout display width  (from PRAMDAC/mode, 0 = 640)
+    uint32_t display_height;     // scanout display height (from PRAMDAC/mode, 0 = 480)
+    uint32_t display_pitch;      // scanout pitch in bytes (from PCRTC_CONFIG,  0 = width*4)
+    uint32_t display_bpp;        // bytes per pixel (0/4 = X8R8G8B8, 2 = R5G6B5)
+    uint32_t pad[2];             // pad to 64 bytes
 };
 
 // ============================= Indirect Draw Command =======================
@@ -232,13 +236,19 @@ struct Nv2aVkRenderer {
 
     // Sync PFIFO control block from NV2A state (DMA_PUT/GET/push enable/pcrtc).
     void sync_pfifo(uint32_t dma_put, uint32_t dma_get, uint32_t push_enabled,
-                    uint32_t pcrtc_start, uint32_t dma_base = 0) {
+                    uint32_t pcrtc_start, uint32_t dma_base = 0,
+                    uint32_t disp_w = 0, uint32_t disp_h = 0,
+                    uint32_t disp_pitch = 0, uint32_t disp_bpp = 0) {
         auto* ctl = mapped<PfifoControlBlock>(GpuBufferLayout::PFIFO_CTL_OFFSET);
         ctl->dma_put = dma_put;
         ctl->dma_get = dma_get;
         ctl->push_enabled = push_enabled;
         ctl->pcrtc_start = pcrtc_start;
         ctl->dma_base = dma_base;
+        ctl->display_width  = disp_w;
+        ctl->display_height = disp_h;
+        ctl->display_pitch  = disp_pitch;
+        ctl->display_bpp    = disp_bpp;
     }
 
     // Sync CPU-side PGRAPH register state into the GPU buffer so shaders can read it.

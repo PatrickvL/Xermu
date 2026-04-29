@@ -22,19 +22,13 @@ const uint PGRAPH_STATE_DW = (64 * 1024 * 1024) / 4;
 const uint PFIFO_CTL_DW    = PGRAPH_STATE_DW + (32 * 1024) / 4;
 
 // PfifoControlBlock field offsets (dword index from PFIFO_CTL_DW).
-const uint CTL_PCRTC_START = PFIFO_CTL_DW + 8;
-
-// NV097 PGRAPH register offsets.
-const uint NV097_SET_SURFACE_FORMAT = 0x0208;
-const uint NV097_SET_SURFACE_PITCH  = 0x020C;
-const uint NV097_SET_SURFACE_CLIP_HORIZONTAL = 0x0200;
-const uint NV097_SET_SURFACE_CLIP_VERTICAL   = 0x0204;
+const uint CTL_PCRTC_START    = PFIFO_CTL_DW + 8;
+const uint CTL_DISPLAY_WIDTH  = PFIFO_CTL_DW + 10;
+const uint CTL_DISPLAY_HEIGHT = PFIFO_CTL_DW + 11;
+const uint CTL_DISPLAY_PITCH  = PFIFO_CTL_DW + 12;
+const uint CTL_DISPLAY_BPP    = PFIFO_CTL_DW + 13;
 
 // ===================== Helpers =============================================
-
-uint pg_read(uint method_byte_offset) {
-    return gpu.data[PGRAPH_STATE_DW + method_byte_offset / 4];
-}
 
 // Unpack an X8R8G8B8 (0xAARRGGBB) pixel to linear RGBA.
 vec4 unpack_x8r8g8b8(uint pixel) {
@@ -65,23 +59,18 @@ vec4 unpack_r5g6b5(uint pixel16) {
 // ===================== Main ================================================
 
 void main() {
-    // Read scanout configuration.
-    uint fb_start   = gpu.data[CTL_PCRTC_START];  // byte offset in Xbox RAM
-    uint surf_fmt   = pg_read(NV097_SET_SURFACE_FORMAT);
-    uint surf_pitch = pg_read(NV097_SET_SURFACE_PITCH);
-    uint clip_h     = pg_read(NV097_SET_SURFACE_CLIP_HORIZONTAL);
-    uint clip_v     = pg_read(NV097_SET_SURFACE_CLIP_VERTICAL);
-
-    // Decode surface info.
-    uint color_format = surf_fmt & 0xF;
-    uint pitch        = surf_pitch & 0xFFFF;  // color pitch in bytes
-    uint fb_width     = (clip_h >> 16) & 0xFFFF;
-    uint fb_height    = (clip_v >> 16) & 0xFFFF;
+    // Read scanout configuration from the PFIFO control block (set by CPU).
+    uint fb_start   = gpu.data[CTL_PCRTC_START];
+    uint fb_width   = gpu.data[CTL_DISPLAY_WIDTH];
+    uint fb_height  = gpu.data[CTL_DISPLAY_HEIGHT];
+    uint pitch      = gpu.data[CTL_DISPLAY_PITCH];
+    uint bpp        = gpu.data[CTL_DISPLAY_BPP];
 
     // Fallback defaults if not configured.
     if (fb_width  == 0) fb_width  = 640;
     if (fb_height == 0) fb_height = 480;
-    if (pitch     == 0) pitch     = fb_width * 4;
+    if (bpp       == 0) bpp       = 4;
+    if (pitch     == 0) pitch     = fb_width * bpp;
 
     // Compute pixel coordinates.
     uint px = uint(v_uv.x * float(fb_width));
@@ -92,33 +81,27 @@ void main() {
     // Byte offset of this pixel in Xbox RAM.
     uint byte_off = fb_start + py * pitch;
 
-    // Read and decode based on surface color format.
-    // Format enum (from SET_SURFACE_FORMAT bits[3:0]):
-    //   0x01 = X1R5G5B5    (2 bpp)
-    //   0x03 = R5G6B5       (2 bpp)
-    //   0x05 = X8R8G8B8     (4 bpp)
-    //   0x08 = A8R8G8B8     (4 bpp)
+    // Read and decode based on bytes-per-pixel.
     vec4 color;
 
-    if (color_format == 0x05 || color_format == 0x08 || color_format == 0x04) {
-        // 32-bit formats: X8R8G8B8 / A8R8G8B8
+    if (bpp == 4) {
+        // 32-bit: X8R8G8B8
         uint pixel_off = byte_off + px * 4;
         uint dw_idx = XBOX_RAM_DW + pixel_off / 4;
         uint pixel  = gpu.data[dw_idx];
-        color = (color_format == 0x08) ? unpack_a8r8g8b8(pixel) : unpack_x8r8g8b8(pixel);
+        color = unpack_x8r8g8b8(pixel);
     }
-    else if (color_format == 0x03 || color_format == 0x01) {
-        // 16-bit formats: R5G6B5 / X1R5G5B5
+    else if (bpp == 2) {
+        // 16-bit: R5G6B5
         uint pixel_off = byte_off + px * 2;
         uint dw_idx = XBOX_RAM_DW + pixel_off / 4;
         uint dword  = gpu.data[dw_idx];
-        // Extract the correct 16-bit half.
         uint shift  = (pixel_off & 2) * 8;  // 0 or 16
         uint pixel16 = (dword >> shift) & 0xFFFF;
         color = unpack_r5g6b5(pixel16);
     }
     else {
-        // Unknown format — magenta error color.
+        // Unknown bpp — magenta error color.
         color = vec4(1.0, 0.0, 1.0, 1.0);
     }
 
