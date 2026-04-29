@@ -76,7 +76,8 @@ struct PfifoControlBlock {
     uint32_t subroutine_return;  // CALL/RETURN stack (single level)
     uint32_t subroutine_active;
     uint32_t pcrtc_start;        // written by CPU on guest PCRTC_START MMIO write
-    uint32_t pad[7];             // pad to 64 bytes
+    uint32_t dma_base;           // DMA context physical base address
+    uint32_t pad[6];             // pad to 64 bytes
 };
 
 // ============================= Indirect Draw Command =======================
@@ -221,6 +222,24 @@ struct Nv2aVkRenderer {
     void destroy();
 
     // ----- Per-frame -----
+
+    // Sync executor RAM into the GPU buffer's XBOX_RAM region.
+    // Must be called before dispatch_pushbuf_parse each frame.
+    void sync_ram(const uint8_t* src_ram, uint32_t size) {
+        uint32_t copy_size = (size < GpuBufferLayout::XBOX_RAM_SIZE) ? size : GpuBufferLayout::XBOX_RAM_SIZE;
+        memcpy(mapped_ptr, src_ram, copy_size);
+    }
+
+    // Sync PFIFO control block from NV2A state (DMA_PUT/GET/push enable/pcrtc).
+    void sync_pfifo(uint32_t dma_put, uint32_t dma_get, uint32_t push_enabled,
+                    uint32_t pcrtc_start, uint32_t dma_base = 0) {
+        auto* ctl = mapped<PfifoControlBlock>(GpuBufferLayout::PFIFO_CTL_OFFSET);
+        ctl->dma_put = dma_put;
+        ctl->dma_get = dma_get;
+        ctl->push_enabled = push_enabled;
+        ctl->pcrtc_start = pcrtc_start;
+        ctl->dma_base = dma_base;
+    }
 
     // Called by the CPU when the guest writes CACHE1_DMA_PUT.
     // Updates the PFIFO control block in mapped GPU memory.

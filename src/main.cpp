@@ -899,6 +899,21 @@ int main(int argc, char** argv) {
 
         // NV2A: dispatch push buffer compute shader + 3D draw pass (before swapchain pass).
         if (app.state == AppState::Running) {
+            // Sync executor RAM → GPU buffer so the compute shader sees push buffer + framebuffer data.
+            if (app.sys.exec && app.sys.exec->ram) {
+                app.nv2a_renderer.sync_ram(app.sys.exec->ram, GUEST_RAM_SIZE);
+            }
+            // Sync PFIFO control state from NV2A registers into the GPU buffer.
+            if (app.sys.hw) {
+                auto& nv = app.sys.hw->nv2a;
+                app.nv2a_renderer.sync_pfifo(
+                    nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUT / 4],
+                    nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4],
+                    (nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
+                    (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
+                    nv.pcrtc_regs[xbox::pcrtc::START / 4],
+                    nv.resolve_dma_base());
+            }
             app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
             app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
         }

@@ -342,6 +342,30 @@ struct Nv2aState {
     // ---------------------------------------------------------------
     static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
 
+    // Resolve the DMA context object from PRAMIN to get the push buffer
+    // physical base address.  DMA_GET/DMA_PUT are byte offsets relative
+    // to this base.
+    uint32_t resolve_dma_base() const {
+        uint32_t inst_reg = pfifo_regs[pfifo::CACHE1_DMA_INSTANCE / 4];
+        uint32_t inst_addr = (inst_reg & 0xFFFF) << 4;
+
+        // Read 3 dwords from PRAMIN at inst_addr.
+        uint32_t flags = 0, limit = 0, frame = 0;
+        if (pramin_ram && inst_addr + 12 <= pramin_ram_size) {
+            memcpy(&flags, pramin_ram + pramin_ram_base + inst_addr, 4);
+            memcpy(&limit, pramin_ram + pramin_ram_base + inst_addr + 4, 4);
+            memcpy(&frame, pramin_ram + pramin_ram_base + inst_addr + 8, 4);
+        } else if (inst_addr + 12 <= PRAMIN_SIZE) {
+            memcpy(&flags, pramin + inst_addr, 4);
+            memcpy(&limit, pramin + inst_addr + 4, 4);
+            memcpy(&frame, pramin + inst_addr + 8, 4);
+        }
+
+        // NV_DMA_ADDRESS = frame[31:12], NV_DMA_ADJUST = flags[31:20]
+        uint32_t base = (frame & 0xFFFFF000u) | ((flags >> 20) & 0xFFF);
+        return base & 0x07FFFFFFu;  // mask to 128 MB
+    }
+
     void tick_fifo(const uint8_t* ram, uint32_t ram_size_bytes) {
         auto& dma_push = pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4];
         auto& push0    = pfifo_regs[pfifo::CACHE1_PUSH0 / 4];
@@ -355,29 +379,38 @@ struct Nv2aState {
         if (dma_get == dma_put) { status = pfifo::STATUS_IDLE; return; }
         status = 0;
 
+        uint32_t dma_base = resolve_dma_base();
         uint32_t get = dma_get;
         uint32_t put = dma_put;
         uint32_t consumed = 0;
 
         while (get != put && consumed < MAX_DWORDS_PER_TICK) {
-            if (get + 4 > ram_size_bytes) break;
+            uint32_t phys = dma_base + get;
+            if (phys + 4 > ram_size_bytes) break;
 
             uint32_t hdr;
-            memcpy(&hdr, ram + get, 4);
+            memcpy(&hdr, ram + phys, 4);
             get += 4;
             consumed++;
 
             if (hdr == 0) continue;  // NOP
 
-            if ((hdr & 0xC0000000u) == 0x40000000u) {
-                // JUMP
-                get = hdr & 0x1FFFFFFCu;
+            // OLD_JUMP: bits[31:29]=001, bits[1:0]=00
+            if ((hdr & 0xE0000003u) == 0x20000000u) {
+                get = hdr & 0x1FFFFFFFu;
                 diag_jumps++;
                 continue;
             }
 
+            // JUMP (new style): bits[1:0]=01
+            if ((hdr & 3) == 1) {
+                get = hdr & 0xFFFFFFFCu;
+                diag_jumps++;
+                continue;
+            }
+
+            // CALL: bits[1:0]=10
             if ((hdr & 3) == 2) {
-                // CALL: save GET, jump to target (single-level on Xbox).
                 if (!(subr & 1)) {
                     subr = (get & 0x1FFFFFFC) | 1;
                     get = hdr & 0xFFFFFFFCu;
@@ -395,17 +428,28 @@ struct Nv2aState {
                 continue;
             }
 
-            uint32_t type = (hdr >> 29) & 0x7;
-            if (type == 0 || type == 4) {
+            // Method commands.
+            // Increasing: (hdr & 0xE0030003) == 0
+            // Non-increasing: (hdr & 0xE0030003) == 0x40000000
+            uint32_t type;
+            if ((hdr & 0xE0030003u) == 0)
+                type = 0;  // increasing
+            else if ((hdr & 0xE0030003u) == 0x40000000u)
+                type = 4;  // non-increasing
+            else
+                continue;  // unknown command, skip
+
+            {
                 uint32_t method     = (hdr >>  0) & 0x1FFC;
                 uint32_t subchannel = (hdr >> 13) & 0x7;
                 uint32_t count      = (hdr >> 18) & 0x7FF;
 
                 for (uint32_t i = 0; i < count && consumed < MAX_DWORDS_PER_TICK; ++i) {
-                    if (get + 4 > ram_size_bytes) goto done;
+                    uint32_t dphys = dma_base + get;
+                    if (dphys + 4 > ram_size_bytes) goto done;
 
                     uint32_t data;
-                    memcpy(&data, ram + get, 4);
+                    memcpy(&data, ram + dphys, 4);
                     get += 4;
                     consumed++;
 

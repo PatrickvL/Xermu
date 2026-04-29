@@ -60,6 +60,7 @@ const uint CTL_FLAGS          = PFIFO_CTL_DW + 5;
 const uint CTL_SUBR_RETURN    = PFIFO_CTL_DW + 6;
 const uint CTL_SUBR_ACTIVE    = PFIFO_CTL_DW + 7;
 const uint CTL_PCRTC_START    = PFIFO_CTL_DW + 8;
+const uint CTL_DMA_BASE       = PFIFO_CTL_DW + 9;
 
 // ===================== PGRAPH register helpers =============================
 const uint PGRAPH_REG_COUNT = 2048;  // 0x2000 bytes / 4
@@ -304,6 +305,8 @@ void main() {
     uint put = gpu.data[CTL_DMA_PUT];
     if (get == put) return;
 
+    uint dma_base = gpu.data[CTL_DMA_BASE];
+
     // Restore VS upload positions from PGRAPH state.
     vs_program_write_pos = pg_read(NV097_SET_TRANSFORM_PROGRAM_LOAD) * 4;
     vs_const_write_pos   = pg_read(NV097_SET_TRANSFORM_CONSTANT_LOAD) * 4;
@@ -311,22 +314,29 @@ void main() {
     uint consumed = 0;
 
     while (get != put && consumed < max_dwords) {
-        if (get + 4 > XBOX_RAM_SIZE) break;
+        uint phys = dma_base + get;
+        if (phys + 4 > XBOX_RAM_SIZE) break;
 
-        uint hdr = ram_read(get);
+        uint hdr = ram_read(phys);
         get += 4;
         consumed++;
 
         if (hdr == 0) continue;  // NOP
 
-        // JUMP: top bits = 010xxxxx xxxxxxxx xxxxxxxx xxxxxx00
-        if ((hdr & 0xC0000000u) == 0x40000000u) {
-            get = hdr & 0x1FFFFFFCu;
+        // OLD_JUMP: bits[31:29]=001, bits[1:0]=00
+        if ((hdr & 0xE0000003u) == 0x20000000u) {
+            get = hdr & 0x1FFFFFFFu;
+            continue;
+        }
+
+        // JUMP (new style): bits[1:0]=01
+        if ((hdr & 3u) == 1u) {
+            get = hdr & 0xFFFFFFFCu;
             continue;
         }
 
         // CALL (bits[1:0] == 2)
-        if ((hdr & 3) == 2) {
+        if ((hdr & 3u) == 2u) {
             if (gpu.data[CTL_SUBR_ACTIVE] == 0) {
                 gpu.data[CTL_SUBR_RETURN] = get;
                 gpu.data[CTL_SUBR_ACTIVE] = 1;
@@ -344,18 +354,27 @@ void main() {
             continue;
         }
 
-        // Method command: type in bits[31:29].
-        // type 0 = incrementing, type 4 = non-incrementing.
-        uint type       = (hdr >> 29) & 0x7;
-        if (type == 0 || type == 4) {
+        // Method command detection (matching xemu/NV2A hardware):
+        // Increasing: (hdr & 0xE0030003) == 0
+        // Non-increasing: (hdr & 0xE0030003) == 0x40000000
+        uint type;
+        if ((hdr & 0xE0030003u) == 0u)
+            type = 0;  // increasing
+        else if ((hdr & 0xE0030003u) == 0x40000000u)
+            type = 4;  // non-increasing
+        else
+            continue;  // unknown, skip
+
+        {
             uint method     = hdr & 0x1FFCu;
             uint subchannel = (hdr >> 13) & 0x7;
             uint count      = (hdr >> 18) & 0x7FFu;
 
             for (uint i = 0; i < count && consumed < max_dwords; i++) {
-                if (get + 4 > XBOX_RAM_SIZE) { get = put; break; }
+                uint dphys = dma_base + get;
+                if (dphys + 4 > XBOX_RAM_SIZE) { get = put; break; }
 
-                uint data_val = ram_read(get);
+                uint data_val = ram_read(dphys);
                 get += 4;
                 consumed++;
 
