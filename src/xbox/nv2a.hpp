@@ -340,7 +340,8 @@ struct Nv2aState {
     // ---------------------------------------------------------------
     // PFIFO DMA pusher
     // ---------------------------------------------------------------
-    static constexpr uint32_t MAX_DWORDS_PER_TICK = 128;
+    // Budget per tick — generous since we only advance GET, no method dispatch.
+    static constexpr uint32_t MAX_DWORDS_PER_TICK = 4096;
 
     // Resolve the DMA context object from PRAMIN to get the push buffer
     // physical base address.  DMA_GET/DMA_PUT are byte offsets relative
@@ -428,39 +429,21 @@ struct Nv2aState {
                 continue;
             }
 
-            // Method commands.
+            // Method commands — skip data dwords (method dispatch is handled
+            // by the GPU compute shader; CPU only advances GET).
             // Increasing: (hdr & 0xE0030003) == 0
             // Non-increasing: (hdr & 0xE0030003) == 0x40000000
-            uint32_t type;
-            if ((hdr & 0xE0030003u) == 0)
-                type = 0;  // increasing
-            else if ((hdr & 0xE0030003u) == 0x40000000u)
-                type = 4;  // non-increasing
-            else
-                continue;  // unknown command, skip
-
-            {
-                uint32_t method     = (hdr >>  0) & 0x1FFC;
-                uint32_t subchannel = (hdr >> 13) & 0x7;
-                uint32_t count      = (hdr >> 18) & 0x7FF;
-
-                for (uint32_t i = 0; i < count && consumed < MAX_DWORDS_PER_TICK; ++i) {
-                    uint32_t dphys = dma_base + get;
-                    if (dphys + 4 > ram_size_bytes) goto done;
-
-                    uint32_t data;
-                    memcpy(&data, ram + dphys, 4);
-                    get += 4;
-                    consumed++;
-
-                    uint32_t m = (type == 0) ? (method + i * 4) : method;
-                    if (method_handler)
-                        method_handler(method_user, subchannel, m, data);
-                    diag_methods++;
-                }
+            uint32_t masked = hdr & 0xE0030003u;
+            if (masked == 0 || masked == 0x40000000u) {
+                uint32_t count = (hdr >> 18) & 0x7FF;
+                uint32_t skip  = count * 4;
+                if (dma_base + get + skip > ram_size_bytes) break;
+                get += skip;
+                consumed += count;
+                diag_methods += count;
             }
+            // else: unknown command, skip header only
         }
-done:
         diag_dwords += consumed;
         dma_get = get;
         if (get == put)

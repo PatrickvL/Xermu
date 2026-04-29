@@ -913,9 +913,8 @@ int main(int argc, char** argv) {
                     (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
                     nv.pcrtc_regs[xbox::pcrtc::START / 4],
                     nv.resolve_dma_base());
-                // Sync CPU-side PGRAPH state so scanout shader can read surface format/pitch.
-                app.nv2a_renderer.sync_pgraph(app.sys.hw->pgraph.regs,
-                                              xbox::PgraphState::REG_COUNT);
+                // Note: PGRAPH state is maintained by the GPU compute shader.
+                // No sync_pgraph() — the shader is the sole method dispatcher.
             }
             app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
             app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
