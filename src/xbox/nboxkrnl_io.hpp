@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 
 #include "cpu/executor.hpp"
+#include "xbox/hle/xbe_loader.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -223,6 +224,12 @@ struct IoSystem {
     // HDD base directory (e.g. "data/hdd/").
     std::string hdd_dir;
 
+    // XBE metadata — extracted from the I/O read buffer when the kernel
+    // reads the first page of an XBE.  Written by worker, read by main thread.
+    std::string          xbe_title;             // software title (UTF-8)
+    uint32_t             xbe_title_id = 0;
+    std::atomic<bool>    xbe_title_ready{false}; // true once title is extracted
+
     // Per-device handle maps: device → (handle → FileInfo).
     std::map<uint32_t, std::unique_ptr<FileInfo>> handle_map[NUM_OF_DEVS];
 
@@ -265,6 +272,48 @@ struct IoSystem {
             pending_flag.notify_one();
             queue_mtx.unlock();
             worker_thread.join();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XBE title extraction — called when the kernel reads the first page
+    // of an XBE file.  The certificate (containing the title) is in the
+    // header area, so it's captured directly from the I/O read buffer
+    // without touching guest RAM or page tables.
+    // -----------------------------------------------------------------------
+
+    void extract_xbe_title_from_buffer(const uint8_t* data, size_t len,
+                                       const std::string& path) {
+        if (len < 0x178) return;
+
+        // Validate XBE magic "XBEH".
+        uint32_t magic;
+        memcpy(&magic, data, 4);
+        if (magic != 0x48454258u) return;
+
+        // certificate_addr is a VA.  Compute offset relative to base.
+        uint32_t base_addr, cert_addr;
+        memcpy(&base_addr, data + 0x104, 4);
+        memcpy(&cert_addr, data + 0x118, 4);
+        uint32_t cert_off = cert_addr - base_addr;
+
+        // Ensure the certificate (at least through title_name) fits in buffer.
+        if (cert_off + 0x0C + 80 > len) return;
+
+        // Read title_id at cert + 0x08.
+        memcpy(&xbe_title_id, data + cert_off + 0x08, 4);
+
+        // Read wsTitleName at cert + 0x0C (40 UCS-2 code units).
+        uint16_t wname[40];
+        memcpy(wname, data + cert_off + 0x0C, 80);
+
+        std::string title = xbe::ucs2_to_utf8(wname, 40);
+
+        if (!title.empty()) {
+            xbe_title = std::move(title);
+            xbe_title_ready.store(true, std::memory_order_release);
+            fprintf(stderr, "[io] XBE \"%s\": title=\"%s\" (ID: %08X)\n",
+                    path.c_str(), xbe_title.c_str(), xbe_title_id);
         }
     }
 
@@ -718,12 +767,14 @@ private:
         std::fstream* fs = &it->second->fs;
 
         switch (io_type) {
-        case REQ_CLOSE:
+        case REQ_CLOSE: {
+            std::string path = it->second->relative_path;
             fprintf(stderr, "[io] closed handle=0x%08X path=%s\n",
-                    req->handle, it->second->relative_path.c_str());
+                    req->handle, path.c_str());
             handle_map[dev].erase(it);
             req->info.header.status = STATUS_SUCCESS;
             break;
+        }
 
         case REQ_READ: {
             req->info.header.status = STATUS_IO_DEVICE_ERROR;
@@ -743,6 +794,17 @@ private:
                         (unsigned)fs->gcount(), req->address);
                 // Actual size to transfer back may be less than requested.
                 req->size = static_cast<uint32_t>(fs->gcount());
+
+                // Intercept the first page read of an XBE from the DVD
+                // device to transparently extract the software title from
+                // the certificate — invisible to guest code.
+                if (dev == DEV_CDROM && req->offset == 0 && fs->gcount() >= 0x178
+                    && !xbe_title_ready.load(std::memory_order_relaxed)) {
+                    extract_xbe_title_from_buffer(
+                        reinterpret_cast<const uint8_t*>(req->buffer.get()),
+                        static_cast<size_t>(fs->gcount()),
+                        it->second->relative_path);
+                }
             } else {
                 fprintf(stderr, "[io] read failed handle=0x%08X offset=%lld size=%u\n",
                         req->handle, (long long)req->offset, req->size);

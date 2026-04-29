@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -68,6 +69,22 @@ struct SectionHeader {
     uint8_t  section_digest[20];        // 0x24: SHA-1 hash
 };
 
+struct Certificate {
+    uint32_t size;                      // 0x00: struct size
+    uint32_t timedate;                  // 0x04: UNIX timestamp
+    uint32_t title_id;                  // 0x08: title ID
+    uint16_t title_name[40];            // 0x0C: wide-char title (null-terminated)
+    uint8_t  alt_title_ids[64];         // 0x5C: alternate title IDs
+    uint32_t allowed_media;             // 0x9C: allowed media types
+    uint32_t game_region;               // 0xA0: game region
+    uint32_t game_ratings;              // 0xA4: game ratings
+    uint32_t disk_number;               // 0xA8: disk number
+    uint32_t version;                   // 0xAC: version
+    uint8_t  lan_key[16];               // 0xB0: LAN key
+    uint8_t  signature_key[16];         // 0xC0: signature key
+    uint8_t  alt_signature_keys[256];   // 0xD0: alternate signature keys
+};
+
 struct TlsDirectory {
     uint32_t raw_data_start;
     uint32_t raw_data_end;
@@ -80,6 +97,25 @@ struct TlsDirectory {
 #pragma pack(pop)
 
 static constexpr uint32_t XBE_MAGIC = 0x48454258u; // "XBEH"
+
+// Convert a UCS-2 (little-endian) string to UTF-8.
+inline std::string ucs2_to_utf8(const uint16_t* src, size_t max_chars) {
+    std::string out;
+    for (size_t i = 0; i < max_chars && src[i]; ++i) {
+        uint16_t ch = src[i];
+        if (ch < 0x80) {
+            out += (char)ch;
+        } else if (ch < 0x800) {
+            out += (char)(0xC0 | (ch >> 6));
+            out += (char)(0x80 | (ch & 0x3F));
+        } else {
+            out += (char)(0xE0 | (ch >> 12));
+            out += (char)(0x80 | ((ch >> 6) & 0x3F));
+            out += (char)(0x80 | (ch & 0x3F));
+        }
+    }
+    return out;
+}
 
 // XOR keys for entry point / kernel thunk decoding
 static constexpr uint32_t XOR_EP_DEBUG  = 0x94859D4Bu;
@@ -224,6 +260,7 @@ struct XbeInfo {
     uint32_t hle_stub_base;     // where HLE stubs were placed
     uint32_t kdata_base;        // where kernel data exports were placed
     bool     valid;
+    std::string title;          // software title from certificate (UTF-8)
 };
 
 // Decode an XOR-encoded value. Try retail key first, fall back to debug.
@@ -277,6 +314,15 @@ inline XbeInfo load_xbe(uint8_t* ram, const uint8_t* file_data, size_t file_size
     info.stack_size    = hdr->stack_size;
     info.num_sections  = hdr->num_sections;
     info.tls_addr      = hdr->tls_addr;
+
+    // Extract title from certificate (if present)
+    if (hdr->certificate_addr) {
+        uint32_t cert_off = hdr->certificate_addr - base;
+        if (cert_off + sizeof(Certificate) <= file_size) {
+            const auto* cert = reinterpret_cast<const Certificate*>(file_data + cert_off);
+            info.title = ucs2_to_utf8(cert->title_name, 40);
+        }
+    }
 
     printf("[xbe] EntryPoint=0x%08X  KernelThunk=0x%08X  TLS=0x%08X\n",
            info.entry_point, info.kernel_thunk_va, info.tls_addr);
@@ -389,6 +435,30 @@ inline XbeInfo load_xbe(uint8_t* ram, const uint8_t* file_data, size_t file_size
 
     info.valid = true;
     return info;
+}
+
+// Read just the software title from an XBE file on disk.
+// Useful when load_xbe isn't called (e.g. nboxkrnl mode).
+inline std::string read_xbe_title(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return {};
+
+    ImageHeader hdr;
+    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) || hdr.magic != XBE_MAGIC) {
+        fclose(f);
+        return {};
+    }
+
+    if (!hdr.certificate_addr) { fclose(f); return {}; }
+
+    uint32_t cert_off = hdr.certificate_addr - hdr.base_address;
+    if (fseek(f, (long)cert_off, SEEK_SET) != 0) { fclose(f); return {}; }
+
+    Certificate cert;
+    if (fread(&cert, 1, sizeof(cert), f) != sizeof(cert)) { fclose(f); return {}; }
+    fclose(f);
+
+    return ucs2_to_utf8(cert.title_name, 40);
 }
 
 

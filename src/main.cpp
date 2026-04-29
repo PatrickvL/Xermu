@@ -761,6 +761,23 @@ int main(int argc, char** argv) {
 
         auto log_fn = [&](const char* msg) { app.log(msg); };
 
+        // Update window title with XBE software title after boot.
+        // In nboxkrnl mode the title arrives later (via I/O read interception),
+        // so the main loop also polls for it until the title is set.
+        auto update_title = [&]() {
+            std::string title;
+            // Prefer runtime-extracted title from I/O read buffer interception.
+            if (app.nbox.io.xbe_title_ready.load(std::memory_order_acquire))
+                title = app.nbox.io.xbe_title;
+            else if (!app.sys.xbe_info.title.empty())
+                title = app.sys.xbe_info.title;
+            else if (!app.cfg.xbe_path.empty())
+                title = xbe::read_xbe_title(app.cfg.xbe_path);
+            if (title.empty()) return;
+            std::string caption = "Xermu \xe2\x80\x94 " + title;
+            SDL_SetWindowTitle(window, caption.c_str());
+        };
+
         if (explicit_mode) {
             // Explicit mode flags — use the specific boot method requested
             if (!cli_bios.empty()) {
@@ -769,6 +786,7 @@ int main(int argc, char** argv) {
                 if (xbox::boot_lle(app.sys, app.cfg, log_fn)) {
                     app.boot_mode = xbox::BootMode::Lle;
                     app.start_emu();
+                    update_title();
                 } else {
                     app.log("[ui] LLE BIOS boot failed");
                 }
@@ -779,6 +797,7 @@ int main(int argc, char** argv) {
                 if (xbox::boot_nboxkrnl_system(app.sys, app.cfg, app.nbox, log_fn)) {
                     app.boot_mode = xbox::BootMode::Nboxkrnl;
                     app.start_emu();
+                    update_title();
                 } else {
                     app.log("[ui] nboxkrnl boot failed");
                 }
@@ -788,6 +807,7 @@ int main(int argc, char** argv) {
                 if (xbox::boot_lle_kernel(app.sys, app.cfg, log_fn)) {
                     app.boot_mode = xbox::BootMode::LleKernel;
                     app.start_emu();
+                    update_title();
                 } else {
                     app.log("[ui] LLE-kernel boot failed");
                 }
@@ -797,6 +817,7 @@ int main(int argc, char** argv) {
             app.boot_mode = xbox::auto_boot(app.sys, app.cfg, app.nbox, log_fn);
             if (app.boot_mode != xbox::BootMode::None) {
                 app.start_emu();
+                update_title();
             }
             // If nothing found, stay in Menu state (user can pick a file)
         }
@@ -804,6 +825,7 @@ int main(int argc, char** argv) {
 
     // Main loop
     bool quit = false;
+    std::string last_window_title;
     while (!quit) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -862,6 +884,15 @@ int main(int argc, char** argv) {
             snprintf(msg, sizeof(msg), "[emu] Halted: EIP=0x%08X EAX=0x%08X",
                      app.emu_thread.halt_eip(), app.emu_thread.halt_eax());
             app.log(msg);
+        }
+
+        // Update window title when runtime XBE metadata arrives (I/O read interception).
+        if (app.state == AppState::Running
+            && app.nbox.io.xbe_title_ready.load(std::memory_order_acquire)
+            && last_window_title != app.nbox.io.xbe_title) {
+            last_window_title = app.nbox.io.xbe_title;
+            std::string caption = "Xermu \xe2\x80\x94 " + last_window_title;
+            SDL_SetWindowTitle(window, caption.c_str());
         }
 
         // Render ImGui frame
