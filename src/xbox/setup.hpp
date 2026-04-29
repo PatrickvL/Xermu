@@ -57,13 +57,12 @@ static void hw_tick_callback(void* user) {
         hw->pic.raise_irq(8);
     }
 
-    // Process NV2A PFIFO push buffer commands so DMA_GET advances.
-    if (hw->ram)
-        hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
+    // NV2A PFIFO is drained by the dedicated Nv2aThread; no tick_fifo here.
 
     // Increment KeTickCount approximately every ~1ms.
-    // Each tick callback fires once per trace; ~1000 traces ≈ 1ms.
-    if (hw->ram && ++hw->tick_accum >= 1000) {
+    // Each tick callback fires once per tick_period instructions (1024).
+    // ~733 MHz / 1024 ≈ 716K ticks/s → 716 ticks per ms.
+    if (hw->ram && ++hw->tick_accum >= 716) {
         hw->tick_accum = 0;
         // KDATA_BASE (0x81000) + offset 0 = KeTickCount
         constexpr uint32_t KE_TICK_ADDR = 0x81000;
@@ -153,7 +152,7 @@ inline XboxHardware* xbox_setup(Executor& exec) {
 
     exec.tick_fn     = hw_tick_callback;
     exec.tick_user   = hw;
-    exec.tick_period = 128;
+    exec.tick_period = 1024;
 
     exec.register_io(0x61, sysctl_read, sysctl_write, &hw->misc);
     exec.register_io(0x80, post_code_read, post_code_write, &hw->misc);

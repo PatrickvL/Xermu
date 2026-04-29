@@ -81,7 +81,7 @@ private:
     void run() {
         // Steps per iteration.  Large enough for meaningful progress,
         // small enough that pause/stop respond promptly.
-        constexpr uint32_t STEPS_PER_ITER = 2'000'000;
+        constexpr uint32_t STEPS_PER_ITER = 4'000'000;
 
         while (!stop_flag.load(std::memory_order_acquire)) {
             // Handle pause.

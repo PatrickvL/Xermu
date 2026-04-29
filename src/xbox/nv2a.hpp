@@ -205,7 +205,7 @@ struct Nv2aState {
 
     // PTIMER: 56-bit freerunning nanosecond counter (not a flat register).
     uint64_t ptimer_ns = 0;
-    static constexpr uint64_t NS_PER_TICK = 100;
+    static constexpr uint64_t NS_PER_TICK = 800;  // ~800ns per tick at tick_period=1024
 
     // PBUS PCI config space mirror (offsets 0x800-0x8FF within PBUS block).
     // On real NV2A, PBUS[0x800+reg] mirrors the GPU's own PCI config space.
@@ -217,7 +217,7 @@ struct Nv2aState {
 
     // PCRTC vblank
     uint32_t vblank_counter = 0;
-    static constexpr uint32_t VBLANK_PERIOD = 130;  // ticks between vblanks (~60Hz at tick_period=128)
+    static constexpr uint32_t VBLANK_PERIOD = 16;  // ticks between vblanks (~60Hz at tick_period=1024)
 
     // GPU method handler — called for each (subchannel, method, data) tuple.
     using MethodHandler = void(*)(void* user, uint32_t subchannel,
