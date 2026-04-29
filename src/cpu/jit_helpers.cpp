@@ -192,6 +192,10 @@ static inline void guest_write(GuestContext* ctx, uint32_t addr, uint32_t val, u
 // ---------------------------------------------------------------------------
 
 void pushfd_helper(GuestContext* ctx, uint32_t eflags_val) {
+    // Merge guest virtual_if into the host EFLAGS value so that the
+    // correct IF bit is saved on the guest stack (the host always runs
+    // with IF=1 in user-mode, which doesn't reflect the guest state).
+    eflags_val = (eflags_val & ~0x200u) | (ctx->virtual_if ? 0x200u : 0u);
     uint32_t esp = ctx->gp[GP_ESP] - 4;
     ctx->gp[GP_ESP] = esp;
     uint32_t pa = guest_translate(ctx, esp, true);
@@ -209,7 +213,10 @@ uint32_t popfd_helper(GuestContext* ctx) {
     if (pa == ~0u) return 0;  // fault
     if (pa < GUEST_RAM_SIZE) {
         auto* base = reinterpret_cast<uint8_t*>(ctx->fastmem_base);
-        uint32_t v; memcpy(&v, base + pa, 4); return v;
+        uint32_t v; memcpy(&v, base + pa, 4);
+        // Restore guest virtual_if from the IF bit in the popped EFLAGS.
+        ctx->virtual_if = (v & 0x200u) != 0;
+        return v;
     }
     return 0;
 }
