@@ -225,6 +225,31 @@ void handle_method(uint method, uint data_val) {
 
     // Special methods
     switch (method) {
+    case NV097_SET_SURFACE_COLOR_OFFSET:
+        // Update the PCRTC_START used by scanout with the new framebuffer address.
+        // On Xbox, Present() flips by setting the surface color offset.
+        // Validate: must be 64-byte aligned to reject garbage from parsing noise.
+        if ((data_val & 0x3Fu) == 0u && data_val < XBOX_RAM_SIZE)
+            gpu.data[CTL_PCRTC_START] = data_val;
+        pg_write(method, data_val);
+        return;
+
+    case NV097_SET_SURFACE_PITCH:
+        // bits [15:0] = color pitch, [31:16] = zeta pitch
+        gpu.data[PFIFO_CTL_DW + 12] = data_val & 0xFFFFu;  // display_pitch
+        pg_write(method, data_val);
+        return;
+
+    case NV097_SET_SURFACE_FORMAT: {
+        // bits [15:12] = color format: 0x5=X1R5G5B5, 0x7=R5G6B5, 0xA=X8R8G8B8, 0xC=A8R8G8B8
+        uint color_fmt = (data_val >> 12) & 0xF;
+        uint bpp = 4;
+        if (color_fmt == 0x5 || color_fmt == 0x7) bpp = 2;
+        gpu.data[PFIFO_CTL_DW + 13] = bpp;  // display_bpp
+        pg_write(method, data_val);
+        return;
+    }
+
     case NV097_SET_TRANSFORM_PROGRAM_LOAD:
         vs_program_write_pos = data_val * 4;
         pg_write(method, data_val);
@@ -261,14 +286,66 @@ void handle_method(uint method, uint data_val) {
         return;
     }
 
-    case NV097_CLEAR_SURFACE:
+    case NV097_CLEAR_SURFACE: {
         pg_write(method, data_val);
-        // Emit a fullscreen draw with clear flag.
-        // The clear color/depth values are already in PGRAPH state;
-        // the draw pipeline reads them from the per-draw snapshot.
-        // Use primitive_mode = 0xFFFF as a sentinel for "clear operation".
-        emit_draw(3, 0xFFFF);
+        // Debug: increment clear counter (pad[0] in control block)
+        gpu.data[PFIFO_CTL_DW + 14] = gpu.data[PFIFO_CTL_DW + 14] + 1u;
+        // Directly fill the framebuffer in Xbox RAM with the clear color.
+        uint clear_color = pg_read(0x1D90);  // NV097_SET_COLOR_CLEAR_VALUE
+        uint fb_offset   = pg_read(NV097_SET_SURFACE_COLOR_OFFSET);
+        uint surf_pitch  = pg_read(NV097_SET_SURFACE_PITCH) & 0xFFFFu;
+        uint surf_fmt    = (pg_read(NV097_SET_SURFACE_FORMAT) >> 12) & 0xF;
+        uint clip_h      = pg_read(0x0200);  // SET_SURFACE_CLIP_HORIZONTAL
+        uint clip_v      = pg_read(0x0204);  // SET_SURFACE_CLIP_VERTICAL
+        uint clip_x      = clip_h & 0xFFFFu;
+        uint clip_w      = (clip_h >> 16) & 0xFFFFu;
+        uint clip_y      = clip_v & 0xFFFFu;
+        uint clip_h_val  = (clip_v >> 16) & 0xFFFFu;
+        if (clip_w == 0) clip_w = 640;
+        if (clip_h_val == 0) clip_h_val = 480;
+        if (surf_pitch == 0) surf_pitch = clip_w * 4;
+        // Store debug info: clear_color at pad[1]
+        gpu.data[PFIFO_CTL_DW + 15] = clear_color;
+
+        // Only clear color buffer if bit 4 (F flag) or bits 0-3 are set
+        if ((data_val & 0xF0) != 0) {
+            // Determine bytes per pixel from surface format
+            uint bpp = 4;
+            if (surf_fmt == 0x5 || surf_fmt == 0x7) bpp = 2;
+
+            // Fill framebuffer region with clear color
+            // Limit to prevent excessive work (max 640x480)
+            uint max_w = min(clip_w, 1024u);
+            uint max_h = min(clip_h_val, 1024u);
+            for (uint y = clip_y; y < clip_y + max_h; y++) {
+                uint row_byte = fb_offset + y * surf_pitch + clip_x * bpp;
+                if (bpp == 4) {
+                    for (uint x = 0; x < max_w; x++) {
+                        uint addr = row_byte + x * 4;
+                        if (addr + 4 <= XBOX_RAM_SIZE)
+                            gpu.data[XBOX_RAM_DW + addr / 4] = clear_color;
+                    }
+                } else {
+                    // 16bpp: pack clear color to R5G6B5
+                    uint r5 = (clear_color >> 19) & 0x1F;
+                    uint g6 = (clear_color >> 10) & 0x3F;
+                    uint b5 = (clear_color >>  3) & 0x1F;
+                    uint pixel16 = (r5 << 11) | (g6 << 5) | b5;
+                    uint packed = pixel16 | (pixel16 << 16);
+                    for (uint x = 0; x < max_w; x += 2) {
+                        uint addr = row_byte + x * 2;
+                        if (addr + 4 <= XBOX_RAM_SIZE)
+                            gpu.data[XBOX_RAM_DW + addr / 4] = packed;
+                    }
+                }
+            }
+        }
+        // Also update PCRTC_START if it's still 0 and we have a valid fb_offset
+        if (gpu.data[CTL_PCRTC_START] == 0 && fb_offset != 0 &&
+            (fb_offset & 0x3Fu) == 0 && fb_offset < XBOX_RAM_SIZE)
+            gpu.data[CTL_PCRTC_START] = fb_offset;
         return;
+    }
 
     default:
         break;
@@ -290,6 +367,10 @@ void main() {
 
     uint dma_base = gpu.data[CTL_DMA_BASE];
 
+    // Debug: write invocation marker to PGRAPH state[0] unconditionally.
+    // Value is frame_id + 0xDEAD0000 so CPU can verify shader runs.
+    gpu.data[PGRAPH_STATE_DW] = 0xDEAD0000u + frame_id;
+
     // Restore VS upload positions from PGRAPH state.
     vs_program_write_pos = pg_read(NV097_SET_TRANSFORM_PROGRAM_LOAD) * 4;
     vs_const_write_pos   = pg_read(NV097_SET_TRANSFORM_CONSTANT_LOAD) * 4;
@@ -306,15 +387,14 @@ void main() {
 
         if (hdr == 0) continue;  // NOP
 
-        // JUMP/CALL/RETURN: disabled during initial sequential parsing.
-        // On Xbox, GET starts at 0 with DMA_base=0 (whole-RAM DMA context).
-        // Data between address 0 and the real push buffer is kernel/app data,
-        // not NV2A commands.  Random dwords matching JUMP bit patterns would
-        // corrupt GET, causing the parser to skip over real commands.
-        // Sequential parsing is safe: the method-type filter below rejects
-        // ~99% of random dwords, and the few that pass cause harmless
-        // PGRAPH writes that the real commands will overwrite.
-        if ((hdr & 3u) != 0u) continue;  // skip JUMP (01), CALL (10), misc (11)
+        // JUMP: bit[1:0] = 01. Target = hdr & 0xFFFFFFFC.
+        // Xbox D3D uses JUMP to wrap the circular push buffer.
+        if ((hdr & 3u) == 1u) {
+            get = hdr & 0xFFFFFFFCu;
+            continue;
+        }
+        // CALL/RETURN and other types: skip.
+        if ((hdr & 3u) != 0u) continue;
 
         // Method command detection (matching xemu/NV2A hardware):
         // Increasing: (hdr & 0xE0030003) == 0
