@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -340,7 +341,10 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
 
 #ifdef _WIN32
     auto& apis = win10_mem_apis();
-    if (!apis.available) return w;
+    if (!apis.available) {
+        fprintf(stderr, "[mem] 4GB: Win10 memory APIs not available\n");
+        return w;
+    }
 
     // 1) Create section for RAM backing.
     LARGE_INTEGER section_sz;
@@ -348,13 +352,31 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
     w.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
                                    PAGE_READWRITE, section_sz.HighPart,
                                    section_sz.LowPart, nullptr);
-    if (!w.section) return w;
+    if (!w.section) {
+        fprintf(stderr, "[mem] 4GB: CreateFileMapping failed: %lu\n", GetLastError());
+        return w;
+    }
 
     // 2) Reserve 4 GB placeholder.
     w.base = apis.pVirtualAlloc2(nullptr, nullptr, WINDOW_4GB,
                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                  PAGE_NOACCESS, nullptr, 0);
     if (!w.base) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "[mem] 4GB placeholder VirtualAlloc2 failed: err=%lu\n", err);
+        // Probe largest free region to diagnose fragmentation
+        size_t largest_free = 0;
+        uintptr_t addr = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        while (VirtualQuery((void*)addr, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_FREE && mbi.RegionSize > largest_free)
+                largest_free = mbi.RegionSize;
+            uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (next <= addr) break;  // overflow
+            addr = next;
+        }
+        fprintf(stderr, "[mem] largest free VA region: %zu MB (need 4096 MB)\n",
+                largest_free / (1024*1024));
         CloseHandle(w.section);
         w.section = nullptr;
         return w;
@@ -362,7 +384,8 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
 
     auto base8 = static_cast<uint8_t*>(w.base);
 
-    auto fail = [&]() {
+    auto fail = [&](const char* step) {
+        fprintf(stderr, "[mem] 4GB: failed at step '%s', err=%lu\n", step, GetLastError());
         VirtualFree(w.base, 0, MEM_RELEASE);
         CloseHandle(w.section);
         w.base = nullptr;
@@ -371,19 +394,19 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
 
     // 3) Split off [0, backing_size) from the placeholder.
     if (!VirtualFree(w.base, backing_size,
-                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail(); return w; }
+                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail("split[0,RAM)"); return w; }
 
     // 4) Split [backing_size, MIRROR_BASE) from the remaining placeholder.
     if (!VirtualFree(base8 + GAP_BASE, GAP_SIZE,
-                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail(); return w; }
+                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail("split[RAM,MIRROR)"); return w; }
 
     // 5) Split [MIRROR_BASE, MIRROR_BASE+64M) from the remaining placeholder.
     if (!VirtualFree(base8 + MIRROR_BASE, MIRROR_WRAP,
-                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail(); return w; }
+                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail("split[MIRROR,+64M)"); return w; }
 
     // 6) Split [MIRROR_BASE+64M, USED_END) from the remaining placeholder.
     if (!VirtualFree(base8 + MIRROR_BASE + MIRROR_WRAP, MIRROR_WRAP,
-                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail(); return w; }
+                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { fail("split[MIRROR+64M,END)"); return w; }
 
     // Now we have 5 regions:
     //   [0, backing_size) = free → map RAM
@@ -397,20 +420,20 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
                                     base8, 0, backing_size,
                                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                     nullptr, 0);
-    if (!v0) { fail(); return w; }
+    if (!v0) { fail("MapView RAM"); return w; }
 
     // 8) Commit gap [backing_size, MIRROR_BASE).
     void* vg = apis.pVirtualAlloc2(nullptr, base8 + GAP_BASE, GAP_SIZE,
                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
                                    nullptr, 0);
-    if (!vg) { fail(); return w; }
+    if (!vg) { fail("commit gap"); return w; }
 
     // 9) Map mirror #1 at [MIRROR_BASE, MIRROR_BASE+64M).
     void* v1 = apis.pMapViewOfFile3(w.section, nullptr,
                                     base8 + MIRROR_BASE, 0, MIRROR_WRAP,
                                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                     nullptr, 0);
-    if (!v1) { fail(); return w; }
+    if (!v1) { fail("MapView mirror1"); return w; }
 
     // 10) Map mirror #2 at [MIRROR_BASE+64M, USED_END).
     void* v2 = apis.pMapViewOfFile3(w.section, nullptr,
@@ -418,7 +441,7 @@ inline AliasedWindow alloc_4gb_window(size_t backing_size) {
                                     0, MIRROR_WRAP,
                                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                     nullptr, 0);
-    if (!v2) { fail(); return w; }
+    if (!v2) { fail("MapView mirror2"); return w; }
 
     // [USED_END, 4GB) stays as placeholder → PAGE_NOACCESS
     // MMIO pages will be committed on demand via commit_mmio_page().
