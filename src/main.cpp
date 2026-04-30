@@ -938,16 +938,106 @@ int main(int argc, char** argv) {
             if (app.sys.hw) {
                 auto& nv = app.sys.hw->nv2a;
                 // Derive display info from PCRTC_CONFIG (bits [1:0] = bpp: 1=8,2=16,3=32).
+                // Bits [31:16] = pitch (if set by AvSetDisplayMode).
                 uint32_t pcrtc_cfg = nv.pcrtc_regs[xbox::pcrtc::CONFIG / 4];
                 uint32_t bpp_sel = pcrtc_cfg & 3;
                 uint32_t disp_bpp = (bpp_sel == 3) ? 4 : (bpp_sel == 2) ? 2 : (bpp_sel == 1) ? 1 : 4;
                 uint32_t disp_w = 640, disp_h = 480;
-                uint32_t disp_pitch = disp_w * disp_bpp;
+                uint32_t encoded_pitch = pcrtc_cfg >> 16;
+                uint32_t disp_pitch = encoded_pitch ? encoded_pitch : (disp_w * disp_bpp);
+                uint32_t push_en = 
+                    (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u;
+                static uint32_t last_put = 0;
+                uint32_t cur_put = nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUT / 4];
+                if (cur_put != last_put && cur_put != 0) {
+                    uint32_t dma_base = nv.resolve_dma_base();
+                    uint32_t inst_reg = nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_INSTANCE / 4];
+                    fprintf(stderr, "[diag] PUT changed: 0x%X->0x%X push_en=%u PUSH0=0x%X GET=0x%X dma_base=0x%X inst=0x%X\n",
+                        last_put, cur_put, push_en,
+                        nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4],
+                        nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4],
+                        dma_base, inst_reg);
+                    // Read the DMA context object to see what's there
+                    {
+                        uint32_t inst_addr = (inst_reg & 0xFFFF) << 4;
+                        uint32_t flags=0, limit=0, frame=0;
+                        if (nv.pramin_ram && inst_addr + 12 <= nv.pramin_ram_size)  {
+                            memcpy(&flags, nv.pramin_ram + nv.pramin_ram_base + inst_addr, 4);
+                            memcpy(&limit, nv.pramin_ram + nv.pramin_ram_base + inst_addr + 4, 4);
+                            memcpy(&frame, nv.pramin_ram + nv.pramin_ram_base + inst_addr + 8, 4);
+                        }
+                        if (flags == 0 && frame == 0 && inst_addr + 12 <= xbox::Nv2aState::PRAMIN_SIZE) {
+                            memcpy(&flags, nv.pramin + inst_addr, 4);
+                            memcpy(&limit, nv.pramin + inst_addr + 4, 4);
+                            memcpy(&frame, nv.pramin + inst_addr + 8, 4);
+                        }
+                        fprintf(stderr, "[diag] DMA obj @ inst_addr=0x%X: flags=0x%X limit=0x%X frame=0x%X\n",
+                            inst_addr, flags, limit, frame);
+                    }
+                    // Dump first 8 dwords of push buffer from exec RAM
+                    if (app.sys.exec && app.sys.exec->ram) {
+                        const uint8_t* ram = app.sys.exec->ram;
+                        uint32_t dma_b = nv.resolve_dma_base();
+                        uint32_t pb_start = dma_b;
+                        fprintf(stderr, "[diag] exec.ram[0x%X..]: ", pb_start);
+                        for (int i = 0; i < 8 && pb_start + i*4 + 4 <= GUEST_RAM_SIZE; i++) {
+                            uint32_t w; memcpy(&w, ram + pb_start + i*4, 4);
+                            fprintf(stderr, "%08X ", w);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    // Scan the pending range [GET, PUT] for surface setup commands
+                    if (app.sys.exec && app.sys.exec->ram) {
+                        const uint8_t* ram = app.sys.exec->ram;
+                        uint32_t initial_get = nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4];
+                        uint32_t scan_start = initial_get;
+                        uint32_t scan_end   = cur_put;
+                        uint32_t ram_limit  = GUEST_RAM_SIZE - dma_base;
+                        if (scan_end > ram_limit) scan_end = ram_limit;
+                        fprintf(stderr, "[diag] Scanning PB [GET=0x%X, PUT=0x%X) for surface cmds (dma_base=0x%X)\n",
+                            scan_start, scan_end, dma_base);
+                        int found = 0;
+                        // Also look for JUMPs and the first non-zero dword
+                        uint32_t first_nonzero_off = 0xFFFFFFFF;
+                        int jump_count = 0;
+                        for (uint32_t pos = scan_start; pos < scan_end && found < 10; pos += 4) {
+                            uint32_t phys = dma_base + pos;
+                            if (phys + 4 > GUEST_RAM_SIZE) break;
+                            uint32_t hdr; memcpy(&hdr, ram + phys, 4);
+                            if (hdr == 0) continue;
+                            if (first_nonzero_off == 0xFFFFFFFF) first_nonzero_off = pos;
+                            // Check for JUMP
+                            if ((hdr & 3u) == 1u) {
+                                if (jump_count < 3)
+                                    fprintf(stderr, "[diag] PB JUMP @ off=0x%X -> 0x%X\n", pos, hdr & 0xFFFFFFFCu);
+                                jump_count++;
+                                pos = (hdr & 0xFFFFFFFCu) - 4; // will be +4'd by loop
+                                continue;
+                            }
+                            if ((hdr & 3u) != 0u) continue; // skip CALL/RET
+                            uint32_t m = hdr & 0x1FFCu;
+                            uint32_t cnt = (hdr >> 18) & 0x7FFu;
+                            uint32_t type = hdr & 0xE0030003u;
+                            if ((type == 0u || type == 0x40000000u) && m >= 0x0200 && m <= 0x0220 && cnt >= 1 && cnt <= 16) {
+                                uint32_t data0 = 0;
+                                if (pos + 4 + dma_base < GUEST_RAM_SIZE) memcpy(&data0, ram + dma_base + pos + 4, 4);
+                                fprintf(stderr, "[diag] PB surface @ off=0x%X: hdr=0x%08X m=0x%X cnt=%u sub=%u data=0x%X\n",
+                                    pos, hdr, m, cnt, (hdr>>13)&7, data0);
+                                found++;
+                            }
+                            // Skip data dwords for this command
+                            if ((type == 0u || type == 0x40000000u) && cnt > 0 && cnt < 2048)
+                                pos += cnt * 4;
+                        }
+                        fprintf(stderr, "[diag] PB scan: first_nonzero=0x%X jumps=%d surface_cmds=%d\n",
+                            first_nonzero_off, jump_count, found);
+                    }
+                    last_put = cur_put;
+                }
                 app.nv2a_renderer.sync_pfifo(
                     nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUT / 4],
                     nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4],
-                    (nv.pfifo_regs[xbox::pfifo::CACHE1_DMA_PUSH / 4] & 1) &&
-                    (nv.pfifo_regs[xbox::pfifo::CACHE1_PUSH0 / 4] & 1) ? 1u : 0u,
+                    push_en,
                     nv.pcrtc_regs[xbox::pcrtc::START / 4],
                     nv.resolve_dma_base(),
                     disp_w, disp_h, disp_pitch, disp_bpp,
@@ -959,12 +1049,191 @@ int main(int argc, char** argv) {
             app.nv2a_renderer.dispatch_pushbuf_parse(vk.cmd_buffers[fi]);
             app.nv2a_renderer.execute_draws(vk.cmd_buffers[fi]);
 
+            // Barrier: compute shader writes → fragment shader reads (scanout).
+            {
+                VkMemoryBarrier bar = {};
+                bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vkCmdPipelineBarrier(vk.cmd_buffers[fi],
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    0, 1, &bar, 0, nullptr, 0, nullptr);
+            }
+
             // Feed back GPU compute shader's DMA_GET to the NV2A register file
             // so the guest sees FIFO progress (used for synchronization checks).
             if (app.sys.hw) {
                 auto* ctl = app.nv2a_renderer.mapped<xbox::PfifoControlBlock>(
                     xbox::GpuBufferLayout::PFIFO_CTL_OFFSET);
+
+                // Scan for SET_REFERENCE in the range the GPU shader just
+                // processed.  This keeps CACHE1_REF in sync so the guest CPU's
+                // fence polls succeed.  Lightweight: only reads dwords already
+                // in cache since the shader just touched them.
+                uint32_t old_get = app.sys.hw->nv2a.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4];
+                uint32_t new_get = ctl->dma_get;
+                if (new_get > old_get && app.sys.exec && app.sys.exec->ram) {
+                    uint32_t dma_base = app.sys.hw->nv2a.resolve_dma_base();
+                    const uint8_t* ram = app.sys.exec->ram;
+                    uint32_t ram_size = GUEST_RAM_SIZE;
+                    uint32_t pos = old_get;
+                    while (pos < new_get) {
+                        uint32_t phys = dma_base + pos;
+                        if (phys + 4 > ram_size) break;
+                        uint32_t hdr;
+                        memcpy(&hdr, ram + phys, 4);
+                        pos += 4;
+                        if (hdr == 0) continue;  // NOP
+                        // JUMP commands
+                        if ((hdr & 0xE0000003u) == 0x20000000u) { pos = hdr & 0x1FFFFFFFu; continue; }
+                        if ((hdr & 3) == 1) { pos = hdr & 0xFFFFFFFCu; continue; }
+                        if ((hdr & 3) == 2) { pos = hdr & 0xFFFFFFFCu; continue; }
+                        if (hdr == 0x00020000u) continue;  // RETURN
+                        // Method command
+                        uint32_t masked = hdr & 0xE0030003u;
+                        if (masked == 0 || masked == 0x40000000u) {
+                            uint32_t count  = (hdr >> 18) & 0x7FF;
+                            uint32_t method = (hdr >> 2) & 0x7FF;
+                            uint32_t subchan = (hdr >> 13) & 0x7;
+                            // SET_REFERENCE: method 0x0050 → method>>2 = 0x14
+                            if (method == 0x14 && count >= 1) {
+                                uint32_t ref_phys = dma_base + pos;
+                                if (ref_phys + 4 <= ram_size) {
+                                    uint32_t ref_val;
+                                    memcpy(&ref_val, ram + ref_phys, 4);
+                                    app.sys.hw->nv2a.pfifo_regs[xbox::pfifo::CACHE1_REF / 4] = ref_val;
+                                }
+                            }
+                            // SET_CONTEXT_DMA_NOTIFIES: method 0x0180 → method>>2 = 0x60
+                            // Track the notifier DMA context instance for this subchannel.
+                            static uint32_t notifier_dma_inst[8] = {};
+                            if (method == 0x60 && count >= 1) {
+                                uint32_t d_phys = dma_base + pos;
+                                if (d_phys + 4 <= ram_size) {
+                                    memcpy(&notifier_dma_inst[subchan], ram + d_phys, 4);
+                                }
+                            }
+                            // NOTIFY: method 0x0104 → method>>2 = 0x41
+                            // Write "completed" status to the notifier area in RAM.
+                            if (method == 0x41 && count >= 1) {
+                                uint32_t notify_type;
+                                uint32_t d_phys = dma_base + pos;
+                                if (d_phys + 4 <= ram_size) {
+                                    memcpy(&notify_type, ram + d_phys, 4);
+                                }
+                                // Resolve notifier DMA instance to physical address
+                                uint32_t inst = notifier_dma_inst[subchan];
+                                if (inst != 0) {
+                                    uint32_t inst_off = inst << 4;
+                                    uint32_t n_flags = 0, n_limit = 0, n_frame = 0;
+                                    auto& nv = app.sys.hw->nv2a;
+                                    if (nv.pramin_ram && inst_off + 12 <= nv.pramin_ram_size) {
+                                        memcpy(&n_flags, nv.pramin_ram + nv.pramin_ram_base + inst_off, 4);
+                                        memcpy(&n_limit, nv.pramin_ram + nv.pramin_ram_base + inst_off + 4, 4);
+                                        memcpy(&n_frame, nv.pramin_ram + nv.pramin_ram_base + inst_off + 8, 4);
+                                    }
+                                    uint32_t notif_base = (n_frame & 0xFFFFF000u) | ((n_flags >> 20) & 0xFFF);
+                                    notif_base &= 0x07FFFFFFu;
+                                    // Each notifier entry is 16 bytes. Write status=0 (completed).
+                                    // Entry index = notify_type (usually 0).
+                                    uint32_t entry_off = notif_base + notify_type * 16;
+                                    if (entry_off + 16 <= ram_size) {
+                                        // DW3 (offset +12) = status. 0 = completed.
+                                        uint32_t zero = 0;
+                                        memcpy(const_cast<uint8_t*>(ram) + entry_off + 12, &zero, 4);
+                                    }
+                                }
+                            }
+                            pos += count * 4;
+                        }
+                    }
+                }
+
                 app.sys.hw->nv2a.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4] = ctl->dma_get;
+                // Periodic diagnostic: log scanout state every 60 display frames
+                static uint32_t diag_frame = 0;
+                if (++diag_frame % 60 == 1) {
+                    // Read PGRAPH surface color offset from GPU buffer
+                    auto* pg = app.nv2a_renderer.mapped<uint32_t>(
+                        xbox::GpuBufferLayout::PGRAPH_STATE_OFFSET);
+                    uint32_t surf_color_off = pg[0x0210 / 4];
+                    uint32_t surf_pitch_reg = pg[0x020C / 4];
+                    uint32_t surf_fmt_reg = pg[0x0208 / 4];
+                    uint32_t clear_count = ctl->pad[0];
+                    uint32_t last_clear_color = ctl->pad[1];
+                    fprintf(stderr, "[diag] frame=%u pcrtc_start=0x%X put=0x%X get=0x%X push=%u base=0x%X bpp=%u pitch=%u surf_color=0x%X surf_pitch=0x%X surf_fmt=0x%X clears=%u clear_col=0x%X\n",
+                            diag_frame,
+                            ctl->pcrtc_start, ctl->dma_put, ctl->dma_get,
+                            ctl->push_enabled, ctl->dma_base,
+                            ctl->display_bpp, ctl->display_pitch,
+                            surf_color_off, surf_pitch_reg, surf_fmt_reg,
+                            clear_count, last_clear_color);
+                    // Dump PGRAPH state: marker at [0] + surface regs
+                    if (diag_frame <= 121) {
+                        fprintf(stderr, "[diag] PGRAPH[0]=0x%08X [0x82]=0x%08X [0x83]=0x%08X\n",
+                                pg[0], pg[0x82], pg[0x83]);
+                    }
+                }
+                // Capture scanout image once at frame 30 for visual debugging
+                static bool captured = false;
+                if (!captured && diag_frame == 30 && app.sys.exec && app.sys.exec->ram) {
+                    captured = true;
+                    uint32_t fb_start = ctl->pcrtc_start;
+                    uint32_t fb_w = ctl->display_width ? ctl->display_width : 640;
+                    uint32_t fb_h = ctl->display_height ? ctl->display_height : 480;
+                    uint32_t fb_pitch = ctl->display_pitch ? ctl->display_pitch : fb_w * 4;
+                    uint32_t fb_bpp = ctl->display_bpp ? ctl->display_bpp : 4;
+                    const uint8_t* ram = app.sys.exec->ram;
+                    // Write BMP file
+                    FILE* bmp = fopen("scanout_capture.bmp", "wb");
+                    if (bmp) {
+                        // BMP header (54 bytes)
+                        uint32_t row_bytes = fb_w * 3;
+                        uint32_t row_pad = (4 - (row_bytes % 4)) % 4;
+                        uint32_t img_size = (row_bytes + row_pad) * fb_h;
+                        uint32_t file_size = 54 + img_size;
+                        uint8_t hdr[54] = {};
+                        hdr[0] = 'B'; hdr[1] = 'M';
+                        memcpy(hdr + 2, &file_size, 4);
+                        uint32_t off = 54; memcpy(hdr + 10, &off, 4);
+                        uint32_t dib = 40; memcpy(hdr + 14, &dib, 4);
+                        int32_t w = (int32_t)fb_w; memcpy(hdr + 18, &w, 4);
+                        int32_t h = -(int32_t)fb_h; memcpy(hdr + 22, &h, 4); // top-down
+                        uint16_t planes = 1; memcpy(hdr + 26, &planes, 2);
+                        uint16_t bits = 24; memcpy(hdr + 28, &bits, 2);
+                        memcpy(hdr + 34, &img_size, 4);
+                        fwrite(hdr, 1, 54, bmp);
+                        for (uint32_t y = 0; y < fb_h; y++) {
+                            uint32_t src_off = fb_start + y * fb_pitch;
+                            for (uint32_t x = 0; x < fb_w; x++) {
+                                uint8_t bgr[3] = {0, 0, 0};
+                                if (fb_bpp == 4) {
+                                    uint32_t pa = src_off + x * 4;
+                                    if (pa + 4 <= GUEST_RAM_SIZE) {
+                                        bgr[0] = ram[pa + 0]; // B
+                                        bgr[1] = ram[pa + 1]; // G
+                                        bgr[2] = ram[pa + 2]; // R
+                                    }
+                                } else if (fb_bpp == 2) {
+                                    uint32_t pa = src_off + x * 2;
+                                    if (pa + 2 <= GUEST_RAM_SIZE) {
+                                        uint16_t p; memcpy(&p, ram + pa, 2);
+                                        bgr[2] = (uint8_t)(((p >> 11) & 0x1F) * 255 / 31);
+                                        bgr[1] = (uint8_t)(((p >> 5) & 0x3F) * 255 / 63);
+                                        bgr[0] = (uint8_t)((p & 0x1F) * 255 / 31);
+                                    }
+                                }
+                                fwrite(bgr, 1, 3, bmp);
+                            }
+                            uint8_t pad[3] = {};
+                            if (row_pad) fwrite(pad, 1, row_pad, bmp);
+                        }
+                        fclose(bmp);
+                        fprintf(stderr, "[diag] Captured scanout to scanout_capture.bmp (%ux%u fb_start=0x%X pitch=%u bpp=%u)\n",
+                                fb_w, fb_h, fb_start, fb_pitch, fb_bpp);
+                    }
+                }
             }
         }
 
