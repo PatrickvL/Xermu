@@ -345,6 +345,13 @@ static bool emit_alu_esp_reg(Emitter& e,
     if (mod != 3) return false; // not reg-reg form â€” shouldn't happen here
 
     // Determine which field(s) have ESP (encoding 4) and need R14 (encoding 6).
+    // IMPORTANT: For group instructions (opcode 80-83, C0-C1, D0-D3, F6-F7, FE-FF),
+    // the reg field is an opcode extension (/r), NOT a register.  Only substitute
+    // the reg field when the instruction actually has two register operands.
+    bool reg_field_is_register = (insn.operand_count_visible >= 2 &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER);
+
     uint8_t rex = 0x40; // base REX prefix (may not be needed if no extended regs)
     uint8_t new_reg = reg;
     uint8_t new_rm = rm;
@@ -353,7 +360,7 @@ static bool emit_alu_esp_reg(Emitter& e,
         new_rm = 6;     // R14 & 7
         rex |= 0x01;    // REX.B for extended rm
     }
-    if (reg == 4) {
+    if (reg == 4 && reg_field_is_register) {
         new_reg = 6;    // R14 & 7
         rex |= 0x04;    // REX.R for extended reg
     }
