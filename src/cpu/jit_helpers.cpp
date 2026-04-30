@@ -137,7 +137,7 @@ fault_prot:
     return ~0u;
 
 fault_np:
-    // Page not present.
+    // Page not present — deliver #PF to guest kernel.
     ctx->cr2 = va;
     ctx->pf_error_code = (is_write ? 2u : 0u);  // P=0, W/R, U/S=0
     ctx->stop_reason = STOP_PAGE_FAULT;
