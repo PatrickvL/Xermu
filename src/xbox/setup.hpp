@@ -75,6 +75,51 @@ static void hw_tick_callback(void* user) {
             static int put_diag = 0;
             if (put_diag < 3) { put_diag++; fprintf(stderr, "[diag] USER PUT sync: 0x%X\n", user_put); }
         }
+        // Check PFIFO CACHE1_DMA_PUT direct register (offset 0x002000 + 0x1240)
+        uint32_t pfifo_put;
+        memcpy(&pfifo_put, nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_PUT, 4);
+        if (pfifo_put != 0 && pfifo_put != cur_put && pfifo_put != user_put) {
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = pfifo_put;
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
+        }
+        // Check PFIFO CACHE1_PUSH0 and PUSH1 — D3D initialization writes these
+        // to select the channel and enable DMA push, triggering RAMFC context load.
+        uint32_t push0_mem, push1_mem;
+        memcpy(&push0_mem, nv2a_mem + 0x002000 + pfifo::CACHE1_PUSH0, 4);
+        memcpy(&push1_mem, nv2a_mem + 0x002000 + pfifo::CACHE1_PUSH1, 4);
+        static uint32_t last_push0 = 0, last_push1 = 0;
+        if (push1_mem != last_push1) {
+            last_push1 = push1_mem;
+            // Trigger RAMFC load (nv2a_write stores reg AND loads context)
+            nv2a_write(NV2A_BASE + 0x002000 + pfifo::CACHE1_PUSH1, push1_mem, 4, &hw->nv2a);
+        }
+        if ((push0_mem & 1) && push0_mem != last_push0) {
+            last_push0 = push0_mem;
+            nv2a_write(NV2A_BASE + 0x002000 + pfifo::CACHE1_PUSH0, push0_mem, 4, &hw->nv2a);
+        }
+        // Sync PFIFO registers that D3D writes during channel setup:
+        // RAMFC (base addr for channel contexts), DMA_INSTANCE (DMA object handle).
+        uint32_t ramfc_mem, inst_mem;
+        memcpy(&ramfc_mem, nv2a_mem + 0x002000 + pfifo::RAMFC, 4);
+        memcpy(&inst_mem, nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_INSTANCE, 4);
+        hw->nv2a.pfifo_regs[pfifo::RAMFC / 4] = ramfc_mem;
+        hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_INSTANCE / 4] = inst_mem;
+        // Sync PRAMIN: D3D writes DMA context objects to the NV2A PRAMIN window
+        // (0xFD700000+). In fastmem mode these land in committed NV2A memory but
+        // resolve_dma_base() reads from pramin_ram (0x03FE0000 in guest RAM).
+        // Mirror the NV2A PRAMIN window to the instance memory pages when the
+        // DMA_INSTANCE register changes (indicates a new DMA context was set up).
+        if (hw->nv2a.pramin_ram) {
+            static uint32_t last_inst = 0;
+            if (inst_mem != 0 && inst_mem != last_inst) {
+                last_inst = inst_mem;
+                uint32_t pramin_size = hw->nv2a.pramin_ram_size;
+                uint8_t* pramin_nv2a = nv2a_mem + 0x700000;
+                uint8_t* pramin_ram  = hw->nv2a.pramin_ram + hw->nv2a.pramin_ram_base;
+                memcpy(pramin_ram, pramin_nv2a, pramin_size);
+            }
+        }
         // Sync DMA_GET back to committed memory so game reads see progress
         uint32_t get_val = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
         memcpy(nv2a_mem + 0x800044, &get_val, 4);
@@ -93,6 +138,20 @@ static void hw_tick_callback(void* user) {
         // Sync PGRAPH_STATUS: 0 = idle (game checks before submitting)
         uint32_t pgraph_status = 0;
         memcpy(nv2a_mem + 0x400000 + 0x0700, &pgraph_status, 4);  // PGRAPH_STATUS
+
+        // Sync PCRTC_START (0x600800) and PCRTC_CONFIG (0x600804) from committed
+        // NV2A memory.  AvSetDisplayMode writes these directly; without polling
+        // them, the scanout shader never sees the framebuffer address.
+        uint32_t pcrtc_start_mem;
+        memcpy(&pcrtc_start_mem, nv2a_mem + 0x600000 + pcrtc::START, 4);
+        if (pcrtc_start_mem != hw->nv2a.pcrtc_regs[pcrtc::START / 4]) {
+            hw->nv2a.pcrtc_regs[pcrtc::START / 4] = pcrtc_start_mem;
+        }
+        uint32_t pcrtc_config_mem;
+        memcpy(&pcrtc_config_mem, nv2a_mem + 0x600000 + pcrtc::CONFIG, 4);
+        if (pcrtc_config_mem != hw->nv2a.pcrtc_regs[pcrtc::CONFIG / 4]) {
+            hw->nv2a.pcrtc_regs[pcrtc::CONFIG / 4] = pcrtc_config_mem;
+        }
 
         // Also sync PCRTC_INTR acknowledgment: if game wrote to 0x600100, handle W1C
         uint32_t pcrtc_intr_mem;
