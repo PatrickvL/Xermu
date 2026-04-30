@@ -104,12 +104,21 @@ private:
                 sys->exec->ctx.halted = false;
                 sys->exec->run(sys->exec->ctx.eip, STEPS_PER_ITER);
 
+                // halted=true after run() means budget was exhausted during HLT
+                // spin (no fatal error).  Just loop back for another iteration.
+                // Only truly halt on fatal EIP or explicit stop.
                 if (sys->exec->ctx.halted) {
-                    halt_eip_.store(sys->exec->ctx.eip, std::memory_order_relaxed);
-                    halt_eax_.store(sys->exec->ctx.gp[GP_EAX], std::memory_order_relaxed);
-                    halted_flag.store(true, std::memory_order_release);
-                    sys->running = false;
-                    break;
+                    uint32_t eip = sys->exec->ctx.eip;
+                    // Fatal: EIP=0xFFFFFFFF or execution of illegal instruction
+                    if (eip == 0xFFFF'FFFFu) {
+                        halt_eip_.store(eip, std::memory_order_relaxed);
+                        halt_eax_.store(sys->exec->ctx.gp[GP_EAX], std::memory_order_relaxed);
+                        halted_flag.store(true, std::memory_order_release);
+                        sys->running = false;
+                        break;
+                    }
+                    // Non-fatal halt (budget exhausted during HLT spin) —
+                    // just loop back to give another time slice.
                 }
             } else {
                 // HLE / LLE-kernel / LLE modes use run_step.
