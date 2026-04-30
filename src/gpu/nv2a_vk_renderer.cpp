@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "nv2a_vk_renderer.hpp"
-#include "nv2a_shaders.hpp"       // runtime GLSL→SPIR-V
+#include "nv2a_shaders.hpp"       // precompiled SPIR-V
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -356,11 +356,10 @@ bool Nv2aVkRenderer::init(VkDevice dev, VkPhysicalDevice phys,
 
     if (!create_gpu_buffer()) return false;
 
-    // Compile GLSL shaders to SPIR-V (once, at first init).
+    // Load precompiled SPIR-V shaders.
     if (g_shaders.pushbuf_comp.empty()) {
-        glslang_initialize_process();
         if (!g_shaders.compile_all()) {
-            fprintf(stderr, "[nv2a_vk] Shader compilation failed\n");
+            fprintf(stderr, "[nv2a_vk] Shader loading failed\n");
             return false;
         }
     }

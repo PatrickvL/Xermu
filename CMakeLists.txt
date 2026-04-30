@@ -70,36 +70,80 @@ set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH "" FORC
 FetchContent_MakeAvailable(volk)
 
 # ---------------------------------------------------------------------------
-# glslang — GLSL to SPIR-V compiler (runtime shader compilation)
+# glslang — builds glslangValidator for offline GLSL→SPIR-V compilation
 # ---------------------------------------------------------------------------
 FetchContent_Declare(glslang
     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
     GIT_TAG        15.2.0
     GIT_SHALLOW    TRUE
 )
-set(ENABLE_SPVREMAPPER     OFF CACHE BOOL "" FORCE)
-set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
-set(ENABLE_HLSL            OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING          OFF CACHE BOOL "" FORCE)
-set(ENABLE_OPT             OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER      OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES ON  CACHE BOOL "" FORCE)
+set(ENABLE_HLSL             OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING           OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT              OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glslang)
 
-# Generate .inc files from GLSL shaders (raw string literal wrappers).
+# ---------------------------------------------------------------------------
+# Precompiled SPIR-V shaders with proper build dependencies.
+# Each .glsl is compiled to .spv then converted to a C uint32_t array header.
+# ---------------------------------------------------------------------------
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders)
-set(SHADER_INC_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_shader_inc.cmake)
-file(GLOB GLSL_SOURCES ${SHADER_DIR}/*.glsl)
-set(GLSL_INC_FILES)
-foreach(glsl ${GLSL_SOURCES})
-    set(inc_file "${glsl}.inc")
-    list(APPEND GLSL_INC_FILES ${inc_file})
+set(SHADER_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+set(SPIRV_HEADER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gen_spirv_header.cmake)
+file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
+
+# Map shader files to their glslangValidator stage flags and array names
+set(SHADER_SOURCES
+    pushbuf_parse.comp.glsl
+    scanout.vert.glsl
+    scanout.frag.glsl
+    nv2a_draw.vert.glsl
+    nv2a_draw.frag.glsl
+)
+set(SHADER_ARRAY_NAMES
+    spv_pushbuf_parse_comp
+    spv_scanout_vert
+    spv_scanout_frag
+    spv_nv2a_draw_vert
+    spv_nv2a_draw_frag
+)
+
+set(SPIRV_HEADERS)
+list(LENGTH SHADER_SOURCES SHADER_COUNT)
+math(EXPR SHADER_LAST "${SHADER_COUNT} - 1")
+foreach(I RANGE 0 ${SHADER_LAST})
+    list(GET SHADER_SOURCES ${I} SHADER_FILE)
+    list(GET SHADER_ARRAY_NAMES ${I} ARRAY_NAME)
+    set(GLSL_PATH ${SHADER_DIR}/${SHADER_FILE})
+    set(SPV_PATH ${SHADER_OUT_DIR}/${SHADER_FILE}.spv)
+    set(HDR_PATH ${SHADER_OUT_DIR}/${SHADER_FILE}.h)
+
+    # Step 1: GLSL → SPIR-V (depends on glslang-standalone being built)
     add_custom_command(
-        OUTPUT  ${inc_file}
-        COMMAND ${CMAKE_COMMAND} -DGLSL_FILE=${glsl} -P ${SHADER_INC_SCRIPT}
-        DEPENDS ${glsl} ${SHADER_INC_SCRIPT}
-        COMMENT "GLSL -> .inc: ${glsl}"
+        OUTPUT  ${SPV_PATH}
+        COMMAND $<TARGET_FILE:glslang-standalone> -V --target-env vulkan1.2
+                ${GLSL_PATH} -o ${SPV_PATH}
+        DEPENDS ${GLSL_PATH} glslang-standalone
+        COMMENT "GLSL→SPIR-V: ${SHADER_FILE}"
+        VERBATIM
     )
+    # Step 2: SPIR-V → C header
+    add_custom_command(
+        OUTPUT  ${HDR_PATH}
+        COMMAND ${CMAKE_COMMAND}
+                -DSPV_FILE=${SPV_PATH}
+                -DHEADER_FILE=${HDR_PATH}
+                -DARRAY_NAME=${ARRAY_NAME}
+                -P ${SPIRV_HEADER_SCRIPT}
+        DEPENDS ${SPV_PATH} ${SPIRV_HEADER_SCRIPT}
+        COMMENT "SPIR-V→header: ${SHADER_FILE}.h"
+        VERBATIM
+    )
+    list(APPEND SPIRV_HEADERS ${HDR_PATH})
 endforeach()
-add_custom_target(shader_inc_files DEPENDS ${GLSL_INC_FILES})
+
+add_custom_target(shader_spirv ALL DEPENDS ${SPIRV_HEADERS})
 
 # Build ImGui as a static library with SDL3 + Vulkan backends
 set(IMGUI_DIR ${imgui_SOURCE_DIR})
@@ -253,9 +297,9 @@ add_executable(xermu ${COMMON_SOURCES}
     src/main.cpp
     src/gpu/nv2a_vk_renderer.cpp
 )
-add_dependencies(xermu shader_inc_files)
-target_include_directories(xermu PRIVATE src src/cpu)
-target_link_libraries(xermu PRIVATE Zydis imgui_lib SDL3::SDL3-static volk glslang::glslang glslang::glslang-default-resource-limits glslang::SPIRV)
+add_dependencies(xermu shader_spirv)
+target_include_directories(xermu PRIVATE src src/cpu ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+target_link_libraries(xermu PRIVATE Zydis imgui_lib SDL3::SDL3-static volk)
 
 if(MSVC)
     target_compile_options(xermu PRIVATE /W3)
