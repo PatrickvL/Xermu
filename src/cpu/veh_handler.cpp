@@ -139,6 +139,7 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
     // Step 1: Is the fault within the fastmem window?
     auto base = (uintptr_t)exec->ctx.fastmem_base;
     if (fault_addr < base || fault_addr >= base + 0x100000000ULL) {
+        // Fault in C helper or unknown code - abort to prevent cascade
         auto rip_outside = (uint8_t*)(uintptr_t)ctx_regs->Rip;
         bool in_cc = exec->cc.contains(rip_outside);
         HMODULE hmod = GetModuleHandleA(NULL);
@@ -146,20 +147,9 @@ LONG CALLBACK fastmem_veh_handler(EXCEPTION_POINTERS* ep) {
                 (unsigned long long)fault_addr,
                 (void*)(uintptr_t)ctx_regs->Rip, (int)in_cc,
                 (unsigned long long)(ctx_regs->Rip - (DWORD64)(uintptr_t)hmod));
-        if (in_cc && ctx_regs->R13) {
-            // Fault in JIT code - redirect to exception_exit
-            auto* gctx = reinterpret_cast<GuestContext*>(ctx_regs->R13);
-            fprintf(stderr, "[veh]   guest EIP=0x%08X ESP=0x%08X\n",
-                    gctx->eip, gctx->gp[4/*ESP*/]);
-            fflush(stderr);
-            gctx->halted = true;
-            gctx->stop_reason = STOP_INVALID_OPCODE;
-            ctx_regs->Rip = (DWORD64)(uintptr_t)exec->mmio_helpers.exception_exit;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        // Fault in C helper or unknown code - abort to prevent cascade
-        fprintf(stderr, "[veh]   R12=%p R13=%p - aborting\n",
-                (void*)(uintptr_t)ctx_regs->R12, (void*)(uintptr_t)ctx_regs->R13);
+        fprintf(stderr, "[veh]   R12=%p R13=%p R14=0x%llX - aborting\n",
+                (void*)(uintptr_t)ctx_regs->R12, (void*)(uintptr_t)ctx_regs->R13,
+                (unsigned long long)ctx_regs->R14);
         fflush(stderr);
         _exit(99);
     }

@@ -662,10 +662,9 @@ inline void emit_fastmem_store_imm8(Emitter& e, uint8_t imm) {
 }
 
 // ---------------------------------------------------------------------------
-// Absolute call via R14 (clobbers R14 — safe: EA already committed or saved)
-//   MOVABS R14, imm64 + CALL R14
-//   REX.W=1, REX.B=1 (R14): 0x49 0xBE imm64
-//   CALL R14: REX.B=1 → 0x41 0xFF 0xD6
+// Absolute call via RAX (preserves R14 upper bits — R14 holds the guest EA/PA
+// and must always have a zero upper dword).
+//   MOVABS RAX, imm64 + CALL RAX
 // On Windows, allocates/frees the required 32-byte shadow space.
 // ---------------------------------------------------------------------------
 
@@ -674,8 +673,10 @@ inline void emit_call_abs(Emitter& e, const void* target) {
     // SUB RSP, 0x20
     e.emit8(REX_W); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x20);
 #endif
-    e.emit8(REX_WB); e.emit8(0xBE); e.emit64((uint64_t)(uintptr_t)target);
-    e.emit8(REX_B); e.emit8(0xFF); e.emit8(0xD6);
+    // MOVABS RAX, target (REX.W=0x48, B8, imm64)
+    e.emit8(0x48); e.emit8(0xB8); e.emit64((uint64_t)(uintptr_t)target);
+    // CALL RAX (FF /2 D0)
+    e.emit8(0xFF); e.emit8(0xD0);
 #ifdef _WIN32
     // ADD RSP, 0x20
     e.emit8(REX_W); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x20);
