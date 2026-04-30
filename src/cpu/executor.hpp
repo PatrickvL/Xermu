@@ -14,11 +14,19 @@ static constexpr uint32_t GUEST_RAM_SIZE = 128u * 1024u * 1024u;
 // RAM as PA 0x00000000.  nboxkrnl's page tables reference this range.
 static constexpr uint32_t CONTIGUOUS_MEMORY_BASE = 0x80000000u;
 
-// Translate a physical address through the contiguous memory alias.
-// PA 0x80000000-0x87FFFFFF → 0x00000000-0x07FFFFFF; all other PAs unchanged.
+// Xbox write-combined (WC) memory alias: PA 0xF0000000 maps to the same
+// physical RAM as PA 0x00000000, but with write-combine caching semantics.
+static constexpr uint32_t WRITE_COMBINED_BASE = 0xF0000000u;
+
+// Translate a physical address through Xbox memory aliases.
+// PA 0x80000000-0x87FFFFFF → 0x00000000-0x07FFFFFF (contiguous/physical map)
+// PA 0xF0000000-0xF7FFFFFF → 0x00000000-0x07FFFFFF (write-combined)
+// All other PAs unchanged.
 inline uint32_t alias_pa(uint32_t pa) {
     if (pa >= CONTIGUOUS_MEMORY_BASE && pa < CONTIGUOUS_MEMORY_BASE + GUEST_RAM_SIZE)
         return pa - CONTIGUOUS_MEMORY_BASE;
+    if (pa >= WRITE_COMBINED_BASE && pa < WRITE_COMBINED_BASE + GUEST_RAM_SIZE)
+        return pa - WRITE_COMBINED_BASE;
     return pa;
 }
 
