@@ -245,18 +245,26 @@ struct Nv2aVkRenderer {
                     uint32_t initial_get = 0, bool initial_get_valid = false) {
         auto* ctl = mapped<PfifoControlBlock>(GpuBufferLayout::PFIFO_CTL_OFFSET);
         ctl->dma_put = dma_put;
-        // Seed GPU's DMA_GET once — using the value captured at DMA_PUSH enable.
-        if (!gpu_get_initialized && initial_get_valid) {
+        // Seed GPU's DMA_GET once — set to CPU's current GET (from RAMFC).
+        // If GET==PUT, there's nothing to process initially (initial commands
+        // were "consumed" before emulation started). The game's render loop
+        // will submit new commands that we'll catch on subsequent frames.
+        if (!gpu_get_initialized && push_enabled && initial_get_valid) {
             ctl->dma_get = initial_get;
             gpu_get_initialized = true;
         }
         ctl->push_enabled = push_enabled;
-        ctl->pcrtc_start = pcrtc_start;
+        // Only set pcrtc_start from CPU if GPU hasn't set it via push buffer.
+        if (pcrtc_start != 0 || ctl->pcrtc_start == 0)
+            ctl->pcrtc_start = pcrtc_start;
         ctl->dma_base = dma_base;
         ctl->display_width  = disp_w;
         ctl->display_height = disp_h;
-        ctl->display_pitch  = disp_pitch;
-        ctl->display_bpp    = disp_bpp;
+        // Only set pitch/bpp from CPU if GPU hasn't set them via push buffer.
+        if (disp_pitch != 0 || ctl->display_pitch == 0)
+            ctl->display_pitch  = disp_pitch;
+        if (disp_bpp != 0 || ctl->display_bpp == 0)
+            ctl->display_bpp    = disp_bpp;
     }
 
     // Sync CPU-side PGRAPH register state into the GPU buffer so shaders can read it.
