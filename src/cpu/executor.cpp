@@ -130,9 +130,24 @@ bool Executor::init(MmioMap* mmio) {
     // Try 4 GB fastmem window first (enables VEH-based MMIO handling).
     fastmem_window = platform::alloc_4gb_window(GUEST_RAM_SIZE);
     if (!fastmem_window.base) {
+        // Probe largest free VA region to diagnose fragmentation
+        size_t largest_free = 0;
+        uintptr_t addr = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        while (VirtualQuery((void*)addr, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_FREE && mbi.RegionSize > largest_free)
+                largest_free = mbi.RegionSize;
+            uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (next <= addr) break;
+            addr = next;
+        }
+        fprintf(stderr, "[mem] 4GB window failed (largest free VA: %zu MB), using 320MB\n",
+                largest_free / (1024*1024));
         // Fallback: 320 MB aliased window.
         fastmem_window = platform::alloc_fastmem_window(FASTMEM_WINDOW_SIZE,
                                                          GUEST_RAM_SIZE);
+    } else {
+        fprintf(stderr, "[mem] 4GB window allocated at %p\n", fastmem_window.base);
     }
     if (fastmem_window.base) {
         ram = static_cast<uint8_t*>(fastmem_window.base);
@@ -142,6 +157,44 @@ bool Executor::init(MmioMap* mmio) {
     }
     if (!ram) return false;
     memset(ram, 0, GUEST_RAM_SIZE); // zero-fill (matches Xbox kernel boot)
+
+    // If we got the 4 GB window, commit memory at the NV2A register range
+    // (0xFD000000-0xFDFFFFFF) so PGRAPH/PFB/PCRTC reads/writes don't fault.
+    // This eliminates VEH overhead for the game's GPU init loop (millions of
+    // register accesses).  The committed pages are zero-filled, which is
+    // correct for PGRAPH_STATUS (0 = idle) and most other registers.
+    nv2a_committed_ = false;
+    if (fastmem_window.window_size >= 0x100000000ULL) {
+        constexpr size_t USED_END  = 0x14000000ULL;  // placeholder starts here
+        constexpr size_t NV2A_OFF  = 0xFD000000ULL;
+        constexpr size_t NV2A_LEN  = 0x01000000ULL;  // 16 MB
+        auto base8 = static_cast<uint8_t*>(fastmem_window.base);
+        // The placeholder covers [USED_END, 4GB).
+        // Split #1: [USED_END, NV2A_OFF) and [NV2A_OFF, 4GB)
+        BOOL ok1 = VirtualFree(base8 + USED_END, NV2A_OFF - USED_END,
+                               MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        if (ok1) {
+            // Split #2: [NV2A_OFF, NV2A_OFF+NV2A_LEN) and [NV2A_OFF+NV2A_LEN, 4GB)
+            BOOL ok2 = VirtualFree(base8 + NV2A_OFF, NV2A_LEN,
+                                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            if (ok2) {
+                // Commit the NV2A region as read-write zero-fill.
+                void* nv2a_mem = VirtualAlloc(base8 + NV2A_OFF, NV2A_LEN,
+                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if (nv2a_mem) {
+                    nv2a_committed_ = true;
+                    fprintf(stderr, "[mmio] committed NV2A registers at fastmem+0x%llX (%zu MB)\n",
+                            (unsigned long long)NV2A_OFF, NV2A_LEN / (1024*1024));
+                } else {
+                    fprintf(stderr, "[mmio] VirtualAlloc for NV2A failed: %lu\n", GetLastError());
+                }
+            } else {
+                fprintf(stderr, "[mmio] VirtualFree split #2 failed: %lu\n", GetLastError());
+            }
+        } else {
+            fprintf(stderr, "[mmio] VirtualFree split #1 failed: %lu\n", GetLastError());
+        }
+    }
 
     if (!cc.init()) return false;
 
@@ -353,6 +406,21 @@ void Executor::io_write(uint16_t port, uint32_t val, unsigned size) {
 
 void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
                                   bool has_error, uint32_t error_code) {
+    // Diagnostic: count hardware IRQ deliveries
+    static int irq_deliver_count = 0;
+    if (vector >= 0x30 && irq_deliver_count < 5) {
+        irq_deliver_count++;
+        fprintf(stderr, "[diag] IRQ deliver: vector=0x%02X return_eip=0x%08X IF=%d (count=%d)\n",
+                vector, return_eip, ctx.virtual_if ? 1 : 0, irq_deliver_count);
+    }
+    // Specifically track vector 0x33 (GPU IRQ 3)
+    static int gpu_irq_count = 0;
+    if (vector == 0x33 && gpu_irq_count < 3) {
+        gpu_irq_count++;
+        fprintf(stderr, "[diag] GPU vector 0x33 delivered! return_eip=0x%08X (count=%d)\n",
+                return_eip, gpu_irq_count);
+    }
+
     uint32_t idt_offset = (uint32_t)vector * 8;
     if (idt_offset + 7 > ctx.idtr_limit) {
         fprintf(stderr, "[exec] IDT vector %u exceeds limit (%u) at EIP=0x%08X\n",
@@ -786,7 +854,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
     uint32_t spin_count  = 0;
     uint32_t stale_eip   = 0;   // tracks repeated spin triggers at same addr
     uint32_t stale_count = 0;
-    static constexpr uint32_t SPIN_THRESHOLD = 32;
+    static constexpr uint32_t SPIN_THRESHOLD = 16;
 
     while (!ctx.halted) {
         if (max_steps && steps >= max_steps) {
@@ -855,6 +923,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                 deliver_interrupt(14, eip, /*has_error=*/true,
                                   ctx.pf_error_code | 0x10u);
                 prev_trace = nullptr;
+                ++steps;  // count toward budget to prevent infinite PF loops
                 continue;
             }
         }
@@ -937,6 +1006,57 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // Advance EIP to what the trace exit stub wrote.
         ctx.eip = ctx.next_eip;
         ++steps;
+
+        // Periodic EIP sample to detect stalls
+        if ((steps & 0xFFFFF) == 0) {  // every ~1M steps
+            static int eip_sample_count = 0;
+            if (eip_sample_count < 5) {
+                ++eip_sample_count;
+                uint32_t sample_pa = ctx.eip;
+                if (paging_enabled()) sample_pa = translate_va(ctx.eip, false);
+                fprintf(stderr, "[diag] EIP sample at step %llu: 0x%08X bytes:",
+                        (unsigned long long)steps, ctx.eip);
+                if (sample_pa != ~0u && sample_pa + 16 <= GUEST_RAM_SIZE) {
+                    for (int i = 0; i < 16; ++i)
+                        fprintf(stderr, " %02X", ram[sample_pa + i]);
+                }
+                fprintf(stderr, "\n");
+                // Also dump the called function at 0x00023F47 (once)
+                if (eip_sample_count == 1) {
+                    uint32_t fn_va = 0x00023F47;
+                    uint32_t fn_pa = fn_va;
+                    if (paging_enabled()) fn_pa = translate_va(fn_va, false);
+                    if (fn_pa != ~0u && fn_pa + 48 <= GUEST_RAM_SIZE) {
+                        fprintf(stderr, "[diag] Fn@0x%08X bytes:", fn_va);
+                        for (int i = 0; i < 48; ++i)
+                            fprintf(stderr, " %02X", ram[fn_pa + i]);
+                        fprintf(stderr, "\n");
+                    }
+                    // Dump loop context (before EIP 0x0001E417)
+                    uint32_t loop_va = 0x0001E3F0;
+                    uint32_t loop_pa = loop_va;
+                    if (paging_enabled()) loop_pa = translate_va(loop_va, false);
+                    if (loop_pa != ~0u && loop_pa + 128 <= GUEST_RAM_SIZE) {
+                        fprintf(stderr, "[diag] Loop@0x%08X bytes:", loop_va);
+                        for (int i = 0; i < 128; ++i)
+                            fprintf(stderr, " %02X", ram[loop_pa + i]);
+                        fprintf(stderr, "\n");
+                    }
+                    // Print EBP-relative values to understand loop state
+                    uint32_t ebp = ctx.gp[GP_EBP];
+                    auto safe_read = [&](uint32_t va) -> uint32_t {
+                        uint32_t pa = paging_enabled() ? translate_va(va, false) : va;
+                        if (pa == ~0u || pa + 4 > GUEST_RAM_SIZE) return 0xDEAD;
+                        uint32_t v; memcpy(&v, ram + pa, 4); return v;
+                    };
+                    fprintf(stderr, "[diag] EBP=0x%08X [ebp-14h]=%u [ebp-8]=0x%08X [ebp-4]=0x%08X\n",
+                            ebp, safe_read(ebp - 0x14), safe_read(ebp - 0x8), safe_read(ebp - 0x4));
+                    // What's at VA 0? (the function reads [ecx] where ecx=[ebp-8])
+                    fprintf(stderr, "[diag] [VA 0]=0x%08X [VA 4]=0x%08X ECX=0x%08X\n",
+                            safe_read(0), safe_read(4), ctx.gp[GP_ECX]);
+                }
+            }
+        }
         prev_trace = t;
 
         // Spin-loop detection: if the trace loops back to itself many times,
@@ -1013,18 +1133,17 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                                 handled = true;
                             }
                         }
-                        // Pass 2: only at offset 0, check for DEC r32 (48..4F)
+                        // Pass 2: DEC r32 at offset 0 = pure delay loop (no stores)
                         if (!handled) {
                             uint8_t b0 = ram[code_pa];
                             if (b0 >= 0x48 && b0 <= 0x4F) {
                                 unsigned reg = b0 - 0x48;
-                                if (ctx.gp[reg] <= SPIN_THRESHOLD * 2) {
-                                    ctx.gp[reg] = 1;
-                                    handled = true;
-                                }
+                                ctx.gp[reg] = 1;
+                                handled = true;
                             }
                         }
                         // Pass 3: MOV reg,[ESP+disp8]; DEC reg; MOV [ESP+disp8],reg; JNZ
+                        // OR:    MOV reg,[ESP]; DEC reg; MOV [ESP],reg; JNZ
                         // This is a countdown delay loop. Fast-forward by
                         // zeroing the counter register so DEC sets ZF=0 and
                         // JNZ falls through.
@@ -1033,7 +1152,8 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                             // 8B 44 24 dd = MOV EAX,[ESP+disp8]  (or other reg)
                             if (b0 == 0x8B) {
                                 uint8_t modrm = ram[code_pa + 1];
-                                if ((modrm & 0xC7) == 0x44) { // mod=01, r/m=4 (SIB)
+                                // mod=01, r/m=100 (SIB follows), with disp8
+                                if ((modrm & 0xC7) == 0x44) {
                                     uint8_t sib = ram[code_pa + 2];
                                     if (sib == 0x24) { // SIB = base=ESP, no index
                                         uint8_t disp = ram[code_pa + 3];
@@ -1049,9 +1169,32 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                                             // value matches (in case code re-reads it)
                                             uint32_t sp = ctx.gp[GP_ESP];
                                             uint32_t addr = sp + disp;
-                                            if (addr + 4 <= GUEST_RAM_SIZE) {
-                                                uint32_t one = 1;
-                                                memcpy(ram + addr, &one, 4);
+                                            uint32_t one = 1;
+                                            write_guest_block(addr, 4, &one);
+                                            handled = true;
+                                        }
+                                    }
+                                }
+                                // mod=00, r/m=100 (SIB follows), no displacement
+                                // 8B 04 24 = MOV reg,[ESP]
+                                else if ((modrm & 0xC7) == 0x04) {
+                                    uint8_t sib = ram[code_pa + 2];
+                                    if (sib == 0x24) { // SIB = base=ESP, no index
+                                        unsigned reg = (modrm >> 3) & 7;
+                                        // Check DEC reg follows at offset 3
+                                        uint8_t b3 = ram[code_pa + 3];
+                                        if (b3 >= 0x48 && b3 <= 0x4F &&
+                                            (unsigned)(b3 - 0x48) == reg) {
+                                            ctx.gp[reg] = 1;
+                                            // Write 1 to [ESP] via paging
+                                            uint32_t sp = ctx.gp[GP_ESP];
+                                            uint32_t one = 1;
+                                            bool ok = write_guest_block(sp, 4, &one);
+                                            static int diag_p3 = 0;
+                                            if (diag_p3 < 3) {
+                                                diag_p3++;
+                                                fprintf(stderr, "[diag] Pass3-nodisp: EIP=0x%08X reg=%u sp=0x%08X write_ok=%d\n",
+                                                        eip, reg, sp, ok ? 1 : 0);
                                             }
                                             handled = true;
                                         }
@@ -1067,8 +1210,27 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         // In BIOS/LLE mode (no hle_handler), do NOT halt —
                         // the loop is legitimate code (RC4, decompression, etc.)
                         // and there's no scheduler to resume it.
+                        // Exception: loops containing memory stores are real work
+                        // (push buffer writing, memcpy, etc.) — don't yield.
                         if (hle_handler) {
-                            ctx.halted = true;
+                            bool has_store = false;
+                            if (code_pa + 32 <= GUEST_RAM_SIZE) {
+                                for (uint32_t s = 0; s < 28; ++s) {
+                                    uint8_t sb = ram[code_pa + s];
+                                    if (sb == 0x88 || sb == 0x89 || sb == 0xA2 || sb == 0xA3 ||
+                                        sb == 0xC6 || sb == 0xC7 || sb == 0xAA || sb == 0xAB) {
+                                        has_store = true; break;
+                                    }
+                                }
+                            }
+                            if (!has_store) {
+                                static int nospin_diag = 0;
+                                if (nospin_diag < 5) {
+                                    nospin_diag++;
+                                    fprintf(stderr, "[diag] Spin yield (no-store) at EIP=0x%08X steps=%u\n", eip, steps);
+                                }
+                                ctx.halted = true;
+                            }
                         }
                         // else: let the loop continue naturally
                     }
@@ -1079,6 +1241,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                         if (stale_eip == eip) {
                             ++stale_count;
                             if (stale_count >= 64) {
+                                static int stale_diag = 0;
+                                if (stale_diag < 3) {
+                                    stale_diag++;
+                                    fprintf(stderr, "[diag] Stale spin at EIP=0x%08X (count=%u)\n", eip, stale_count);
+                                }
                                 ctx.halted = true;
                                 stale_count = 0;
                             }
@@ -1095,6 +1262,55 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             }
         } else {
             spin_count = 0;
+
+            // Slow-spin detection: track backward-edge targets across CALL
+            // boundaries.  Loops containing function calls reset spin_count
+            // on forward edges but the backward-edge target repeats.
+            // After enough repetitions, fire tick so interrupts can preempt.
+            // NOTE: Disabled for now — the high-frequency tick firing adds
+            // overhead to legitimate long init loops (PGRAPH channel setup).
+            // VBlank IRQs fire naturally through tick_period mechanism.
+            #if 0
+            if (ctx.eip < eip && hle_handler) {
+                static uint32_t slow_target = 0;
+                static uint32_t slow_count = 0;
+                if (ctx.eip == slow_target) {
+                    if (++slow_count >= 64) {
+                        // Fire ticks to let VBlank/timer IRQs preempt the spin
+                        if (tick_fn) {
+                            for (int t = 0; t < 100; ++t)
+                                tick_fn(tick_user);
+                        }
+                        slow_count = 0;
+                    }
+                } else {
+                    slow_target = ctx.eip;
+                    slow_count = 1;
+                }
+            }
+            #endif
+
+            // Multi-trace cycle detection: catch 2-4 trace ping-pong loops
+            // that the single-trace detector misses (e.g. BST cycles in kernel).
+            // When detected, fire extra device ticks so timer IRQs can preempt
+            // the stuck code via the normal interrupt delivery mechanism.
+            {
+                static uint32_t prev_eip2 = 0;
+                static uint32_t cycle2_count = 0;
+                if (ctx.eip == prev_eip2 && ctx.eip != eip) {
+                    if (++cycle2_count >= 100) {
+                        cycle2_count = 0;
+                        // Fire device ticks to advance time while CPU is stuck.
+                        if (tick_fn) {
+                            for (int t = 0; t < 100; ++t)
+                                tick_fn(tick_user);
+                        }
+                    }
+                } else {
+                    cycle2_count = 0;
+                }
+                prev_eip2 = eip;
+            }
         }
 
         // Periodic device tick (e.g. PIT timer).
@@ -1107,6 +1323,27 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         if (ctx.stop_reason == STOP_PRIVILEGED) {
             prev_trace = nullptr; // chain broken
             handle_privileged();
+            ++steps;  // count privileged ops toward budget
+
+            // HLT: spin-tick until an external interrupt arrives.
+            // On real x86, HLT suspends the CPU until the next interrupt.
+            // Advance EIP past the HLT opcode (1 byte) so execution resumes
+            // at the following instruction after the ISR returns via IRET.
+            if (ctx.halted) {
+                ctx.eip += 1;  // HLT is always 1 byte (0xF4)
+                ctx.halted = false;
+                // Spin: call tick_fn to advance device timers until an IRQ fires.
+                while (!(irq_check && irq_check(irq_user))) {
+                    if (max_steps && steps >= max_steps) { ctx.halted = true; break; }
+                    if (tick_period) {
+                        if (++tick_counter >= tick_period) {
+                            tick_counter = 0;
+                            tick_fn(tick_user);
+                        }
+                    }
+                    ++steps;
+                }
+            }
             continue;
         }
 
@@ -1114,6 +1351,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         // translate_va_jit already set CR2 to the faulting VA.
         if (ctx.stop_reason == STOP_PAGE_FAULT) {
             prev_trace = nullptr; // chain broken
+            ++steps;  // count PFs toward budget
             static int pf_log_count = 0;
             if (pf_log_count < 50) {
                 ++pf_log_count;
@@ -1175,6 +1413,7 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
         if (ctx.stop_reason == STOP_DIVIDE_ERROR) {
             prev_trace = nullptr;
             deliver_interrupt(0, ctx.eip);
+            ++steps;
             continue;
         }
 
@@ -1222,6 +1461,16 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             }
             ctx.halted = true;
             break;
+        }
+    }
+    // Diagnostic: report steps completed on exit
+    {
+        static int run_exit_count = 0;
+        if (run_exit_count < 20) {
+            ++run_exit_count;
+            fprintf(stderr, "[diag] run() exit #%d: steps=%llu/%llu halted=%d EIP=0x%08X\n",
+                    run_exit_count, (unsigned long long)steps, (unsigned long long)max_steps,
+                    ctx.halted ? 1 : 0, ctx.eip);
         }
     }
 }

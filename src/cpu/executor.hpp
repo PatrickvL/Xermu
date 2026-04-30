@@ -91,6 +91,9 @@ struct Executor {
     // VEH handle (Windows only) for 4 GB fastmem fault interception.
     void*          veh_handle_ = nullptr;
 
+    // Whether NV2A register pages are committed in the fastmem window.
+    bool           nv2a_committed_ = false;
+
     // I/O port dispatch table.
     static constexpr int MAX_IO_PORTS = 128;
     IoPortEntry io_ports[MAX_IO_PORTS] {};

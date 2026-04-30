@@ -57,7 +57,58 @@ static void hw_tick_callback(void* user) {
         hw->pic.raise_irq(8);
     }
 
-    // NV2A PFIFO is drained by the dedicated Nv2aThread; no tick_fifo here.
+    // NV2A PFIFO: sync USER channel writes from fastmem-committed NV2A memory.
+    // When NV2A range is committed (no VEH faults), the game's writes to
+    // USER PUT (0xFD800040) and PFIFO DMA_PUT (0xFD003240) go directly to RAM.
+    // We poll them here to trigger PFIFO processing.
+    if (hw->ram && hw->nv2a.fastmem_nv2a) {
+        uint8_t* nv2a_mem = hw->nv2a.fastmem_nv2a;
+        // Check USER channel PUT (offset 0x800040)
+        uint32_t user_put;
+        memcpy(&user_put, nv2a_mem + 0x800040, 4);
+        uint32_t cur_put = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+        if (user_put != 0 && user_put != cur_put) {
+            // Simulate the DMA_PUT write handler
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = user_put;
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
+            hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
+            static int put_diag = 0;
+            if (put_diag < 3) { put_diag++; fprintf(stderr, "[diag] USER PUT sync: 0x%X\n", user_put); }
+        }
+        // Sync DMA_GET back to committed memory so game reads see progress
+        uint32_t get_val = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+        memcpy(nv2a_mem + 0x800044, &get_val, 4);
+        // Also sync to PFIFO register space (game may read 0xFD003244 directly)
+        memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_GET, &get_val, 4);
+        // Sync CACHE1_REF to USER REF (offset 0x800048) and PFIFO space
+        uint32_t ref_val = hw->nv2a.pfifo_regs[pfifo::CACHE1_REF / 4];
+        memcpy(nv2a_mem + 0x800048, &ref_val, 4);
+        memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_REF, &ref_val, 4);
+        // Sync CACHE1_DMA_PUT so game can verify PUT was accepted
+        uint32_t put_reg = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+        memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_PUT, &put_reg, 4);
+        // Sync CACHE1_STATUS: idle if GET==PUT
+        uint32_t status_val = (get_val == put_reg) ? pfifo::STATUS_IDLE : 0u;
+        memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_STATUS, &status_val, 4);
+        // Sync PGRAPH_STATUS: 0 = idle (game checks before submitting)
+        uint32_t pgraph_status = 0;
+        memcpy(nv2a_mem + 0x400000 + 0x0700, &pgraph_status, 4);  // PGRAPH_STATUS
+
+        // Also sync PCRTC_INTR acknowledgment: if game wrote to 0x600100, handle W1C
+        uint32_t pcrtc_intr_mem;
+        memcpy(&pcrtc_intr_mem, nv2a_mem + 0x600100, 4);
+        if (pcrtc_intr_mem != 0) {
+            // Game acknowledged interrupt — clear the bit(s) and update IRQ
+            hw->nv2a.pcrtc_regs[pcrtc::INTR / 4] &= ~pcrtc_intr_mem;
+            memset(nv2a_mem + 0x600100, 0, 4);  // clear committed copy
+            hw->nv2a.update_irq();
+        }
+
+        hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
+    } else if (hw->ram) {
+        // Fallback: no committed NV2A, just drain PFIFO
+        hw->nv2a.tick_fifo(hw->ram, hw->ram_size);
+    }
 
     // Increment KeTickCount approximately every ~1ms.
     // Each tick callback fires once per tick_period instructions (1024).
@@ -79,6 +130,9 @@ static void hw_tick_callback(void* user) {
 // NV2A IRQ callback: assert/deassert PIC IRQ 3 (PCI INTA# routing on Xbox).
 static void nv2a_irq_callback(void* user, bool level) {
     auto* pic = static_cast<PicPair*>(user);
+    static int irq_diag = 0;
+    if (level && irq_diag < 5) { irq_diag++; fprintf(stderr, "[diag] NV2A IRQ assert (PIC IRQ 3) count=%d imr=0x%02X isr=0x%02X irr=0x%02X\n",
+        irq_diag, pic->master.imr, pic->master.isr, pic->master.irr); }
     if (level)
         pic->raise_irq(3);
     else
@@ -122,6 +176,12 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     hw->nv2a.pramin_ram      = exec.ram;
     hw->nv2a.pramin_ram_base = 0x03FE0000;
     hw->nv2a.pramin_ram_size = 16 * 4096;  // 64 KB
+
+    // If the 4GB fastmem window committed NV2A pages, wire the pointer so
+    // update_irq() can sync computed registers to fastmem for direct reads.
+    if (exec.nv2a_committed_) {
+        hw->nv2a.fastmem_nv2a = exec.ram + 0xFD000000u;
+    }
 
     hw->mmio.add(APU_BASE, APU_SIZE,
                  apu_read, apu_write, &hw->apu);

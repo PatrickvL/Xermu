@@ -172,8 +172,8 @@ struct Nv2aState {
     static constexpr uint32_t PFIFO_COUNT   = 0x2000 / 4;  // 2048 slots (0x002000-0x003FFF)
     static constexpr uint32_t PVIDEO_COUNT  = 0xA00  / 4;  // covers up to 0x960
     static constexpr uint32_t PTIMER_COUNT  = 0x800  / 4;
-    static constexpr uint32_t PFB_COUNT     = 0x400  / 4;
-    static constexpr uint32_t PGRAPH_COUNT  = 0x800  / 4;
+    static constexpr uint32_t PFB_COUNT     = 0x600  / 4;  // covers tile regs at 0x240+
+    static constexpr uint32_t PGRAPH_COUNT  = 0x2000 / 4;  // covers tile regs at 0x900+
     static constexpr uint32_t PCRTC_COUNT   = 0x1000 / 4;
     static constexpr uint32_t PRAMDAC_COUNT = 0x1000 / 4;
 
@@ -217,7 +217,7 @@ struct Nv2aState {
 
     // PCRTC vblank
     uint32_t vblank_counter = 0;
-    static constexpr uint32_t VBLANK_PERIOD = 600;  // ticks between vblanks (~60Hz, balanced for emulation speed)
+    static constexpr uint32_t VBLANK_PERIOD = 600;  // ticks between vblanks (~1ms at tick_period=1024)
 
     // Captured initial DMA_GET at the moment DMA push is first enabled.
     // Used by the GPU compute shader to know where to start parsing.
@@ -247,6 +247,9 @@ struct Nv2aState {
     uint32_t diag_jumps    = 0;
     uint32_t diag_calls    = 0;
 
+    // Per-subchannel notifier DMA context instance (for NOTIFY handling).
+    uint32_t notifier_ctx[8] = {};
+
     Nv2aState() {
         pmc_regs[pmc::BOOT_0 / 4]             = pmc::NV2A_CHIP_ID;
         pmc_regs[0x044 / 4]                   = pmc::NV2A_CHIP_ID; // BOOT_42 mirror
@@ -257,6 +260,9 @@ struct Nv2aState {
         pfb_regs[pfb::CFG0 / 4]               = pfb::CFG0_64MB;
         pfifo_regs[pfifo::CACHE1_STATUS / 4]   = pfifo::STATUS_IDLE;
         pfifo_regs[pfifo::RUNOUT_STATUS / 4]   = pfifo::STATUS_IDLE;
+        // PGRAPH: FIFO access enabled (bit 0=1) — PGRAPH accepts methods.
+        pgraph_regs[pgraph_ctl::FIFO / 4]      = 1;
+        // PGRAPH: STATUS = 0 means idle (all bits indicate busy units).
         pramdac_regs[pramdac::NVPLL / 4]       = 0x00011C01;
         pramdac_regs[pramdac::MPLL / 4]        = 0x00011801;
         pramdac_regs[pramdac::VPLL / 4]        = 0x00031801;
@@ -293,8 +299,19 @@ struct Nv2aState {
         }
         if (++vblank_counter >= VBLANK_PERIOD) {
             vblank_counter = 0;
-            if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1)
+            static uint32_t vb_total = 0;
+            vb_total++;
+            if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1) {
                 pcrtc_regs[pcrtc::INTR / 4] |= 1;
+                static int vb_diag = 0;
+                if (vb_diag < 5) { vb_diag++; fprintf(stderr, "[diag] VBlank IRQ fired (%d) intr_en=0x%X pmc_en=0x%X pending=0x%X imr=0x%02X isr=0x%02X\n",
+                    vb_diag, pcrtc_regs[pcrtc::INTR_EN / 4], pmc_regs[pmc::INTR_EN / 4],
+                    pmc_regs[pmc::INTR_0 / 4], 0, 0); }
+            } else {
+                static int vb_skip = 0;
+                if (vb_skip < 3) { vb_skip++; fprintf(stderr, "[diag] VBlank skipped (INTR_EN=0x%X) total=%u\n",
+                    pcrtc_regs[pcrtc::INTR_EN / 4], vb_total); }
+            }
         }
         update_irq();
     }
@@ -340,13 +357,25 @@ struct Nv2aState {
             bool level = (pending != 0) && (pmc_regs[pmc::INTR_EN / 4] & 1);
             irq_callback(irq_user, level);
         }
+
+        // Sync key registers to fastmem-committed NV2A memory so direct
+        // reads from JIT code see correct values (no VEH dispatch needed).
+        if (fastmem_nv2a) {
+            memcpy(fastmem_nv2a + 0x000100, &pending, 4);  // PMC_INTR_0
+            memcpy(fastmem_nv2a + 0x600100, &pcrtc_regs[pcrtc::INTR / 4], 4);
+            memcpy(fastmem_nv2a + 0x600140, &pcrtc_regs[pcrtc::INTR_EN / 4], 4);
+        }
     }
+
+    // Pointer to NV2A register memory in the fastmem window (if committed).
+    // Set by the emulator after init. NULL if not using fastmem NV2A.
+    uint8_t* fastmem_nv2a = nullptr;
 
     // ---------------------------------------------------------------
     // PFIFO DMA pusher
     // ---------------------------------------------------------------
     // Budget per tick — generous since we only advance GET, no method dispatch.
-    static constexpr uint32_t MAX_DWORDS_PER_TICK = 4096;
+    static constexpr uint32_t MAX_DWORDS_PER_TICK = 65536;
 
     // Resolve the DMA context object from PRAMIN to get the push buffer
     // physical base address.  DMA_GET/DMA_PUT are byte offsets relative
@@ -373,7 +402,8 @@ struct Nv2aState {
             memcpy(&frame, pramin + inst_addr + 8, 4);
         }
 
-        // NV_DMA_ADDRESS = frame[31:12], NV_DMA_ADJUST = flags[31:20]
+        // NV_DMA_ADDRESS: standard NV2A format (matches xemu).
+        // frame[31:12] provides bits [31:12], flags[31:20] provides bits [11:0].
         uint32_t base = (frame & 0xFFFFF000u) | ((flags >> 20) & 0xFFF);
         return base & 0x07FFFFFFu;  // mask to 128 MB
     }
@@ -389,6 +419,23 @@ struct Nv2aState {
         if (!(dma_push & pfifo::DMA_PUSH_ENABLE)) return;
         if (!(push0 & 1)) return;
         if (dma_get == dma_put) { status = pfifo::STATUS_IDLE; return; }
+        status = 0;
+        static int fifo_diag = 0;
+        if (fifo_diag < 3) {
+            fifo_diag++;
+            uint32_t dma_base_val = resolve_dma_base();
+            fprintf(stderr, "[diag] tick_fifo: GET=0x%X PUT=0x%X base=0x%X\n", dma_get, dma_put, dma_base_val);
+            // Dump first 8 dwords at current GET position
+            uint32_t start_phys = dma_base_val + dma_get;
+            if (start_phys + 32 <= ram_size_bytes) {
+                fprintf(stderr, "[diag]   PB@0x%X:", start_phys);
+                for (int i = 0; i < 8; i++) {
+                    uint32_t w; memcpy(&w, ram + start_phys + i*4, 4);
+                    fprintf(stderr, " %08X", w);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         status = 0;
 
         uint32_t dma_base = resolve_dma_base();
@@ -440,15 +487,98 @@ struct Nv2aState {
                 continue;
             }
 
-            // Method commands — skip data dwords (method dispatch is handled
-            // by the GPU compute shader; CPU only advances GET).
+            // Method commands — advance GET past data dwords.
+            // Intercept key methods (SET_REFERENCE) for synchronization.
             // Increasing: (hdr & 0xE0030003) == 0
             // Non-increasing: (hdr & 0xE0030003) == 0x40000000
             uint32_t masked = hdr & 0xE0030003u;
             if (masked == 0 || masked == 0x40000000u) {
-                uint32_t count = (hdr >> 18) & 0x7FF;
-                uint32_t skip  = count * 4;
+                uint32_t count  = (hdr >> 18) & 0x7FF;
+                uint32_t method = (hdr >> 2) & 0x7FF;  // method offset / 4
+                uint32_t subchan = (hdr >> 13) & 0x7;
+                uint32_t skip   = count * 4;
                 if (dma_base + get + skip > ram_size_bytes) break;
+
+                // Diagnostic: log first N unique methods seen
+                {
+                    static uint32_t seen_methods[64] = {};
+                    static int seen_count = 0;
+                    if (seen_count < 64) {
+                        bool found = false;
+                        for (int i = 0; i < seen_count; ++i)
+                            if (seen_methods[i] == method) { found = true; break; }
+                        if (!found) {
+                            seen_methods[seen_count++] = method;
+                            fprintf(stderr, "[diag] method=0x%03X (off=0x%04X) subchan=%u count=%u\n",
+                                    method, method*4, subchan, count);
+                        }
+                    }
+                }
+
+                // SET_REFERENCE (method 0x0050, i.e. method>>2 = 0x14)
+                // Updates CACHE1_REF so CPU fence polls succeed.
+                if (method == 0x14 && count >= 1) {
+                    uint32_t ref_val;
+                    memcpy(&ref_val, ram + dma_base + get, 4);
+                    pfifo_regs[pfifo::CACHE1_REF / 4] = ref_val;
+                }
+
+                // SET_CONTEXT_DMA_NOTIFIES (method 0x0180, method>>2 = 0x60)
+                // Track notifier DMA context per subchannel.
+                if (method == 0x60 && count >= 1) {
+                    uint32_t ctx_inst;
+                    memcpy(&ctx_inst, ram + dma_base + get, 4);
+                    notifier_ctx[subchan] = ctx_inst;
+                }
+
+                // NOTIFY (method 0x0104, method>>2 = 0x41)
+                // Write completion status to notifier area in RAM.
+                if (method == 0x41 && count >= 1) {
+                    uint32_t notify_type = 0;
+                    memcpy(&notify_type, ram + dma_base + get, 4);
+                    uint32_t inst = notifier_ctx[subchan];
+                    if (inst != 0) {
+                        // Resolve DMA object from PRAMIN
+                        uint32_t inst_off = inst << 4;
+                        uint32_t n_flags = 0, n_frame = 0;
+                        if (pramin_ram && inst_off + 12 <= pramin_ram_size) {
+                            memcpy(&n_flags, pramin_ram + pramin_ram_base + inst_off, 4);
+                            memcpy(&n_frame, pramin_ram + pramin_ram_base + inst_off + 8, 4);
+                        }
+                        if (n_flags == 0 && n_frame == 0 && inst_off + 12 <= PRAMIN_SIZE) {
+                            memcpy(&n_flags, pramin + inst_off, 4);
+                            memcpy(&n_frame, pramin + inst_off + 8, 4);
+                        }
+                        uint32_t notif_base = (n_frame & 0xFFFFF000u) | ((n_flags >> 20) & 0xFFF);
+                        notif_base &= 0x07FFFFFFu;
+                        uint32_t entry_off = notif_base + notify_type * 16;
+                        if (entry_off + 16 <= ram_size_bytes) {
+                            // Write status=0 (completed) at DW3 (offset+12)
+                            uint32_t zero = 0;
+                            memcpy(const_cast<uint8_t*>(ram) + entry_off + 12, &zero, 4);
+                        }
+                    }
+                }
+
+                // NV097_SET_SURFACE_COLOR_OFFSET (method 0x0208, method>>2 = 0x82)
+                if (method == 0x82 && count >= 1) {
+                    uint32_t surf_off;
+                    memcpy(&surf_off, ram + dma_base + get, 4);
+                    pgraph_regs[0x208 / 4] = surf_off;  // surface color offset
+                }
+                // NV097_SET_SURFACE_PITCH (method 0x020C, method>>2 = 0x83)
+                if (method == 0x83 && count >= 1) {
+                    uint32_t pitch_val;
+                    memcpy(&pitch_val, ram + dma_base + get, 4);
+                    pgraph_regs[0x20C / 4] = pitch_val;
+                }
+                // NV097_SET_SURFACE_FORMAT (method 0x0200, method>>2 = 0x80)
+                if (method == 0x80 && count >= 1) {
+                    uint32_t fmt_val;
+                    memcpy(&fmt_val, ram + dma_base + get, 4);
+                    pgraph_regs[0x200 / 4] = fmt_val;
+                }
+
                 get += skip;
                 consumed += count;
                 diag_methods += count;
@@ -516,11 +646,17 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     // --- PFB (0x100000) ---
     if (off >= 0x100000 && off < 0x101000) {
         uint32_t r = off - 0x100000;
-        if (r / 4 < Nv2aState::PFB_COUNT) return nv->pfb_regs[r / 4];
+        if (r / 4 < Nv2aState::PFB_COUNT) {
+            uint32_t val = nv->pfb_regs[r / 4];
+            // Status registers (0x400+): auto-clear busy/pending bits.
+            // On real NV2A, these clear within a few cycles after being set.
+            if (r >= 0x400) val &= ~0x00010000u;
+            return val;
+        }
         return 0;
     }
     // --- PGRAPH control (0x400000) ---
-    if (off >= 0x400000 && off < 0x401000) {
+    if (off >= 0x400000 && off < 0x402000) {
         uint32_t r = off - 0x400000;
         if (r / 4 < Nv2aState::PGRAPH_COUNT) return nv->pgraph_regs[r / 4];
         return 0;
@@ -562,7 +698,7 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     }
     // --- USER (0x800000): GPU channel control area ---
     // Each channel is 64KB. Xbox uses channel 0.
-    // Register 0x40 = DMA_PUT, 0x44 = DMA_GET (mirrors PFIFO CACHE1).
+    // Register 0x40 = DMA_PUT, 0x44 = DMA_GET, 0x48 = REF (mirrors PFIFO CACHE1).
     if (off >= 0x800000) {
         uint32_t chan_off = off & 0xFFFF;
         if (chan_off == 0x44) {
@@ -570,6 +706,10 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
         }
         if (chan_off == 0x40)
             return nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+        if (chan_off == 0x48)
+            return nv->pfifo_regs[pfifo::CACHE1_REF / 4];
+        static int user_diag = 0;
+        if (user_diag < 5) { user_diag++; fprintf(stderr, "[diag] USER read: chan_off=0x%X\n", chan_off); }
         return 0;
     }
 
@@ -619,6 +759,21 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         if (r / 4 < Nv2aState::PFIFO_COUNT) nv->pfifo_regs[r / 4] = val;
         if (r == pfifo::INTR_EN) nv->update_irq();
 
+        // Diagnostic: DMA_GET writes
+        if (r == pfifo::CACHE1_DMA_GET) {
+            static int get_diag = 0;
+            if (get_diag < 10) { get_diag++; fprintf(stderr, "[diag] PFIFO DMA_GET write: val=0x%X (count=%d)\n", val, get_diag); }
+        }
+
+        // When DMA_PUT is written directly (Xbox D3D uses PFIFO CACHE1_DMA_PUT
+        // at 0xFD003240 rather than USER channel PUT at 0xFD800040), ensure push
+        // is enabled. Do NOT seed GET — the kernel sets GET via RAMFC context.
+        if (r == pfifo::CACHE1_DMA_PUT) {
+            static int put_diag_count = 0;
+            if (put_diag_count < 10) { put_diag_count++; fprintf(stderr, "[diag] PFIFO DMA_PUT write: val=0x%X (count=%d)\n", val, put_diag_count); }
+            nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
+            nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
+        }
 
         // When CACHE1_PUSH1 is written (channel select) or PUSH0 is enabled,
         // load DMA_PUT/DMA_GET from RAMFC context in PRAMIN.
@@ -638,15 +793,25 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
                     memcpy(&put, nv->pramin_ram + ram_addr + 0, 4);
                     memcpy(&get, nv->pramin_ram + ram_addr + 4, 4);
                 }
+                fprintf(stderr, "[diag] RAMFC load: pramin_ram=%p base=0x%X ctx_off=0x%X ram_addr=0x%X -> PUT=0x%X GET=0x%X\n",
+                    (void*)nv->pramin_ram, nv->pramin_ram_base, ctx_off, ram_addr, put, get);
+            } else {
+                fprintf(stderr, "[diag] RAMFC load: pramin_ram=NULL, using internal pramin[]\n");
             }
             if (put == 0 && get == 0 && ctx_off + 64 <= Nv2aState::PRAMIN_SIZE) {
                 memcpy(&put, nv->pramin + ctx_off + 0, 4);
                 memcpy(&get, nv->pramin + ctx_off + 4, 4);
+                fprintf(stderr, "[diag] RAMFC fallback: pramin[0x%X] -> PUT=0x%X GET=0x%X\n", ctx_off, put, get);
             }
 
             if (put != 0 || get != 0) {
                 nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = put;
                 nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
+                // RAMFC context loaded — push is active.
+                nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
+                nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
+                fprintf(stderr, "[diag] RAMFC loaded: ch=%u PUT=0x%X GET=0x%X (ramfc_reg=0x%X ramfc_base=0x%X)\n",
+                    channel, put, get, ramfc_reg, ramfc_base);
             }
         }
 
@@ -683,7 +848,7 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         return;
     }
     // --- PGRAPH control (0x400000) ---
-    if (off >= 0x400000 && off < 0x401000) {
+    if (off >= 0x400000 && off < 0x402000) {
         uint32_t r = off - 0x400000;
         if (r == pgraph_ctl::INTR) { nv->pgraph_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PGRAPH_COUNT) nv->pgraph_regs[r / 4] = val;
@@ -695,6 +860,11 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
         uint32_t r = off - 0x600000;
         if (r == pcrtc::INTR) { nv->pcrtc_regs[r / 4] &= ~val; nv->update_irq(); return; }
         if (r / 4 < Nv2aState::PCRTC_COUNT) nv->pcrtc_regs[r / 4] = val;
+        if (r == pcrtc::START) {
+            static int pcrtc_diag = 0;
+            if (pcrtc_diag++ < 3)
+                fprintf(stderr, "[diag] PCRTC_START write: 0x%X\n", val);
+        }
         if (r == pcrtc::INTR_EN) nv->update_irq();
         return;
     }
@@ -719,14 +889,12 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off >= 0x800000) {
         uint32_t chan_off = off & 0xFFFF;
         if (chan_off == 0x40) {
+            static int user_put_count = 0;
+            if (user_put_count < 10) { user_put_count++; fprintf(stderr, "[diag] USER PUT write: val=0x%X (count=%d)\n", val, user_put_count); }
             // DMA_PUT: update PFIFO registers and ensure push is enabled.
-            // On first USER PUT write, seed GET=PUT so that the pusher starts
-            // at the push buffer base rather than processing garbage from addr 0.
-            // The game will later advance PUT past any new commands.
-            uint32_t cur_get = nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
-            if (cur_get == 0) {
-                nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = val;
-            }
+            // Do NOT seed GET here — in nboxkrnl mode, the kernel initializes
+            // GET=0 (via RAMFC) and fills the push buffer from 0..PUT.
+            // Seeding GET=PUT would skip all initial commands.
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4] = val;
             nv->pfifo_regs[pfifo::CACHE1_DMA_PUSH / 4] |= pfifo::DMA_PUSH_ENABLE;
             nv->pfifo_regs[pfifo::CACHE1_PUSH0 / 4] |= 1;
