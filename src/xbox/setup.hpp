@@ -121,7 +121,10 @@ static void hw_tick_callback(void* user) {
             }
         }
         // Sync DMA_GET back to committed memory so game reads see progress
-        uint32_t get_val = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+        // Use fifo_get (tick_fifo's progress) or gpu_shader_get, whichever is further
+        uint32_t get_val = hw->nv2a.fifo_get_valid ? hw->nv2a.fifo_get
+                         : hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+        if (hw->nv2a.gpu_shader_get > get_val) get_val = hw->nv2a.gpu_shader_get;
         memcpy(nv2a_mem + 0x800044, &get_val, 4);
         // Also sync to PFIFO register space (game may read 0xFD003244 directly)
         memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_GET, &get_val, 4);
@@ -129,6 +132,8 @@ static void hw_tick_callback(void* user) {
         uint32_t ref_val = hw->nv2a.pfifo_regs[pfifo::CACHE1_REF / 4];
         memcpy(nv2a_mem + 0x800048, &ref_val, 4);
         memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_REF, &ref_val, 4);
+        // Sync CACHE1_REF to PGRAPH space at 0x400B10 (D3D polls this as GPU ref counter)
+        memcpy(nv2a_mem + 0x400B10, &ref_val, 4);
         // Sync CACHE1_DMA_PUT so game can verify PUT was accepted
         uint32_t put_reg = hw->nv2a.pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
         memcpy(nv2a_mem + 0x002000 + pfifo::CACHE1_DMA_PUT, &put_reg, 4);
@@ -183,6 +188,21 @@ static void hw_tick_callback(void* user) {
     }
 
     // Advance ACPI PM Timer (~3.58 ticks per µs callback).
+    hw->acpi.tick();
+}
+
+// Burst tick: same as hw_tick_callback but skips VBLANK (tick_timer).
+// Used by spin-detection to advance PIT/RTC time without re-asserting
+// NV2A interrupts that the guest is actively trying to acknowledge.
+static void hw_tick_burst_callback(void* user) {
+    auto* hw = static_cast<XboxHardware*>(user);
+    hw->pit.tick();
+    // Skip nv2a.tick_timer() — don't fire VBLANKs during burst
+    hw->usb0.tick_frame();
+    hw->usb1.tick_frame();
+    if (hw->cmos.tick()) {
+        hw->pic.raise_irq(8);
+    }
     hw->acpi.tick();
 }
 
@@ -278,9 +298,10 @@ inline XboxHardware* xbox_setup(Executor& exec) {
     exec.register_io(0x4D0, elcr_io_read, elcr_io_write, &hw->cmos);
     exec.register_io(0x4D1, elcr_io_read, elcr_io_write, &hw->cmos);
 
-    exec.tick_fn     = hw_tick_callback;
-    exec.tick_user   = hw;
-    exec.tick_period = 1024;
+    exec.tick_fn       = hw_tick_callback;
+    exec.tick_fn_burst = hw_tick_burst_callback;
+    exec.tick_user     = hw;
+    exec.tick_period   = 1024;
 
     exec.register_io(0x61, sysctl_read, sysctl_write, &hw->misc);
     exec.register_io(0x80, post_code_read, post_code_write, &hw->misc);

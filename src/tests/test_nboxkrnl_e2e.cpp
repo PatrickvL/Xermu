@@ -159,7 +159,7 @@ static bool create_mock_pe(const char* path) {
     pe.opt_magic      = 0x010B; // PE32
     pe.entry_rva      = 0x1000; // .text section RVA
     pe.code_base      = 0x1000;
-    pe.image_base     = 0x80010000;
+    pe.image_base     = 0x80400000;
     pe.section_align  = 0x1000;
     pe.file_align     = 0x200;
     pe.image_size     = 0x2000;       // 2 pages (headers + .text)

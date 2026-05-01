@@ -121,10 +121,11 @@ struct Executor {
     // Optional periodic tick callback (e.g. PIT timer).
     // Called every tick_period traces; tick_period=0 disables.
     using TickFn = void(*)(void*);
-    TickFn   tick_fn      = nullptr;
-    void*    tick_user     = nullptr;
-    uint32_t tick_period   = 0;
-    uint32_t tick_counter  = 0;
+    TickFn   tick_fn        = nullptr;
+    TickFn   tick_fn_burst  = nullptr;  // burst mode: skip VBLANK (for spin-detect)
+    void*    tick_user      = nullptr;
+    uint32_t tick_period    = 0;
+    uint32_t tick_counter   = 0;
 
     // HLE callback: if non-null, INT with this vector calls the handler
     // instead of delivering through IDT. Handler receives ordinal from EAX.

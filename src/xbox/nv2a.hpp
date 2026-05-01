@@ -247,6 +247,11 @@ struct Nv2aState {
     uint32_t diag_jumps    = 0;
     uint32_t diag_calls    = 0;
 
+    // tick_fifo's own GET position (independent of GPU shader GET)
+    uint32_t fifo_get      = 0;
+    bool     fifo_get_valid = false;
+    uint32_t gpu_shader_get = 0;  // GPU compute shader's DMA_GET position
+
     // Per-subchannel notifier DMA context instance (for NOTIFY handling).
     uint32_t notifier_ctx[8] = {};
 
@@ -299,18 +304,8 @@ struct Nv2aState {
         }
         if (++vblank_counter >= VBLANK_PERIOD) {
             vblank_counter = 0;
-            static uint32_t vb_total = 0;
-            vb_total++;
-            if (pcrtc_regs[pcrtc::INTR_EN / 4] & 1) {
+            if ((pcrtc_regs[pcrtc::INTR_EN / 4] & 1) && !(pcrtc_regs[pcrtc::INTR / 4] & 1)) {
                 pcrtc_regs[pcrtc::INTR / 4] |= 1;
-                static int vb_diag = 0;
-                if (vb_diag < 5) { vb_diag++; fprintf(stderr, "[diag] VBlank IRQ fired (%d) intr_en=0x%X pmc_en=0x%X pending=0x%X imr=0x%02X isr=0x%02X\n",
-                    vb_diag, pcrtc_regs[pcrtc::INTR_EN / 4], pmc_regs[pmc::INTR_EN / 4],
-                    pmc_regs[pmc::INTR_0 / 4], 0, 0); }
-            } else {
-                static int vb_skip = 0;
-                if (vb_skip < 3) { vb_skip++; fprintf(stderr, "[diag] VBlank skipped (INTR_EN=0x%X) total=%u\n",
-                    pcrtc_regs[pcrtc::INTR_EN / 4], vb_total); }
             }
         }
         update_irq();
@@ -375,7 +370,7 @@ struct Nv2aState {
     // PFIFO DMA pusher
     // ---------------------------------------------------------------
     // Budget per tick — generous since we only advance GET, no method dispatch.
-    static constexpr uint32_t MAX_DWORDS_PER_TICK = 65536;
+    static constexpr uint32_t MAX_DWORDS_PER_TICK = 256 * 1024;
 
     // Resolve the DMA context object from PRAMIN to get the push buffer
     // physical base address.  DMA_GET/DMA_PUT are byte offsets relative
@@ -418,34 +413,23 @@ struct Nv2aState {
 
         if (!(dma_push & pfifo::DMA_PUSH_ENABLE)) return;
         if (!(push0 & 1)) return;
-        if (dma_get == dma_put) { status = pfifo::STATUS_IDLE; return; }
-        status = 0;
-        static int fifo_diag = 0;
-        if (fifo_diag < 3) {
-            fifo_diag++;
-            uint32_t dma_base_val = resolve_dma_base();
-            fprintf(stderr, "[diag] tick_fifo: GET=0x%X PUT=0x%X base=0x%X\n", dma_get, dma_put, dma_base_val);
-            // Dump first 8 dwords at current GET position
-            uint32_t start_phys = dma_base_val + dma_get;
-            if (start_phys + 32 <= ram_size_bytes) {
-                fprintf(stderr, "[diag]   PB@0x%X:", start_phys);
-                for (int i = 0; i < 8; i++) {
-                    uint32_t w; memcpy(&w, ram + start_phys + i*4, 4);
-                    fprintf(stderr, " %08X", w);
-                }
-                fprintf(stderr, "\n");
-            }
+        // Initialize fifo_get from dma_get once push is first enabled with data
+        if (!fifo_get_valid && dma_put != 0) {
+            fifo_get = dma_get;
+            fifo_get_valid = true;
         }
+        if (!fifo_get_valid) return;
+        if (fifo_get == dma_put) { status = pfifo::STATUS_IDLE; return; }
         status = 0;
 
         uint32_t dma_base = resolve_dma_base();
-        uint32_t get = dma_get;
+        uint32_t get = fifo_get;
         uint32_t put = dma_put;
         uint32_t consumed = 0;
 
         while (get != put && consumed < MAX_DWORDS_PER_TICK) {
             uint32_t phys = dma_base + get;
-            if (phys + 4 > ram_size_bytes) break;
+            if (phys >= ram_size_bytes || phys + 4 > ram_size_bytes) break;
 
             uint32_t hdr;
             memcpy(&hdr, ram + phys, 4);
@@ -456,14 +440,16 @@ struct Nv2aState {
 
             // OLD_JUMP: bits[31:29]=001, bits[1:0]=00
             if ((hdr & 0xE0000003u) == 0x20000000u) {
-                get = hdr & 0x1FFFFFFFu;
+                uint32_t target = hdr & 0x1FFFFFFFu;
+                get = target;
                 diag_jumps++;
                 continue;
             }
 
             // JUMP (new style): bits[1:0]=01
             if ((hdr & 3) == 1) {
-                get = hdr & 0xFFFFFFFCu;
+                uint32_t target = hdr & 0xFFFFFFFCu;
+                get = target;
                 diag_jumps++;
                 continue;
             }
@@ -521,6 +507,19 @@ struct Nv2aState {
                     uint32_t ref_val;
                     memcpy(&ref_val, ram + dma_base + get, 4);
                     pfifo_regs[pfifo::CACHE1_REF / 4] = ref_val;
+                }
+
+                // NV097_SET_REFERENCE (method 0x1D70, method>>2 = 0x75C)
+                // Updates PGRAPH REF_CNT register at NV2A offset 0x400B10.
+                // Does NOT update PFIFO CACHE1_REF (that's only method 0x14).
+                if (method == 0x75C && count >= 1) {
+                    uint32_t ref_val;
+                    memcpy(&ref_val, ram + dma_base + get, 4);
+                    pgraph_regs[0xB10 / 4] = ref_val;
+                    // Stop after writing fence so game can poll before next epoch
+                    get += skip;
+                    consumed += count;
+                    goto fifo_done;
                 }
 
                 // SET_CONTEXT_DMA_NOTIFIES (method 0x0180, method>>2 = 0x60)
@@ -585,8 +584,23 @@ struct Nv2aState {
             }
             // else: unknown command, skip header only
         }
+    fifo_done:
         diag_dwords += consumed;
-        dma_get = get;
+        fifo_get = get;
+        fifo_get_valid = true;
+        // Update CACHE1_DMA_GET register to reflect processed position.
+        pfifo_regs[pfifo::CACHE1_DMA_GET / 4] = get;
+        // Write GET back to RAMFC in guest RAM (real HW DMA pusher does this).
+        if (pramin_ram) {
+            uint32_t ramfc_reg = pfifo_regs[0x0214 / 4];
+            uint32_t ramfc_base = ((ramfc_reg >> 12) & 0x1FFF) << 4;
+            uint32_t channel = pfifo_regs[pfifo::CACHE1_PUSH1 / 4] & 0x1F;
+            uint32_t ctx_off = ramfc_base + channel * 64;
+            uint32_t ram_addr = pramin_ram_base + ctx_off + 4; // +4 = GET offset in RAMFC entry
+            if (ram_addr + 4 <= pramin_ram_base + pramin_ram_size) {
+                memcpy(pramin_ram + ram_addr, &get, 4);
+            }
+        }
         if (get == put)
             status = pfifo::STATUS_IDLE;
     }
@@ -702,7 +716,11 @@ static uint32_t nv2a_read(uint32_t pa, unsigned /*size*/, void* user) {
     if (off >= 0x800000) {
         uint32_t chan_off = off & 0xFFFF;
         if (chan_off == 0x44) {
-            return nv->pfifo_regs[pfifo::CACHE1_DMA_GET / 4];
+            // Return the furthest GET position between tick_fifo and GPU shader
+            uint32_t fg = nv->fifo_get_valid ? nv->fifo_get : nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
+            uint32_t sg = nv->gpu_shader_get;
+            uint32_t result = (sg > fg) ? sg : fg;
+            return result;
         }
         if (chan_off == 0x40)
             return nv->pfifo_regs[pfifo::CACHE1_DMA_PUT / 4];
@@ -851,6 +869,8 @@ static void nv2a_write(uint32_t pa, uint32_t val, unsigned /*size*/, void* user)
     if (off >= 0x400000 && off < 0x402000) {
         uint32_t r = off - 0x400000;
         if (r == pgraph_ctl::INTR) { nv->pgraph_regs[r / 4] &= ~val; nv->update_irq(); return; }
+        // REF_CNT (0xB10) is read-only — only written via NV097_SET_REFERENCE method
+        if (r == 0xB10) return;
         if (r / 4 < Nv2aState::PGRAPH_COUNT) nv->pgraph_regs[r / 4] = val;
         if (r == pgraph_ctl::INTR_EN) nv->update_irq();
         return;

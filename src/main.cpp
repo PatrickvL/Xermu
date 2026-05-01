@@ -1002,7 +1002,7 @@ int main(int argc, char** argv) {
                         int jump_count = 0;
                         for (uint32_t pos = scan_start; pos < scan_end && found < 10; pos += 4) {
                             uint32_t phys = dma_base + pos;
-                            if (phys + 4 > GUEST_RAM_SIZE) break;
+                            if (phys >= GUEST_RAM_SIZE || phys + 4 > GUEST_RAM_SIZE) break;
                             uint32_t hdr; memcpy(&hdr, ram + phys, 4);
                             if (hdr == 0) continue;
                             if (first_nonzero_off == 0xFFFFFFFF) first_nonzero_off = pos;
@@ -1011,7 +1011,9 @@ int main(int argc, char** argv) {
                                 if (jump_count < 3)
                                     fprintf(stderr, "[diag] PB JUMP @ off=0x%X -> 0x%X\n", pos, hdr & 0xFFFFFFFCu);
                                 jump_count++;
-                                pos = (hdr & 0xFFFFFFFCu) - 4; // will be +4'd by loop
+                                uint32_t target = (hdr & 0xFFFFFFFCu);
+                                if (dma_base + target >= GUEST_RAM_SIZE) break;
+                                pos = target - 4; // will be +4'd by loop
                                 continue;
                             }
                             if ((hdr & 3u) != 0u) continue; // skip CALL/RET
@@ -1080,15 +1082,27 @@ int main(int argc, char** argv) {
                     uint32_t pos = old_get;
                     while (pos < new_get) {
                         uint32_t phys = dma_base + pos;
-                        if (phys + 4 > ram_size) break;
+                        if (phys >= ram_size || phys + 4 > ram_size) break;
                         uint32_t hdr;
                         memcpy(&hdr, ram + phys, 4);
                         pos += 4;
                         if (hdr == 0) continue;  // NOP
-                        // JUMP commands
-                        if ((hdr & 0xE0000003u) == 0x20000000u) { pos = hdr & 0x1FFFFFFFu; continue; }
-                        if ((hdr & 3) == 1) { pos = hdr & 0xFFFFFFFCu; continue; }
-                        if ((hdr & 3) == 2) { pos = hdr & 0xFFFFFFFCu; continue; }
+                        // JUMP commands — validate target before following
+                        if ((hdr & 0xE0000003u) == 0x20000000u) {
+                            uint32_t target = hdr & 0x1FFFFFFFu;
+                            if (dma_base + target >= ram_size) break;
+                            pos = target; continue;
+                        }
+                        if ((hdr & 3) == 1) {
+                            uint32_t target = hdr & 0xFFFFFFFCu;
+                            if (dma_base + target >= ram_size) break;
+                            pos = target; continue;
+                        }
+                        if ((hdr & 3) == 2) {
+                            uint32_t target = hdr & 0xFFFFFFFCu;
+                            if (dma_base + target >= ram_size) break;
+                            pos = target; continue;
+                        }
                         if (hdr == 0x00020000u) continue;  // RETURN
                         // Method command
                         uint32_t masked = hdr & 0xE0030003u;
@@ -1150,7 +1164,8 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                app.sys.hw->nv2a.pfifo_regs[xbox::pfifo::CACHE1_DMA_GET / 4] = ctl->dma_get;
+                // Store GPU shader's GET for USER DMA_GET reads (combined with fifo_get)
+                app.sys.hw->nv2a.gpu_shader_get = ctl->dma_get;
                 // Periodic diagnostic: log scanout state every 60 display frames
                 static uint32_t diag_frame = 0;
                 if (++diag_frame % 60 == 1) {

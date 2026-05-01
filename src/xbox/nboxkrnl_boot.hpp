@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // nboxkrnl_boot.hpp — PE loader, page table setup, and boot mode for nboxkrnl.
 //
-// Loads the nboxkrnl.exe PE into guest RAM at PA 0x10000 (VA 0x80010000),
+// Loads the nboxkrnl.exe PE into guest RAM at PA 0x400000 (VA 0x80400000),
 // sets up 32-bit non-PAE page tables, configures CPU state, and returns
 // the entry EIP for KernelEntry.
 // ---------------------------------------------------------------------------
@@ -16,16 +16,16 @@
 
 namespace nboxkrnl {
 
-// nboxkrnl is linked at VA 0x80010000, which maps to PA 0x10000.
-static constexpr uint32_t KERNEL_VA_BASE = 0x80010000u;
-static constexpr uint32_t KERNEL_PA_BASE = 0x00010000u;
+// nboxkrnl is linked at VA 0x80400000, which maps to PA 0x400000.
+static constexpr uint32_t KERNEL_VA_BASE = 0x80400000u;
+static constexpr uint32_t KERNEL_PA_BASE = 0x00400000u;
 static constexpr uint32_t KERNEL_VA_OFFSET = KERNEL_VA_BASE - KERNEL_PA_BASE; // 0x80000000
 
 // Page directory at PA 0xF000.
 static constexpr uint32_t PAGE_DIR_PA = 0x0000F000u;
 
 // Stack at VA 0x80400000 (PA 0x400000 = 4 MB).
-static constexpr uint32_t STACK_VA = 0x80400000u;
+static constexpr uint32_t STACK_VA = 0x80430000u;
 
 // ---------------------------------------------------------------------------
 // Set up nboxkrnl-compatible page tables in guest RAM.
@@ -95,14 +95,14 @@ inline void setup_cpu_state(Executor& exec) {
 // ---------------------------------------------------------------------------
 // Load nboxkrnl PE into guest RAM.
 //
-// nboxkrnl is a 32-bit Native PE with ImageBase = 0x80010000.
-// The PE loader expects to write to ram[image_base], but 0x80010000 is
-// beyond the 128 MB RAM.  So we load into ram[0x10000] by passing a
+// nboxkrnl is a 32-bit Native PE with ImageBase = 0x80400000.
+// The PE loader expects to write to ram[image_base], but 0x80400000 is
+// beyond the 128 MB RAM.  So we load into ram[0x400000] by passing a
 // modified RAM pointer: ram - 0x80000000.  This way
-//   ram_base[0x80010000] = ram[-0x80000000 + 0x80010000] = ram[0x10000]
+//   ram_base[0x80400000] = ram[-0x80000000 + 0x80400000] = ram[0x400000]
 //
 // WARNING: We must ensure the PE loader doesn't access any address below
-// image_base (0x80010000) because those would be negative offsets.  The
+// image_base (0x80400000) because those would be negative offsets.  The
 // PE loader zeroes ram[image_base .. image_base+image_size], copies headers,
 // and copies sections.  All accesses are within [image_base, image_base+image_size).
 // ---------------------------------------------------------------------------

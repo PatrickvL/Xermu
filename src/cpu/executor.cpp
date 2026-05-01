@@ -406,21 +406,6 @@ void Executor::io_write(uint16_t port, uint32_t val, unsigned size) {
 
 void Executor::deliver_interrupt(uint8_t vector, uint32_t return_eip,
                                   bool has_error, uint32_t error_code) {
-    // Diagnostic: count hardware IRQ deliveries
-    static int irq_deliver_count = 0;
-    if (vector >= 0x30 && irq_deliver_count < 5) {
-        irq_deliver_count++;
-        fprintf(stderr, "[diag] IRQ deliver: vector=0x%02X return_eip=0x%08X IF=%d (count=%d)\n",
-                vector, return_eip, ctx.virtual_if ? 1 : 0, irq_deliver_count);
-    }
-    // Specifically track vector 0x33 (GPU IRQ 3)
-    static int gpu_irq_count = 0;
-    if (vector == 0x33 && gpu_irq_count < 3) {
-        gpu_irq_count++;
-        fprintf(stderr, "[diag] GPU vector 0x33 delivered! return_eip=0x%08X (count=%d)\n",
-                return_eip, gpu_irq_count);
-    }
-
     uint32_t idt_offset = (uint32_t)vector * 8;
     if (idt_offset + 7 > ctx.idtr_limit) {
         fprintf(stderr, "[exec] IDT vector %u exceeds limit (%u) at EIP=0x%08X\n",
@@ -982,8 +967,29 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             t = builder.build(eip, code_ptr, code_len, ram,
                               cc, arena, &ctx);
             if (!t) {
-                fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) — halting\n", eip, code_pa);
-                break;
+                // Code cache or arena full — flush and retry once.
+                static int flush_count = 0;
+                flush_count++;
+                if (flush_count <= 3)
+                    fprintf(stderr, "[exec] code cache full, flushing (#%d) at EIP=%08X\n", flush_count, eip);
+                tcache.clear();
+                cc.reset();
+                arena.reset();
+                prev_trace = nullptr;
+                // Retry build after flush
+                t = builder.build(eip, code_ptr, code_len, ram,
+                                  cc, arena, &ctx);
+                if (!t) {
+                    static int build_fail_count = 0;
+                    if (build_fail_count < 3) {
+                        build_fail_count++;
+                        fprintf(stderr, "[exec] build failed at EIP=%08X (PA=%08X) bytes:", eip, code_pa);
+                        for (uint32_t i = 0; i < 16 && code_pa + i < GUEST_RAM_SIZE; i++)
+                            fprintf(stderr, " %02X", ram[code_pa + i]);
+                        fprintf(stderr, "\n");
+                    }
+                    break;
+                }
             }
             tcache.insert(t);
 
@@ -1301,9 +1307,11 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
                     if (++cycle2_count >= 100) {
                         cycle2_count = 0;
                         // Fire device ticks to advance time while CPU is stuck.
+                        // Use burst mode (no VBLANK) to avoid re-asserting IRQs
+                        // that the guest is actively trying to clear.
                         if (tick_fn) {
                             for (int t = 0; t < 100; ++t)
-                                tick_fn(tick_user);
+                                tick_fn_burst(tick_user);
                         }
                     }
                 } else {
@@ -1332,17 +1340,19 @@ void Executor::run(uint32_t entry_eip, uint64_t max_steps) {
             if (ctx.halted) {
                 ctx.eip += 1;  // HLT is always 1 byte (0xF4)
                 ctx.halted = false;
-                // Spin: call tick_fn to advance device timers until an IRQ fires.
+                // Fast-forward ticks (not individual steps) until an IRQ fires.
+                // This keeps the host GUI responsive by limiting spin duration.
+                // Budget: allow up to 1024 ticks (≈1 frame worth of device time).
+                uint32_t hlt_ticks = 0;
+                constexpr uint32_t HLT_MAX_TICKS = 1024;
                 while (!(irq_check && irq_check(irq_user))) {
-                    if (max_steps && steps >= max_steps) { ctx.halted = true; break; }
-                    if (tick_period) {
-                        if (++tick_counter >= tick_period) {
-                            tick_counter = 0;
-                            tick_fn(tick_user);
-                        }
-                    }
-                    ++steps;
+                    if (hlt_ticks >= HLT_MAX_TICKS) { ctx.halted = true; break; }
+                    tick_fn(tick_user);
+                    hlt_ticks++;
                 }
+                // Don't charge halted time to step budget — the CPU isn't
+                // executing real instructions, and we want the main loop to
+                // deliver the pending IRQ on the very next iteration.
             }
             continue;
         }

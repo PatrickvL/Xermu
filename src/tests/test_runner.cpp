@@ -202,8 +202,8 @@ int main(int argc, char** argv) {
                     fprintf(stderr, " %02X", sys.exec->ram[eip + i]);
                 fprintf(stderr, "\n");
             }
-            // Dump the kernel load region at 0x80010000 (physical 0x10000)
-            uint32_t kbase = 0x10000;
+            // Dump the kernel load region at 0x80400000 (physical 0x400000)
+            uint32_t kbase = 0x400000;
             if (kbase + 64 < GUEST_RAM_SIZE) {
                 fprintf(stderr, "  kernel @%08X:", kbase);
                 for (int i = 0; i < 64; ++i) {
